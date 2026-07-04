@@ -1,6 +1,11 @@
 import { Button } from "@cap/ui";
 import { Comment, User, type Video } from "@cap/web-domain";
-import { faCommentSlash } from "@fortawesome/free-solid-svg-icons";
+import {
+	faChevronDown,
+	faChevronRight,
+	faCircleCheck,
+	faCommentSlash,
+} from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { useSearchParams } from "next/navigation";
 import type React from "react";
@@ -12,6 +17,7 @@ import {
 	useCallback,
 	useEffect,
 	useImperativeHandle,
+	useMemo,
 	useRef,
 	useState,
 } from "react";
@@ -19,9 +25,16 @@ import { deleteComment } from "@/actions/videos/delete-comment";
 import { newComment } from "@/actions/videos/new-comment";
 import { useCurrentUser } from "@/app/Layout/AuthContext";
 import type { CommentType } from "../../../Share";
-import CommentComponent from "./Comment";
+import CommentThread from "./Comment";
 import CommentInput from "./CommentInput";
 import EmptyState from "./EmptyState";
+import { DONE_MESSAGE, latestDoneAt, useReopenedThreads } from "./threadState";
+
+type Thread = {
+	root: CommentType;
+	replies: CommentType[];
+	isDone: boolean;
+};
 
 export const Comments = Object.assign(
 	forwardRef<
@@ -52,6 +65,11 @@ export const Comments = Object.assign(
 		const [replyingTo, setReplyingTo] = useState<Comment.CommentId | null>(
 			null,
 		);
+		const [showResolved, setShowResolved] = useState(false);
+
+		const { isThreadDone, reopen, clearReopen } = useReopenedThreads(
+			props.videoId,
+		);
 
 		const commentsContainerRef = useRef<HTMLDivElement>(null);
 
@@ -74,16 +92,41 @@ export const Comments = Object.assign(
 
 		useImperativeHandle(ref, () => ({ scrollToBottom }), [scrollToBottom]);
 
-		const rootComments = optimisticComments.filter(
-			(comment) => !comment.parentCommentId || comment.parentCommentId === "",
-		);
+		const { openThreads, resolvedThreads } = useMemo(() => {
+			const roots = optimisticComments.filter(
+				(comment) => !comment.parentCommentId || comment.parentCommentId === "",
+			);
+			const threads: Thread[] = roots.map((root) => {
+				const replies = optimisticComments.filter((reply) => {
+					if (!reply.parentCommentId || reply.parentCommentId === "")
+						return false;
+					if (reply.parentCommentId === root.id) return true;
+					// replies-to-replies are flattened into their top-level thread
+					const parent = optimisticComments.find(
+						(c) => c.id === reply.parentCommentId,
+					);
+					return parent?.parentCommentId === root.id;
+				});
+				const doneAt = latestDoneAt(replies);
+				return {
+					root,
+					replies,
+					isDone: isThreadDone(root.id, doneAt),
+				};
+			});
 
-		const handleNewComment = async (content: string) => {
+			return {
+				openThreads: threads.filter((t) => !t.isDone),
+				resolvedThreads: threads.filter((t) => t.isDone),
+			};
+		}, [optimisticComments, isThreadDone]);
+
+		const postComment = async (
+			content: string,
+			parentCommentId: Comment.CommentId,
+			timestamp: number | null,
+		) => {
 			if (!user) return;
-
-			// Get current video time from the video element
-			const videoElement = document.querySelector("video") as HTMLVideoElement;
-			const currentTime = videoElement?.currentTime || 0;
 
 			const optimisticComment: CommentType = {
 				id: Comment.CommentId.make(`temp-${Date.now()}`),
@@ -93,9 +136,9 @@ export const Comments = Object.assign(
 				content,
 				createdAt: new Date(),
 				videoId: props.videoId,
-				parentCommentId: Comment.CommentId.make(""),
+				parentCommentId,
 				type: "text",
-				timestamp: currentTime,
+				timestamp,
 				updatedAt: new Date(),
 				sending: true,
 			};
@@ -104,66 +147,52 @@ export const Comments = Object.assign(
 				setOptimisticComments(optimisticComment);
 			});
 
+			const data = await newComment({
+				content,
+				videoId: props.videoId,
+				authorImage: user.imageUrl,
+				parentCommentId,
+				type: "text",
+				timestamp,
+			});
+			handleCommentSuccess(data);
+			return data;
+		};
+
+		const currentVideoTime = () => {
+			const videoElement = document.querySelector("video") as HTMLVideoElement;
+			return videoElement?.currentTime || 0;
+		};
+
+		const handleNewComment = async (content: string) => {
 			try {
-				const data = await newComment({
+				await postComment(
 					content,
-					videoId: props.videoId,
-					authorImage: user.imageUrl,
-					parentCommentId: Comment.CommentId.make(""),
-					type: "text",
-					timestamp: currentTime,
-				});
-				handleCommentSuccess(data);
+					Comment.CommentId.make(""),
+					currentVideoTime(),
+				);
 			} catch (error) {
 				console.error("Error posting comment:", error);
 			}
 		};
 
 		const handleReply = async (content: string) => {
-			if (!replyingTo || !user) return;
-
-			const videoElement = document.querySelector("video") as HTMLVideoElement;
-			const currentTime = videoElement?.currentTime || 0;
+			if (!replyingTo) return;
 
 			const parentComment = optimisticComments.find((c) => c.id === replyingTo);
 			const actualParentId = parentComment?.parentCommentId
 				? parentComment.parentCommentId
 				: replyingTo;
 
-			const optimisticReply: CommentType = {
-				id: Comment.CommentId.make(`temp-reply-${Date.now()}`),
-				authorId: user.id,
-				authorName: user.name,
-				authorImage: user.imageUrl,
-				content,
-				createdAt: new Date(),
-				videoId: props.videoId,
-				parentCommentId: actualParentId,
-				type: "text",
-				timestamp: currentTime,
-				updatedAt: new Date(),
-				sending: true,
-			};
-
-			startTransition(() => {
-				setOptimisticComments(optimisticReply);
-			});
-
 			try {
-				const data = await newComment({
+				const data = await postComment(
 					content,
-					videoId: props.videoId,
-					parentCommentId: actualParentId,
-					type: "text",
-					timestamp: currentTime,
-					authorImage: user.imageUrl,
-				});
-
-				handleCommentSuccess(data);
-
-				const newReplyElement = document.getElementById(`comment-${data.id}`);
-				if (newReplyElement) {
-					newReplyElement.scrollIntoView({
+					actualParentId,
+					currentVideoTime(),
+				);
+				if (data) {
+					const newReplyElement = document.getElementById(`comment-${data.id}`);
+					newReplyElement?.scrollIntoView({
 						behavior: "smooth",
 						block: "center",
 					});
@@ -172,6 +201,24 @@ export const Comments = Object.assign(
 			} catch (error) {
 				console.error("Error posting reply:", error);
 			}
+		};
+
+		const handleResolve = async (threadId: Comment.CommentId) => {
+			if (!user) {
+				props.setShowAuthOverlay(true);
+				return;
+			}
+			// a fresh done-message must win over any earlier local reopen
+			clearReopen(threadId);
+			try {
+				await postComment(DONE_MESSAGE, threadId, null);
+			} catch (error) {
+				console.error("Error resolving thread:", error);
+			}
+		};
+
+		const handleReopen = (threadId: Comment.CommentId) => {
+			reopen(threadId);
 		};
 
 		const handleCancelReply = () => {
@@ -194,6 +241,33 @@ export const Comments = Object.assign(
 			}
 		};
 
+		const onReply = (id: Comment.CommentId) => {
+			if (!user) {
+				props.setShowAuthOverlay(true);
+			} else {
+				setReplyingTo(id);
+			}
+		};
+
+		const renderThread = (thread: Thread) => (
+			<CommentThread
+				key={thread.root.id}
+				comment={thread.root}
+				replies={thread.replies}
+				isDone={thread.isDone}
+				onReply={onReply}
+				replyingToId={replyingTo}
+				handleReply={handleReply}
+				onCancelReply={handleCancelReply}
+				onDelete={handleDeleteComment}
+				onResolve={handleResolve}
+				onReopen={handleReopen}
+				onSeek={onSeek}
+			/>
+		);
+
+		const hasThreads = openThreads.length > 0 || resolvedThreads.length > 0;
+
 		return (
 			<Comments.Shell
 				commentInputProps={{
@@ -210,29 +284,50 @@ export const Comments = Object.assign(
 							commentsDisabled={commentsDisabled}
 						/>
 					</div>
-				) : rootComments.length === 0 ? (
+				) : !hasThreads ? (
 					<EmptyState />
 				) : (
 					<div className="p-4 space-y-6">
-						{rootComments.map((comment) => (
-							<CommentComponent
-								key={comment.id}
-								comment={comment}
-								replies={optimisticComments}
-								onReply={(id) => {
-									if (!user) {
-										props.setShowAuthOverlay(true);
-									} else {
-										setReplyingTo(id);
-									}
-								}}
-								replyingToId={replyingTo}
-								handleReply={handleReply}
-								onCancelReply={handleCancelReply}
-								onDelete={handleDeleteComment}
-								onSeek={onSeek}
-							/>
-						))}
+						{openThreads.map(renderThread)}
+
+						{openThreads.length === 0 && resolvedThreads.length > 0 && (
+							<div className="flex flex-col items-center py-6 text-center">
+								<FontAwesomeIcon
+									icon={faCircleCheck}
+									className="mb-2 text-green-500 size-6"
+								/>
+								<p className="text-sm font-medium text-gray-12">
+									All threads resolved
+								</p>
+								<p className="text-xs text-gray-9">Nothing left to do here.</p>
+							</div>
+						)}
+
+						{resolvedThreads.length > 0 && (
+							<div className="space-y-4">
+								<button
+									type="button"
+									onClick={() => setShowResolved((v) => !v)}
+									className="flex gap-2 items-center w-full text-xs font-medium text-gray-9 hover:text-gray-12 transition-colors"
+								>
+									<div className="flex-1 h-px bg-gray-4" />
+									<span className="flex gap-1.5 items-center">
+										<FontAwesomeIcon
+											className="size-[9px]"
+											icon={showResolved ? faChevronDown : faChevronRight}
+										/>
+										{resolvedThreads.length} resolved{" "}
+										{resolvedThreads.length === 1 ? "thread" : "threads"}
+									</span>
+									<div className="flex-1 h-px bg-gray-4" />
+								</button>
+								{showResolved && (
+									<div className="space-y-6">
+										{resolvedThreads.map(renderThread)}
+									</div>
+								)}
+							</div>
+						)}
 					</div>
 				)}
 			</Comments.Shell>

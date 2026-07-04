@@ -561,7 +561,7 @@ export const Share = ({
 					</div>
 
 					{!allSettingsDisabled && (
-						<div className="flex flex-col lg:w-80">
+						<div className="flex flex-col lg:w-96 lg:sticky lg:top-4 lg:self-start lg:h-[calc(100vh-2rem)]">
 							<Sidebar
 								data={{
 									...data,

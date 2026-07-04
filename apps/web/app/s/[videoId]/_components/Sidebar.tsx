@@ -198,7 +198,7 @@ export const Sidebar = forwardRef<{ scrollToBottom: () => void }, SidebarProps>(
 		const allTabsDisabled = tabs.every((tab) => tab.disabled);
 
 		return (
-			<div className="bg-white rounded-2xl border border-gray-5 overflow-hidden h-[calc(100vh-16rem)] lg:h-full flex flex-col lg:aspect-video">
+			<div className="bg-white rounded-2xl border border-gray-5 overflow-hidden h-[calc(100vh-16rem)] lg:h-full flex flex-col">
 				<div className="flex-none">
 					<div
 						className={clsx(
