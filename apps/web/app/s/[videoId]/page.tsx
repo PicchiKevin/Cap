@@ -887,7 +887,7 @@ async function AuthorizedContent({
 	}
 
 	return (
-		<div className="container flex-1 px-4 pb-8 mx-auto">
+		<div className="container flex-1 px-4 pb-8 mx-auto lg:max-w-none lg:mx-0 lg:pr-[27rem] xl:pr-[29rem]">
 			<ShareHeader
 				data={{
 					...videoWithOrganizationInfo,

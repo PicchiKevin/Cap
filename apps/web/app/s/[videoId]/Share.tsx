@@ -561,7 +561,7 @@ export const Share = ({
 					</div>
 
 					{!allSettingsDisabled && (
-						<div className="flex flex-col lg:w-[26rem] xl:w-[28rem] lg:sticky lg:top-0 lg:self-start lg:h-screen lg:py-3">
+						<div className="flex flex-col lg:fixed lg:top-0 lg:right-0 lg:bottom-0 lg:z-20 lg:w-[26rem] xl:w-[28rem] lg:p-3">
 							<Sidebar
 								data={{
 									...data,

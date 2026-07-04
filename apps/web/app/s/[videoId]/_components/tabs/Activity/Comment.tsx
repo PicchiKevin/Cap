@@ -6,6 +6,7 @@ import {
 	faReply,
 	faRotateLeft,
 	faTrash,
+	faXmark,
 } from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import clsx from "clsx";
@@ -51,22 +52,11 @@ const ActionButton: React.FC<{
 const CommentRow: React.FC<{
 	comment: CommentType;
 	isReply?: boolean;
-	onReply?: () => void;
 	onDelete?: () => void;
-	onResolve?: () => void;
 	onReopen?: () => void;
 	onSeek?: (time: number) => void;
 	badge?: React.ReactNode;
-}> = ({
-	comment,
-	isReply,
-	onReply,
-	onDelete,
-	onResolve,
-	onReopen,
-	onSeek,
-	badge,
-}) => {
+}> = ({ comment, isReply, onDelete, onReopen, onSeek, badge }) => {
 	const user = useCurrentUser();
 	const isOwnComment = user?.id === comment.authorId;
 	const commentDate = new Date(comment.createdAt);
@@ -94,7 +84,7 @@ const CommentRow: React.FC<{
 						{formatTimeAgo(commentDate)}
 					</span>
 				</Tooltip>
-				{comment.timestamp !== null && (
+				{!isReply && comment.timestamp !== null && (
 					<button
 						type="button"
 						onClick={() => onSeek?.(Number(comment.timestamp))}
@@ -112,34 +102,25 @@ const CommentRow: React.FC<{
 			>
 				<LinkifiedText text={comment.content} />
 			</p>
-			<div className="hidden absolute -top-1 right-0 gap-0.5 items-center p-0.5 rounded-lg border shadow-sm group-hover:flex bg-gray-1 border-gray-4">
-				{onReply && (
-					<ActionButton tooltip="Reply" icon={faReply} onClick={onReply} />
-				)}
-				{onResolve && (
-					<ActionButton
-						tooltip={`Mark as done — posts "This is done"`}
-						icon={faCheck}
-						onClick={onResolve}
-						success
-					/>
-				)}
-				{onReopen && (
-					<ActionButton
-						tooltip="Reopen thread"
-						icon={faRotateLeft}
-						onClick={onReopen}
-					/>
-				)}
-				{isOwnComment && onDelete && (
-					<ActionButton
-						tooltip="Delete"
-						icon={faTrash}
-						onClick={onDelete}
-						danger
-					/>
-				)}
-			</div>
+			{(onReopen || (isOwnComment && onDelete)) && (
+				<div className="hidden absolute -top-1 right-0 gap-0.5 items-center p-0.5 rounded-lg border shadow-sm group-hover:flex bg-gray-1 border-gray-4">
+					{onReopen && (
+						<ActionButton
+							tooltip="Reopen thread"
+							icon={faRotateLeft}
+							onClick={onReopen}
+						/>
+					)}
+					{isOwnComment && onDelete && (
+						<ActionButton
+							tooltip="Delete"
+							icon={faTrash}
+							onClick={onDelete}
+							danger
+						/>
+					)}
+				</div>
+			)}
 		</div>
 	);
 };
@@ -197,7 +178,6 @@ const CommentThread: React.FC<{
 	onReopen,
 	onSeek,
 }) => {
-	const user = useCurrentUser();
 	const isReplying = replyingToId === comment.id;
 	const [showReplies, setShowReplies] = useState(!isDone);
 	const commentParams = useSearchParams().get("comment");
@@ -241,10 +221,6 @@ const CommentThread: React.FC<{
 						</span>
 					) : undefined
 				}
-				onReply={
-					user && !isReplying && !isDone ? () => onReply(comment.id) : undefined
-				}
-				onResolve={user && !isDone ? () => onResolve(comment.id) : undefined}
 				onReopen={isDone ? () => onReopen(comment.id) : undefined}
 				onDelete={() => handleDelete(comment)}
 			/>
@@ -293,15 +269,45 @@ const CommentThread: React.FC<{
 				)}
 			</AnimatePresence>
 
+			{!isDone && !isReplying && (
+				<div className="flex gap-1.5 mt-2 ml-[26px]">
+					<button
+						type="button"
+						onClick={() => onReply(comment.id)}
+						className="flex gap-1.5 items-center px-2 py-1 text-[11px] font-medium rounded-md border transition-colors border-gray-4 bg-gray-1 text-gray-10 hover:bg-gray-3 hover:text-gray-12"
+					>
+						<FontAwesomeIcon className="size-[9px]" icon={faReply} />
+						Reply
+					</button>
+					<button
+						type="button"
+						onClick={() => onResolve(comment.id)}
+						className="flex gap-1.5 items-center px-2 py-1 text-[11px] font-medium rounded-md border transition-colors border-gray-4 bg-gray-1 text-gray-10 hover:bg-green-50 hover:border-green-300 hover:text-green-700"
+					>
+						<FontAwesomeIcon className="size-[9px]" icon={faCheck} />
+						Mark done
+					</button>
+				</div>
+			)}
+
 			{isReplying && (
-				<div className="mt-2 ml-[26px]">
-					<CommentInput
-						onSubmit={handleReply}
-						onCancel={onCancelReply}
-						placeholder="Write a reply..."
-						showCancelButton={true}
-						autoFocus={true}
-					/>
+				<div className="flex gap-1.5 items-start mt-2 ml-[26px]">
+					<div className="flex-1 min-w-0">
+						<CommentInput
+							onSubmit={handleReply}
+							placeholder="Write a reply..."
+							autoFocus={true}
+						/>
+					</div>
+					<Tooltip content="Close">
+						<button
+							type="button"
+							onClick={onCancelReply}
+							className="flex justify-center items-center mt-1 rounded-md size-6 shrink-0 text-gray-8 transition-colors hover:bg-gray-3 hover:text-gray-12"
+						>
+							<FontAwesomeIcon className="size-[11px]" icon={faXmark} />
+						</button>
+					</Tooltip>
 				</div>
 			)}
 		</motion.div>
