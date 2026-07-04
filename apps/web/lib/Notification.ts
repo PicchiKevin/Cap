@@ -11,6 +11,7 @@ import { and, eq, gte, isNull, ne, or, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import type { UserPreferences } from "@/app/(org)/dashboard/dashboard-data";
 import { getSessionHash } from "@/lib/anonymous-names";
+import { sendSlackCommentNotification } from "@/lib/slack-notifications";
 
 export type NotificationType = Notification["type"];
 
@@ -101,6 +102,19 @@ export async function createNotification(
 		};
 
 		const { type, ...data } = notification;
+
+		// Slack DMs go to all thread participants, independent of the single
+		// in-app notification below and its early returns (owner-authored
+		// replies, per-user pauses, dedup) — hence dispatched up front.
+		if (type === "comment" || type === "reply") {
+			void sendSlackCommentNotification({
+				videoId: notification.videoId,
+				authorId: notification.authorId,
+				comment: notification.comment,
+				parentCommentId:
+					type === "reply" ? (notification.parentCommentId ?? null) : null,
+			});
+		}
 
 		if (type === "reply" && notification.parentCommentId) {
 			const [parentComment] = await db()

@@ -31,6 +31,10 @@ oauth_config:
       - links:read
       - links:write
       - links.embed:write
+      # comment notification DMs
+      - chat:write
+      - im:write
+      - users:read.email
 
 settings:
   event_subscriptions:
