@@ -52,6 +52,11 @@ const lookupSlackUserId = async (botToken: string, email: string) => {
 	const slackUserId = result?.ok && result.user ? result.user.id : null;
 	if (result && (result.ok || result.error === "users_not_found")) {
 		slackUserCache.set(email, { slackUserId, fetchedAt: Date.now() });
+	} else if (result) {
+		// missing_scope / invalid_auth etc. — surface it, otherwise DMs fail silently
+		console.error(
+			`[slack-notifications] users.lookupByEmail failed: ${result.error}`,
+		);
 	}
 	return slackUserId;
 };
