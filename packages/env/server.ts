@@ -97,6 +97,16 @@ function createServerEnv() {
 			SUPERMEMORY_API_KEY: z.string().optional(),
 			SUPERMEMORY_KNOWLEDGE_TAG: z.string().optional(),
 
+			/// Slack link unfurling (optional)
+			SLACK_SIGNING_SECRET: z
+				.string()
+				.optional()
+				.describe("Slack app signing secret for link unfurl events"),
+			SLACK_BOT_TOKEN: z
+				.string()
+				.optional()
+				.describe("Slack bot token (xoxb-…) used to call chat.unfurl"),
+
 			/// Cap Cloud
 			// These are only needed for Cap Cloud (https://cap.so)
 			STRIPE_SECRET_KEY: z.string().optional(),

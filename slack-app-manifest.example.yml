@@ -1,0 +1,42 @@
+# Slack app manifest for Cap link unfurling (inline video playback in Slack).
+#
+# Setup:
+#  1. Replace YOUR-CAP-DOMAIN below with your Cap instance domain (3 places).
+#  2. Go to https://api.slack.com/apps -> "Create New App" -> "From a manifest",
+#     pick your workspace and paste this file.
+#  3. On the app page: "Install to Workspace", then copy
+#       - Settings -> Basic Information -> Signing Secret  -> SLACK_SIGNING_SECRET
+#       - Settings -> Install App -> Bot User OAuth Token  -> SLACK_BOT_TOKEN
+#     into your Cap server environment and redeploy.
+#  4. Slack verifies the request URL when saving; your deployment must be live
+#     with both env vars set first (re-run "Verify" if needed).
+#
+# Only public videos are unfurled; private links fall back to a plain link.
+
+display_information:
+  name: Cap
+  description: Watch Cap recordings without leaving Slack
+  background_color: "#4785FF"
+
+features:
+  bot_user:
+    display_name: Cap
+    always_online: true
+  unfurl_domains:
+    - YOUR-CAP-DOMAIN
+
+oauth_config:
+  scopes:
+    bot:
+      - links:read
+      - links:write
+      - links.embed:write
+
+settings:
+  event_subscriptions:
+    request_url: https://YOUR-CAP-DOMAIN/api/slack/events
+    bot_events:
+      - link_shared
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
