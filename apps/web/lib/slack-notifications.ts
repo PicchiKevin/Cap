@@ -42,11 +42,21 @@ const lookupSlackUserId = async (botToken: string, email: string) => {
 		return cached.slackUserId;
 	}
 
-	const result = await slackApi<{
-		ok: boolean;
-		error?: string;
-		user?: { id: string };
-	}>(botToken, "users.lookupByEmail", { email });
+	// users.lookupByEmail rejects JSON bodies (invalid_arguments) — query only
+	type LookupResult = { ok: boolean; error?: string; user?: { id: string } };
+	let result: LookupResult | null = null;
+	try {
+		const response = await fetch(
+			`https://slack.com/api/users.lookupByEmail?email=${encodeURIComponent(email)}`,
+			{ headers: { Authorization: `Bearer ${botToken}` } },
+		);
+		result = (await response.json()) as LookupResult;
+	} catch (error) {
+		console.error(
+			"[slack-notifications] users.lookupByEmail request failed:",
+			error,
+		);
+	}
 
 	// users_not_found is expected for emails without a Slack account
 	const slackUserId = result?.ok && result.user ? result.user.id : null;
