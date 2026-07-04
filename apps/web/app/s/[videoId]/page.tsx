@@ -247,7 +247,7 @@ export async function generateMetadata(
 						buildEnv.NEXT_PUBLIC_WEB_URL,
 					).toString();
 					const playlistUrl = new URL(
-						`/api/playlist?videoId=${video.id}`,
+						`/api/playlist?videoId=${video.id}&videoType=mp4`,
 						buildEnv.NEXT_PUBLIC_WEB_URL,
 					).toString();
 
@@ -256,16 +256,18 @@ export async function generateMetadata(
 						description: "Watch this video on Cap",
 						openGraph: {
 							images: [
+								// static PNG first: crawlers like Slackbot validate the primary
+								// image and can drop the card on the signed-GIF redirect
+								{
+									url: ogImageUrl,
+									width: 1200,
+									height: 630,
+								},
 								{
 									url: previewImageUrl,
 									width: 480,
 									height: 270,
 									type: "image/gif",
-								},
-								{
-									url: ogImageUrl,
-									width: 1200,
-									height: 630,
 								},
 							],
 							videos: [
@@ -283,20 +285,21 @@ export async function generateMetadata(
 							description: "Watch this video on Cap",
 							images: [
 								{
+									url: ogImageUrl,
+									width: 1200,
+									height: 630,
+								},
+								{
 									url: previewImageUrl,
 									width: 480,
 									height: 270,
 									type: "image/gif",
 								},
-								{
-									url: ogImageUrl,
-									width: 1200,
-									height: 630,
-								},
 							],
 							players: {
+								// the embed page is iframe-embeddable; /s is a full page
 								playerUrl: new URL(
-									`/s/${videoId}`,
+									`/embed/${videoId}`,
 									buildEnv.NEXT_PUBLIC_WEB_URL,
 								).toString(),
 								streamUrl: playlistUrl,
