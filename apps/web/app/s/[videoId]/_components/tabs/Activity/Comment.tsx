@@ -1,4 +1,3 @@
-import { Button } from "@cap/ui";
 import type { Comment } from "@cap/web-domain";
 import {
 	faCheck,
@@ -26,165 +25,146 @@ import { formatTimeAgo, formatTimestamp } from "./utils";
 const formatVideoTimestamp = (timestamp: number) =>
 	new Date(timestamp * 1000).toISOString().substr(11, 8);
 
-const CommentBubble: React.FC<{
+const ActionButton: React.FC<{
+	tooltip: string;
+	icon: typeof faReply;
+	onClick: () => void;
+	danger?: boolean;
+	success?: boolean;
+}> = ({ tooltip, icon, onClick, danger, success }) => (
+	<Tooltip content={tooltip}>
+		<button
+			type="button"
+			onClick={onClick}
+			className={clsx(
+				"flex justify-center items-center rounded-md size-6 text-gray-8 transition-colors hover:bg-gray-3",
+				danger && "hover:text-red-500",
+				success && "hover:text-green-600",
+				!danger && !success && "hover:text-gray-12",
+			)}
+		>
+			<FontAwesomeIcon className="size-[10px]" icon={icon} />
+		</button>
+	</Tooltip>
+);
+
+const CommentRow: React.FC<{
 	comment: CommentType;
-	isRoot?: boolean;
-	isDone?: boolean;
+	isReply?: boolean;
 	onReply?: () => void;
 	onDelete?: () => void;
 	onResolve?: () => void;
 	onReopen?: () => void;
 	onSeek?: (time: number) => void;
+	badge?: React.ReactNode;
 }> = ({
 	comment,
-	isRoot,
-	isDone,
+	isReply,
 	onReply,
 	onDelete,
 	onResolve,
 	onReopen,
 	onSeek,
+	badge,
 }) => {
 	const user = useCurrentUser();
 	const isOwnComment = user?.id === comment.authorId;
-	const commentParams = useSearchParams().get("comment");
-	const replyParams = useSearchParams().get("reply");
-	const isHighlighted = (commentParams || replyParams) === comment.id;
 	const commentDate = new Date(comment.createdAt);
-	const hasActions = Boolean(onReply || onDelete || onResolve || onReopen);
 
 	return (
-		<div className="flex items-start space-x-2.5">
-			{comment.authorName && (
-				<SignedImageUrl
-					image={comment.authorImage}
-					name={comment.authorName}
-					className="size-6"
-					letterClass="text-sm"
-				/>
-			)}
-			<motion.div
-				viewport={{ once: true }}
-				whileInView={{
-					scale: isHighlighted ? [1, 1.08, 1] : 1,
-					borderColor: isHighlighted ? ["#EEEEEE", "#1696e0"] : "#EEEEEE",
-					backgroundColor: isHighlighted ? ["#F9F9F9", "#EDF6FF"] : " #F9F9F9",
-				}}
-				transition={{ duration: 0.75, ease: "easeInOut", delay: 0.15 }}
+		<div
+			id={`comment-${comment.id}`}
+			className={clsx("group relative", comment.sending && "opacity-40")}
+		>
+			<div className="flex gap-1.5 items-center">
+				{comment.authorName && (
+					<SignedImageUrl
+						image={comment.authorImage}
+						name={comment.authorName}
+						className={isReply ? "size-4" : "size-5"}
+						letterClass={isReply ? "text-[9px]" : "text-[10px]"}
+					/>
+				)}
+				<span className="text-xs font-medium truncate text-gray-12">
+					{comment.authorName || "Anonymous"}
+				</span>
+				{badge}
+				<Tooltip content={formatTimestamp(commentDate)}>
+					<span className="text-[11px] text-gray-8 shrink-0">
+						{formatTimeAgo(commentDate)}
+					</span>
+				</Tooltip>
+				{comment.timestamp !== null && (
+					<button
+						type="button"
+						onClick={() => onSeek?.(Number(comment.timestamp))}
+						className="text-[11px] tabular-nums text-blue-500 shrink-0 cursor-pointer hover:text-blue-700"
+					>
+						{formatVideoTimestamp(comment.timestamp)}
+					</button>
+				)}
+			</div>
+			<p
 				className={clsx(
-					"flex-1 p-3 rounded-xl border border-gray-3 bg-gray-2 min-w-0",
-					isDone && "opacity-75",
+					"mt-0.5 text-[13px] leading-snug text-gray-11 break-words",
+					isReply ? "pl-[22px]" : "pl-[26px]",
 				)}
 			>
-				<div className="flex gap-3 justify-between items-center">
-					<div className="flex gap-2 items-center min-w-0">
-						<p className="text-sm font-medium truncate text-gray-12">
-							{comment.authorName || "Anonymous"}
-						</p>
-						{isRoot && isDone && (
-							<span className="flex gap-1 items-center px-1.5 py-0.5 text-[11px] font-medium text-green-700 bg-green-100 rounded-full">
-								<FontAwesomeIcon className="size-[9px]" icon={faCheck} />
-								Done
-							</span>
-						)}
-					</div>
-					<div className="flex gap-2 items-center text-nowrap min-w-fit">
-						<Tooltip content={formatTimestamp(commentDate)}>
-							<p className="text-xs text-gray-8">
-								{formatTimeAgo(commentDate)}
-							</p>
-						</Tooltip>
-						{comment.timestamp !== null && (
-							<button
-								type="button"
-								onClick={() => onSeek?.(Number(comment.timestamp))}
-								className="text-xs text-blue-500 cursor-pointer hover:text-blue-700"
-							>
-								{formatVideoTimestamp(comment.timestamp)}
-							</button>
-						)}
-					</div>
-				</div>
-				<p className="mt-2 text-sm text-gray-11">
-					<LinkifiedText text={comment.content} />
-				</p>
-				{hasActions && (
-					<div className="flex items-center pt-2 mt-2.5 space-x-2 border-t border-gray-3">
-						{onReply && (
-							<Tooltip content="Reply">
-								<Button
-									onClick={onReply}
-									size="icon"
-									variant="outline"
-									icon={
-										<FontAwesomeIcon className="size-[10px]" icon={faReply} />
-									}
-									className="text-[13px] p-0 size-6"
-								/>
-							</Tooltip>
-						)}
-						{onResolve && (
-							<Tooltip content={`Mark as done — posts "This is done"`}>
-								<Button
-									onClick={onResolve}
-									size="icon"
-									variant="outline"
-									icon={
-										<FontAwesomeIcon className="size-[10px]" icon={faCheck} />
-									}
-									className="text-[13px] p-0 size-6 hover:text-green-600 hover:border-green-300"
-								/>
-							</Tooltip>
-						)}
-						{onReopen && (
-							<Tooltip content="Reopen thread">
-								<Button
-									onClick={onReopen}
-									size="icon"
-									variant="outline"
-									icon={
-										<FontAwesomeIcon
-											className="size-[10px]"
-											icon={faRotateLeft}
-										/>
-									}
-									className="text-[13px] p-0 size-6"
-								/>
-							</Tooltip>
-						)}
-						{isOwnComment && onDelete && (
-							<Tooltip content="Delete comment">
-								<Button
-									onClick={onDelete}
-									size="icon"
-									variant="outline"
-									icon={
-										<FontAwesomeIcon className="size-[10px]" icon={faTrash} />
-									}
-									className="text-[13px] p-0 size-6"
-								/>
-							</Tooltip>
-						)}
-					</div>
+				<LinkifiedText text={comment.content} />
+			</p>
+			<div className="hidden absolute -top-1 right-0 gap-0.5 items-center p-0.5 rounded-lg border shadow-sm group-hover:flex bg-gray-1 border-gray-4">
+				{onReply && (
+					<ActionButton tooltip="Reply" icon={faReply} onClick={onReply} />
 				)}
-			</motion.div>
+				{onResolve && (
+					<ActionButton
+						tooltip={`Mark as done — posts "This is done"`}
+						icon={faCheck}
+						onClick={onResolve}
+						success
+					/>
+				)}
+				{onReopen && (
+					<ActionButton
+						tooltip="Reopen thread"
+						icon={faRotateLeft}
+						onClick={onReopen}
+					/>
+				)}
+				{isOwnComment && onDelete && (
+					<ActionButton
+						tooltip="Delete"
+						icon={faTrash}
+						onClick={onDelete}
+						danger
+					/>
+				)}
+			</div>
 		</div>
 	);
 };
 
 const ResolutionLine: React.FC<{ comment: CommentType }> = ({ comment }) => (
-	<div className="flex gap-2 items-center py-1 text-xs text-gray-9">
-		<span className="flex justify-center items-center rounded-full bg-green-100 text-green-700 size-4">
-			<FontAwesomeIcon className="size-[8px]" icon={faCheck} />
+	<div
+		id={`comment-${comment.id}`}
+		className={clsx(
+			"flex gap-1.5 items-center text-[11px] text-gray-9",
+			comment.sending && "opacity-40",
+		)}
+	>
+		<span className="flex justify-center items-center rounded-full bg-green-100 text-green-700 size-3.5 shrink-0">
+			<FontAwesomeIcon className="size-[7px]" icon={faCheck} />
 		</span>
-		<span>
+		<span className="truncate">
 			<span className="font-medium text-gray-11">
 				{comment.authorName || "Anonymous"}
 			</span>{" "}
 			marked this as done
 		</span>
 		<Tooltip content={formatTimestamp(new Date(comment.createdAt))}>
-			<span>· {formatTimeAgo(new Date(comment.createdAt))}</span>
+			<span className="shrink-0">
+				· {formatTimeAgo(new Date(comment.createdAt))}
+			</span>
 		</Tooltip>
 	</div>
 );
@@ -220,6 +200,12 @@ const CommentThread: React.FC<{
 	const user = useCurrentUser();
 	const isReplying = replyingToId === comment.id;
 	const [showReplies, setShowReplies] = useState(!isDone);
+	const commentParams = useSearchParams().get("comment");
+	const replyParams = useSearchParams().get("reply");
+	const highlightedId = commentParams || replyParams;
+	const isHighlighted =
+		highlightedId === comment.id ||
+		replies.some((reply) => reply.id === highlightedId);
 
 	useEffect(() => {
 		if (isDone) setShowReplies(false);
@@ -231,21 +217,30 @@ const CommentThread: React.FC<{
 		}
 	};
 
-	const visibleReplyCount = replies.length;
-
 	return (
-		<div
-			id={`comment-${comment.id}`}
+		<motion.div
+			viewport={{ once: true }}
+			whileInView={{
+				borderColor: isHighlighted ? ["#EEEEEE", "#1696e0"] : "#EEEEEE",
+				backgroundColor: isHighlighted ? ["#FFFFFF", "#EDF6FF"] : "#FFFFFF",
+			}}
+			transition={{ duration: 0.75, ease: "easeInOut", delay: 0.15 }}
 			className={clsx(
-				"space-y-2",
-				comment.sending ? "opacity-20" : "opacity-100",
+				"p-2.5 rounded-lg border border-gray-3 bg-white",
+				isDone && "opacity-75",
 			)}
 		>
-			<CommentBubble
+			<CommentRow
 				comment={comment}
-				isRoot
-				isDone={isDone}
 				onSeek={onSeek}
+				badge={
+					isDone ? (
+						<span className="flex gap-1 items-center px-1.5 py-px text-[10px] font-medium text-green-700 bg-green-100 rounded-full shrink-0">
+							<FontAwesomeIcon className="size-[8px]" icon={faCheck} />
+							Done
+						</span>
+					) : undefined
+				}
 				onReply={
 					user && !isReplying && !isDone ? () => onReply(comment.id) : undefined
 				}
@@ -254,24 +249,24 @@ const CommentThread: React.FC<{
 				onDelete={() => handleDelete(comment)}
 			/>
 
-			{visibleReplyCount > 0 && (
+			{replies.length > 0 && (
 				<button
 					type="button"
 					onClick={() => setShowReplies((v) => !v)}
-					className="flex gap-1.5 items-center ml-9 text-xs font-medium text-gray-9 hover:text-gray-12 transition-colors"
+					className="flex gap-1 items-center mt-1.5 ml-[26px] text-[11px] font-medium text-gray-9 transition-colors hover:text-gray-12"
 				>
 					<FontAwesomeIcon
-						className="size-[9px]"
+						className="size-[8px]"
 						icon={showReplies ? faChevronDown : faChevronRight}
 					/>
 					{showReplies
 						? "Hide replies"
-						: `Show ${visibleReplyCount} ${visibleReplyCount === 1 ? "reply" : "replies"}`}
+						: `${replies.length} ${replies.length === 1 ? "reply" : "replies"}`}
 				</button>
 			)}
 
 			<AnimatePresence initial={false}>
-				{showReplies && visibleReplyCount > 0 && (
+				{showReplies && replies.length > 0 && (
 					<motion.div
 						initial={{ height: 0, opacity: 0 }}
 						animate={{ height: "auto", opacity: 1 }}
@@ -279,33 +274,18 @@ const CommentThread: React.FC<{
 						transition={{ duration: 0.2, ease: "easeInOut" }}
 						className="overflow-hidden"
 					>
-						<div className="ml-8 pl-4 space-y-3 border-l-2 border-gray-100">
+						<div className="mt-2 ml-[9px] pl-3.5 space-y-2 border-l border-gray-4">
 							{replies.map((reply) =>
 								isDoneMessage(reply) ? (
-									<div
-										key={reply.id}
-										id={`comment-${reply.id}`}
-										className={clsx(reply.sending && "opacity-20")}
-									>
-										<ResolutionLine comment={reply} />
-									</div>
+									<ResolutionLine key={reply.id} comment={reply} />
 								) : (
-									<div
+									<CommentRow
 										key={reply.id}
-										id={`comment-${reply.id}`}
-										className={clsx(reply.sending && "opacity-20")}
-									>
-										<CommentBubble
-											comment={reply}
-											onSeek={onSeek}
-											onReply={
-												user && replyingToId !== reply.id && !isDone
-													? () => onReply(reply.id)
-													: undefined
-											}
-											onDelete={() => handleDelete(reply)}
-										/>
-									</div>
+										comment={reply}
+										isReply
+										onSeek={onSeek}
+										onDelete={() => handleDelete(reply)}
+									/>
 								),
 							)}
 						</div>
@@ -314,7 +294,7 @@ const CommentThread: React.FC<{
 			</AnimatePresence>
 
 			{isReplying && (
-				<div className="ml-9">
+				<div className="mt-2 ml-[26px]">
 					<CommentInput
 						onSubmit={handleReply}
 						onCancel={onCancelReply}
@@ -324,7 +304,7 @@ const CommentThread: React.FC<{
 					/>
 				</div>
 			)}
-		</div>
+		</motion.div>
 	);
 };
 

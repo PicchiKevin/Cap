@@ -287,7 +287,7 @@ export const Comments = Object.assign(
 				) : !hasThreads ? (
 					<EmptyState />
 				) : (
-					<div className="p-4 space-y-6">
+					<div className="p-3 space-y-2.5">
 						{openThreads.map(renderThread)}
 
 						{openThreads.length === 0 && resolvedThreads.length > 0 && (
@@ -304,7 +304,7 @@ export const Comments = Object.assign(
 						)}
 
 						{resolvedThreads.length > 0 && (
-							<div className="space-y-4">
+							<div className="space-y-2.5">
 								<button
 									type="button"
 									onClick={() => setShowResolved((v) => !v)}
@@ -322,7 +322,7 @@ export const Comments = Object.assign(
 									<div className="flex-1 h-px bg-gray-4" />
 								</button>
 								{showResolved && (
-									<div className="space-y-6">
+									<div className="space-y-2.5">
 										{resolvedThreads.map(renderThread)}
 									</div>
 								)}
