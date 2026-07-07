@@ -1,3 +1,4 @@
+import { serverEnv } from "@cap/env";
 import { Storage } from "@cap/web-backend";
 import { Video } from "@cap/web-domain";
 import {
@@ -24,7 +25,7 @@ export async function GET(
 ) {
 	try {
 		const { videoId } = (await props.params) as { videoId: Video.VideoId };
-		const origin = new URL(request.url).origin;
+		const origin = serverEnv().WEB_URL.replace(/\/$/, "");
 
 		const user = await getRequestUser(request);
 		const video = await getViewableVideo(videoId, user);
