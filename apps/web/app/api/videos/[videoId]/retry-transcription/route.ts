@@ -1,9 +1,48 @@
 import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
-import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import {
+	organizationMembers,
+	organizations,
+	videos,
+} from "@cap/database/schema";
+import type { Organisation, User, Video } from "@cap/web-domain";
+import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
+import {
+	canManageOrganizationSettings,
+	getEffectiveOrganizationRole,
+} from "@/lib/permissions/roles";
+
+async function isOrgAdmin(
+	userId: User.UserId,
+	orgId: Organisation.OrganisationId,
+): Promise<boolean> {
+	const [row] = await db()
+		.select({
+			ownerId: organizations.ownerId,
+			memberRole: organizationMembers.role,
+		})
+		.from(organizations)
+		.leftJoin(
+			organizationMembers,
+			and(
+				eq(organizationMembers.organizationId, organizations.id),
+				eq(organizationMembers.userId, userId),
+			),
+		)
+		.where(eq(organizations.id, orgId))
+		.limit(1);
+
+	if (!row) return false;
+
+	const role = getEffectiveOrganizationRole({
+		userId,
+		ownerId: row.ownerId,
+		memberRole: row.memberRole,
+	});
+
+	return canManageOrganizationSettings(role);
+}
 
 export async function POST(
 	_request: Request,
@@ -20,7 +59,7 @@ export async function POST(
 			return Response.json({ error: "Video ID is required" }, { status: 400 });
 		}
 
-		// Verify user owns the video
+		// Verify user owns the video or is an admin/owner of its organization
 		const videoQuery = await db()
 			.select()
 			.from(videos)
@@ -32,7 +71,15 @@ export async function POST(
 		}
 
 		const video = videoQuery[0];
-		if (!video || video.ownerId !== user.id) {
+		if (!video) {
+			return Response.json({ error: "Video not found" }, { status: 404 });
+		}
+
+		const isAuthorized =
+			video.ownerId === user.id ||
+			(video.orgId ? await isOrgAdmin(user.id, video.orgId) : false);
+
+		if (!isAuthorized) {
 			return Response.json({ error: "Unauthorized" }, { status: 403 });
 		}
 
