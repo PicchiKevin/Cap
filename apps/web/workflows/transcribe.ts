@@ -1,4 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { db } from "@cap/database";
 import {
 	organizations,
@@ -15,10 +18,11 @@ import {
 	type AiGenerationLanguage,
 	type AiGenerationLanguageCode,
 	parseAiGenerationLanguage,
-	type Video,
+	Video,
 } from "@cap/web-domain";
 import { createClient } from "@deepgram/sdk";
 import { eq } from "drizzle-orm";
+import type { Effect } from "effect";
 import { FatalError } from "workflow";
 import {
 	ENHANCED_AUDIO_CONTENT_TYPE,
@@ -187,7 +191,25 @@ async function extractAudio(
 		decodeStorageVideo(video),
 	).pipe(runPromise);
 
-	const videoUrl = await resolveVideoSourceUrl(videoId, userId, video);
+	let videoUrl: string;
+	try {
+		videoUrl = await resolveVideoSourceUrl(videoId, userId, video);
+	} catch (sourceError) {
+		const segmentsResult = await extractAudioFromSegments(video, bucket);
+
+		if (segmentsResult === "no-segments") {
+			throw sourceError;
+		}
+
+		if (segmentsResult === "no-audio") {
+			console.log(
+				`[transcribe] Segmented recording ${videoId} has no audio track`,
+			);
+			return null;
+		}
+
+		return await uploadTempAudio(bucket, userId, videoId, segmentsResult);
+	}
 
 	const useMediaServer = isMediaServerConfigured();
 	console.log(
@@ -241,6 +263,19 @@ async function extractAudio(
 		}
 	}
 
+	return await uploadTempAudio(bucket, userId, videoId, audioBuffer);
+}
+
+type VideoBucketAccess = Effect.Effect.Success<
+	ReturnType<typeof Storage.getAccessForVideo>
+>[0];
+
+async function uploadTempAudio(
+	bucket: VideoBucketAccess,
+	userId: string,
+	videoId: string,
+	audioBuffer: Buffer,
+): Promise<string> {
 	console.log(
 		`[transcribe] Extracted audio for ${videoId}: ${audioBuffer.length} bytes`,
 	);
@@ -253,11 +288,76 @@ async function extractAudio(
 		})
 		.pipe(runPromise);
 
-	const audioSignedUrl = await bucket
-		.getInternalSignedObjectUrl(audioKey)
-		.pipe(runPromise);
+	return await bucket.getInternalSignedObjectUrl(audioKey).pipe(runPromise);
+}
 
-	return audioSignedUrl;
+async function extractAudioFromSegments(
+	video: typeof videos.$inferSelect,
+	bucket: VideoBucketAccess,
+): Promise<Buffer | "no-segments" | "no-audio"> {
+	const segSource = new Video.SegmentsSource({
+		videoId: video.id,
+		ownerId: video.ownerId,
+	});
+
+	const fetchObject = async (key: string): Promise<Buffer | null> => {
+		const url = await bucket.getInternalSignedObjectUrl(key).pipe(runPromise);
+		const response = await fetch(url);
+		if (!response.ok) return null;
+		return Buffer.from(await response.arrayBuffer());
+	};
+
+	const manifestBuffer = await fetchObject(segSource.getManifestKey());
+	if (!manifestBuffer) {
+		return "no-segments";
+	}
+
+	let manifest: Video.SegmentManifestType;
+	try {
+		manifest = JSON.parse(manifestBuffer.toString("utf-8"));
+	} catch {
+		console.error(
+			`[transcribe] Failed to parse segments manifest for ${video.id}`,
+		);
+		return "no-segments";
+	}
+
+	if (!manifest.audio_init_uploaded || manifest.audio_segments.length === 0) {
+		return "no-audio";
+	}
+
+	console.log(
+		`[transcribe] Extracting audio from ${manifest.audio_segments.length} segments for ${video.id}`,
+	);
+
+	const audioInit = await fetchObject(segSource.getAudioInitKey());
+	if (!audioInit) {
+		throw new Error("Audio init segment not accessible");
+	}
+
+	const parts: Buffer[] = [audioInit];
+	for (const entry of manifest.audio_segments) {
+		const { index } = Video.normalizeSegmentEntry(entry);
+		const segment = await fetchObject(segSource.getAudioSegmentKey(index));
+		if (!segment) {
+			throw new Error(`Audio segment ${index} not accessible`);
+		}
+		parts.push(segment);
+	}
+
+	const fmp4Path = join(tmpdir(), `segments-audio-${randomUUID()}.mp4`);
+	await fs.writeFile(fmp4Path, Buffer.concat(parts));
+
+	try {
+		const result = await extractAudioFromUrl(fmp4Path);
+		try {
+			return await fs.readFile(result.filePath);
+		} finally {
+			await result.cleanup();
+		}
+	} finally {
+		await fs.unlink(fmp4Path).catch(() => {});
+	}
 }
 
 async function resolveVideoSourceUrl(
@@ -276,6 +376,7 @@ async function resolveVideoSourceUrl(
 		.limit(1);
 
 	const candidateKeys = [
+		`${video.ownerId}/${videoId}/result.mp4`,
 		`${userId}/${videoId}/result.mp4`,
 		upload[0]?.rawFileKey,
 	].filter(
