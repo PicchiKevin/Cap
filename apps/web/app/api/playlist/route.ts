@@ -1,4 +1,5 @@
 import * as Db from "@cap/database/schema";
+import { serverEnv } from "@cap/env";
 import {
 	Database,
 	provideOptionalAuth,
@@ -16,6 +17,11 @@ import {
 } from "@effect/platform";
 import { eq } from "drizzle-orm";
 import { Effect, Layer, Option, Schema } from "effect";
+import { verifyAgentMediaToken } from "@/lib/agent-media-token";
+import {
+	resolveMobileRequestOrigin,
+	resolveMobileWebResourceUrl,
+} from "@/lib/mobile-request-origin";
 import { apiToHandler } from "@/lib/server";
 import { CACHE_CONTROL_HEADERS } from "@/utils/helpers";
 import {
@@ -40,6 +46,7 @@ const GetPlaylistParams = Schema.Struct({
 	requireComplete: Schema.OptionFromUndefinedOr(Schema.String),
 	thumbnail: Schema.OptionFromUndefinedOr(Schema.String),
 	fileType: Schema.OptionFromUndefinedOr(Schema.String),
+	agentMediaToken: Schema.OptionFromUndefinedOr(Schema.String),
 });
 
 class Api extends HttpApi.make("CapWebApi").add(
@@ -54,6 +61,24 @@ class Api extends HttpApi.make("CapWebApi").add(
 	),
 ) {}
 
+const getVideoForAgentMediaToken = (videoId: Video.VideoId) =>
+	Effect.gen(function* () {
+		const database = yield* Database;
+		const [row] = yield* database.use((db) =>
+			db.select().from(Db.videos).where(eq(Db.videos.id, videoId)).limit(1),
+		);
+		if (!row) return yield* Effect.fail(new HttpApiError.NotFound());
+
+		return Video.Video.decodeSync({
+			...row,
+			bucketId: row.bucket,
+			storageIntegrationId: row.storageIntegrationId,
+			createdAt: row.createdAt.toISOString(),
+			updatedAt: row.updatedAt.toISOString(),
+			metadata: row.metadata as Record<string, unknown> | null,
+		});
+	});
+
 const ApiLive = HttpApiBuilder.api(Api).pipe(
 	Layer.provide(
 		HttpApiBuilder.group(Api, "root", (handlers) =>
@@ -61,28 +86,56 @@ const ApiLive = HttpApiBuilder.api(Api).pipe(
 				const storage = yield* Storage;
 				const videos = yield* Videos;
 
-				return handlers.handle("getVideoSrc", ({ urlParams }) =>
+				return handlers.handle("getVideoSrc", ({ request, urlParams }) =>
 					Effect.gen(function* () {
-						const [video] = yield* videos
-							.getByIdForViewing(urlParams.videoId)
-							.pipe(
-								Effect.flatten,
-								Effect.catchTag(
-									"NoSuchElementException",
-									() => new HttpApiError.NotFound(),
-								),
-							);
+						const requestHost =
+							request.headers["x-forwarded-host"] ?? request.headers.host;
+						let requestUrl = request.originalUrl;
+						if (requestHost) {
+							try {
+								const url = new URL(requestUrl);
+								url.host = requestHost.split(",")[0]?.trim() ?? url.host;
+								requestUrl = url.toString();
+							} catch {
+								requestUrl = request.originalUrl;
+							}
+						}
+						const agentMediaToken = Option.getOrNull(urlParams.agentMediaToken);
+						const tokenClaims = agentMediaToken
+							? verifyAgentMediaToken(agentMediaToken)
+							: null;
+						const video =
+							tokenClaims?.videoId === urlParams.videoId
+								? yield* getVideoForAgentMediaToken(urlParams.videoId)
+								: (yield* videos.getByIdForViewing(urlParams.videoId).pipe(
+										Effect.flatten,
+										Effect.catchTag("NoSuchElementException", () =>
+											Effect.fail(new HttpApiError.NotFound()),
+										),
+									))[0];
 
-						return yield* getPlaylistResponse(video, urlParams);
+						return yield* getPlaylistResponse(
+							video,
+							urlParams,
+							resolveMobileRequestOrigin(
+								serverEnv().WEB_URL,
+								requestUrl,
+								requestHost,
+							),
+						);
 					}).pipe(
 						provideOptionalAuth,
 						Effect.tapErrorCause(Effect.logError),
 						Effect.catchTags({
-							VerifyVideoPasswordError: () => new HttpApiError.Forbidden(),
-							PolicyDenied: () => new HttpApiError.Unauthorized(),
-							DatabaseError: () => new HttpApiError.InternalServerError(),
-							StorageError: () => new HttpApiError.InternalServerError(),
-							UnknownException: () => new HttpApiError.InternalServerError(),
+							VerifyVideoPasswordError: () =>
+								Effect.fail(new HttpApiError.Forbidden()),
+							PolicyDenied: () => Effect.fail(new HttpApiError.Unauthorized()),
+							DatabaseError: () =>
+								Effect.fail(new HttpApiError.InternalServerError()),
+							StorageError: () =>
+								Effect.fail(new HttpApiError.InternalServerError()),
+							UnknownException: () =>
+								Effect.fail(new HttpApiError.InternalServerError()),
 						}),
 						Effect.provideService(Storage, storage),
 					),
@@ -136,11 +189,22 @@ const resolveRawPreviewKey = (video: Video.Video) =>
 const getPlaylistResponse = (
 	video: Video.Video,
 	urlParams: (typeof GetPlaylistParams)["Type"],
+	publicOrigin: string,
 ) =>
 	Effect.gen(function* () {
 		const [bucket, customBucket] = yield* Storage.getAccessForVideo(video);
 		const isMp4Source =
 			video.source.type === "desktopMP4" || video.source.type === "webMP4";
+		const agentMediaToken = Option.getOrNull(urlParams.agentMediaToken);
+		const playlistUrl = (videoType: string, requireComplete = false) => {
+			const params = new URLSearchParams({
+				videoId: video.id,
+				videoType,
+			});
+			if (requireComplete) params.set("requireComplete", "1");
+			if (agentMediaToken) params.set("agentMediaToken", agentMediaToken);
+			return `/api/playlist?${params}`;
+		};
 
 		if (urlParams.videoType === "raw-preview") {
 			const rawFileKey = yield* resolveRawPreviewKey(video);
@@ -194,13 +258,10 @@ const getPlaylistResponse = (
 					return yield* Effect.fail(new HttpApiError.NotFound());
 				}
 
-				const videoPlaylistUrl = `/api/playlist?videoId=${video.id}&videoType=segments-video`;
-				const requireCompleteSuffix = requireComplete
-					? "&requireComplete=1"
-					: "";
+				const videoPlaylistUrl = playlistUrl("segments-video", requireComplete);
 				const audioPlaylistUrl =
 					manifest.audio_init_uploaded && manifest.audio_segments.length > 0
-						? `/api/playlist?videoId=${video.id}&videoType=segments-audio${requireCompleteSuffix}`
+						? playlistUrl("segments-audio", requireComplete)
 						: null;
 
 				let playlist =
@@ -211,7 +272,7 @@ const getPlaylistResponse = (
 				} else {
 					playlist += "#EXT-X-STREAM-INF:BANDWIDTH=2000000\n";
 				}
-				playlist += `${videoPlaylistUrl}${requireCompleteSuffix}\n`;
+				playlist += `${videoPlaylistUrl}\n`;
 
 				return HttpServerResponse.text(playlist, {
 					headers: {
@@ -237,13 +298,28 @@ const getPlaylistResponse = (
 				return yield* Effect.fail(new HttpApiError.NotFound());
 			}
 
-			const initUrl = yield* bucket.getSignedObjectUrl(initKey);
+			const signedInitUrl = yield* bucket.getSignedObjectUrl(initKey);
+			const initUrl = resolveMobileWebResourceUrl(
+				signedInitUrl,
+				serverEnv().WEB_URL,
+				publicOrigin,
+			);
 			const segmentUrls = yield* Effect.all(
 				segments.map((seg) => {
 					const key = isVideo
 						? segSource.getVideoSegmentKey(seg.index)
 						: segSource.getAudioSegmentKey(seg.index);
-					return bucket.getSignedObjectUrl(key);
+					return bucket
+						.getSignedObjectUrl(key)
+						.pipe(
+							Effect.map((url) =>
+								resolveMobileWebResourceUrl(
+									url,
+									serverEnv().WEB_URL,
+									publicOrigin,
+								),
+							),
+						);
 				}),
 				{ concurrency: "unbounded" },
 			);
@@ -298,7 +374,7 @@ const getPlaylistResponse = (
 				.pipe(
 					Effect.andThen(
 						Option.match({
-							onNone: () => new HttpApiError.NotFound(),
+							onNone: () => Effect.fail(new HttpApiError.NotFound()),
 							onSome: (c) =>
 								HttpServerResponse.text(c).pipe(
 									HttpServerResponse.setHeaders({
@@ -319,7 +395,9 @@ const getPlaylistResponse = (
 			const enhancedAudioKey = `${video.ownerId}/${video.id}/enhanced-audio.mp3`;
 			return yield* bucket.getSignedObjectUrl(enhancedAudioKey).pipe(
 				Effect.map(HttpServerResponse.redirect),
-				Effect.catchTag("StorageError", () => new HttpApiError.NotFound()),
+				Effect.catchTag("StorageError", () =>
+					Effect.fail(new HttpApiError.NotFound()),
+				),
 				Effect.withSpan("fetchEnhancedAudio"),
 			);
 		}
@@ -386,10 +464,8 @@ const getPlaylistResponse = (
 				const generatedPlaylist = generateMasterPlaylist(
 					videoMetadata?.Metadata?.resolution ?? "",
 					videoMetadata?.Metadata?.bandwidth ?? "",
-					`/api/playlist?videoId=${video.id}&videoType=video`,
-					audioMetadata
-						? `/api/playlist?videoId=${video.id}&videoType=audio`
-						: null,
+					playlistUrl("video"),
+					audioMetadata ? playlistUrl("audio") : null,
 				);
 
 				return HttpServerResponse.text(generatedPlaylist, {

@@ -1,12 +1,18 @@
 import { db } from "@cap/database";
-import { videos, videoUploads } from "@cap/database/schema";
+import { users, videos, videoUploads } from "@cap/database/schema";
 import { serverEnv } from "@cap/env";
-import { Storage } from "@cap/web-backend";
+import { Storage } from "@cap/web-backend/src/Storage/index";
 import { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
-import { FatalError } from "workflow";
-import { runPromise } from "@/lib/server";
+import { FatalError, sleep } from "workflow";
+import { isAiGenerationEnabledForUser } from "@/lib/ai-generation-entitlement";
+import {
+	createMediaServerCapacityError,
+	isMediaServerCapacityError,
+} from "@/lib/media-server-backpressure";
+import { transcribeVideo } from "@/lib/transcribe";
 import { decodeStorageVideo } from "@/lib/video-storage";
+import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
 interface ProcessVideoWorkflowPayload {
 	videoId: string;
@@ -40,12 +46,24 @@ export async function processVideoWorkflow(
 	try {
 		await validateProcessingRequest(videoId, rawFileKey);
 
-		const result = await processVideoOnMediaServer(
-			videoId,
-			userId,
-			rawFileKey,
-			bucketId,
-		);
+		let result: MediaServerProcessResult;
+		let capacityRetryCount = 0;
+		while (true) {
+			try {
+				result = await processVideoOnMediaServer(
+					videoId,
+					userId,
+					rawFileKey,
+					bucketId,
+				);
+				break;
+			} catch (error) {
+				if (!isMediaServerCapacityError(error)) throw error;
+				await markVideoWaitingForCapacity(videoId);
+				await sleep(`${Math.min(120, 15 + capacityRetryCount * 15)}s`);
+				capacityRetryCount++;
+			}
+		}
 
 		await saveMetadataAndComplete(videoId, result.metadata);
 
@@ -53,6 +71,8 @@ export async function processVideoWorkflow(
 		if (rawFileKey !== outputKey) {
 			await cleanupRawUpload(videoId, rawFileKey);
 		}
+
+		await queueProcessedVideoTranscription(videoId);
 
 		return {
 			success: true,
@@ -113,8 +133,8 @@ interface MediaServerProcessResult {
 	};
 }
 
-const MEDIA_SERVER_START_MAX_ATTEMPTS = 6;
-const MEDIA_SERVER_START_RETRY_BASE_MS = 2000;
+const MEDIA_SERVER_START_MAX_ATTEMPTS = 2;
+const MEDIA_SERVER_START_RETRY_BASE_MS = 250;
 const MEDIA_SERVER_COMPLETION_MAX_ATTEMPTS = 720;
 const MEDIA_SERVER_COMPLETION_POLL_INTERVAL_MS = 5000;
 const MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS = 3 * 60 * 60;
@@ -215,6 +235,14 @@ async function startMediaServerProcessJob(
 			continue;
 		}
 
+		if (shouldRetry) {
+			throw createMediaServerCapacityError({
+				response,
+				message: errorMessage,
+				videoId: body.videoId,
+			});
+		}
+
 		throw new Error(errorMessage);
 	}
 
@@ -248,13 +276,13 @@ async function processVideoOnMediaServer(
 	const videoDomain = decodeStorageVideo(video);
 
 	const [bucket] =
-		await Storage.getAccessForVideo(videoDomain).pipe(runPromise);
+		await Storage.getAccessForVideo(videoDomain).pipe(runWorkflowPromise);
 
 	const rawVideoUrl = await bucket
 		.getInternalSignedObjectUrl(rawFileKey, {
 			expiresIn: MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS,
 		})
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
 	const outputKey = `${userId}/${videoId}/result.mp4`;
 	const thumbnailKey = `${userId}/${videoId}/screenshot/screen-capture.jpg`;
@@ -268,7 +296,7 @@ async function processVideoOnMediaServer(
 			},
 			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
 		)
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
 	const thumbnailPresignedUrl = await bucket
 		.getInternalPresignedPutUrl(
@@ -278,7 +306,7 @@ async function processVideoOnMediaServer(
 			},
 			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
 		)
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
 	const previewGifPresignedUrl = await bucket
 		.getInternalPresignedPutUrl(
@@ -289,7 +317,7 @@ async function processVideoOnMediaServer(
 			},
 			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
 		)
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
 	const webhookUrl = `${webhookBaseUrl}/api/webhooks/media-server/progress?retryable=true`;
 	const webhookSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET;
@@ -456,11 +484,49 @@ async function cleanupRawUpload(
 		const videoDomain = decodeStorageVideo(video);
 
 		const [bucket] =
-			await Storage.getAccessForVideo(videoDomain).pipe(runPromise);
+			await Storage.getAccessForVideo(videoDomain).pipe(runWorkflowPromise);
 
-		await bucket.deleteObject(rawFileKey).pipe(runPromise);
+		await bucket.deleteObject(rawFileKey).pipe(runWorkflowPromise);
 	} catch (error) {
 		console.error("[process-video] Failed to delete raw upload", error);
+	}
+}
+
+async function queueProcessedVideoTranscription(
+	videoId: string,
+): Promise<void> {
+	"use step";
+
+	try {
+		const [owner] = await db()
+			.select({
+				id: videos.ownerId,
+				stripeSubscriptionStatus: users.stripeSubscriptionStatus,
+				thirdPartyStripeSubscriptionId: users.thirdPartyStripeSubscriptionId,
+			})
+			.from(videos)
+			.innerJoin(users, eq(videos.ownerId, users.id))
+			.where(eq(videos.id, Video.VideoId.make(videoId)));
+
+		if (!owner) return;
+
+		const result = await transcribeVideo(
+			Video.VideoId.make(videoId),
+			owner.id,
+			isAiGenerationEnabledForUser(owner),
+		);
+
+		if (!result.success) {
+			console.warn("[process-video] Failed to queue transcription", {
+				videoId,
+				message: result.message,
+			});
+		}
+	} catch (error) {
+		console.warn("[process-video] Failed to queue transcription", {
+			videoId,
+			error,
+		});
 	}
 }
 
@@ -477,6 +543,19 @@ async function setProcessingError(
 			processingProgress: 0,
 			processingMessage: "Video processing failed",
 			processingError: errorMessage,
+			updatedAt: new Date(),
+		})
+		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+}
+
+async function markVideoWaitingForCapacity(videoId: string): Promise<void> {
+	"use step";
+
+	await db()
+		.update(videoUploads)
+		.set({
+			processingMessage: "Queued for video processing...",
+			processingError: null,
 			updatedAt: new Date(),
 		})
 		.where(eq(videoUploads.videoId, videoId as Video.VideoId));

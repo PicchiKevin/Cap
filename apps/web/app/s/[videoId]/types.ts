@@ -13,11 +13,14 @@ export type VideoData = Omit<typeof videos.$inferSelect, "ownerId"> & {
 	inheritedPasswordSources?: SpaceRuleSource[];
 	inheritedSpaceSettings?: Partial<Record<ViewerSettingKey, SpaceRuleSource[]>>;
 	orgSettings?: OrganizationSettings | null;
+	videoSettings?: OrganizationSettings | null;
 	organizationName?: string | null;
 	organizationIconUrl?: ImageUpload.ImageUrl | null;
 	shareableLinkIconUrl?: ImageUpload.ImageUrl | null;
 	hasActiveUpload?: boolean;
 	activeUploadRawFileKey?: string | null;
+	ownerIsOverShareLimit?: boolean;
+	canRetryTranscription?: boolean;
 };
 
 export type VideoOwner = {

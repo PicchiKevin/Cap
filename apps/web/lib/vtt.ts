@@ -1,32 +1,25 @@
+import { parseAgentVtt } from "@/lib/agent-api";
+
 export interface TranscriptCue {
 	start: string;
 	end: string;
 	text: string;
 }
 
+const formatVttTimestamp = (milliseconds: number) => {
+	const hours = Math.floor(milliseconds / 3_600_000);
+	const minutes = Math.floor((milliseconds % 3_600_000) / 60_000);
+	const seconds = Math.floor((milliseconds % 60_000) / 1_000);
+	const remainder = milliseconds % 1_000;
+	return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${remainder.toString().padStart(3, "0")}`;
+};
+
 export function parseVttCues(vtt: string): TranscriptCue[] {
-	const cues: TranscriptCue[] = [];
-	const blocks = vtt.replace(/\r/g, "").split("\n\n");
-
-	for (const block of blocks) {
-		const lines = block.split("\n").filter(Boolean);
-		const timingIndex = lines.findIndex((line) => line.includes("-->"));
-		if (timingIndex === -1) continue;
-
-		const timing = lines[timingIndex];
-		const text = lines
-			.slice(timingIndex + 1)
-			.join(" ")
-			.trim();
-		if (!timing || !text) continue;
-
-		const [start, end] = timing.split("-->").map((part) => part.trim());
-		if (!start || !end) continue;
-
-		cues.push({ start, end, text });
-	}
-
-	return cues;
+	return parseAgentVtt(vtt).map((cue) => ({
+		start: formatVttTimestamp(cue.startMs),
+		end: formatVttTimestamp(cue.endMs),
+		text: cue.text.replace(/\s+/g, " "),
+	}));
 }
 
 export function vttToPlainText(vtt: string): string {

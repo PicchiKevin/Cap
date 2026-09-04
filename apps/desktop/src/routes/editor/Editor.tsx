@@ -7,6 +7,7 @@ import { makePersisted } from "@solid-primitives/storage";
 import { createMutation, createQuery, skipToken } from "@tanstack/solid-query";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { emitTo } from "@tauri-apps/api/event";
 import { Menu } from "@tauri-apps/api/menu";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask } from "@tauri-apps/plugin-dialog";
@@ -17,11 +18,13 @@ import {
 	createSignal,
 	ErrorBoundary,
 	For,
+	lazy,
 	Match,
 	on,
 	onCleanup,
 	onMount,
 	Show,
+	Suspense,
 	Switch,
 } from "solid-js";
 import { createStore } from "solid-js/store";
@@ -39,7 +42,6 @@ import { Toggle } from "~/components/Toggle";
 import { composeEventHandlers } from "~/utils/composeEventHandlers";
 import { createTauriEventListener } from "~/utils/createEventListener";
 import { commands, events } from "~/utils/tauri";
-import { ClipsSidebar } from "./ClipsSidebar";
 import { ConfigSidebar } from "./ConfigSidebar";
 import {
 	EditorContextProvider,
@@ -51,13 +53,28 @@ import {
 	useEditorInstanceContext,
 } from "./context";
 import { EditorErrorScreen } from "./EditorErrorScreen";
-import { ExportPage } from "./ExportPage";
-import { Header } from "./Header";
+import { EditorSkeleton } from "./editor-skeleton";
+import { Header, type TitleSaveRegistration } from "./Header";
 import { ImportProgress } from "./ImportProgress";
 import { PlayerContent } from "./Player";
 import { Timeline } from "./Timeline";
-import { TranscriptPanel } from "./TranscriptPage";
 import { Dialog, DialogContent, EditorButton, Input, Subfield } from "./ui";
+
+// Deferred surfaces: these are not visible at first paint (export mode,
+// transcript panel, clips sidebar), so their code is split out of the editor
+// chunk to keep webview parse time — the dominant editor-open cost on
+// WebView2 — off the critical path. Each render site wraps them in a local
+// <Suspense> so the chunk load never bubbles up to the top-level editor
+// Suspense (which would flash the whole UI back to the skeleton).
+const ClipsSidebar = lazy(() =>
+	import("./ClipsSidebar").then((m) => ({ default: m.ClipsSidebar })),
+);
+const ExportPage = lazy(() =>
+	import("./ExportPage").then((m) => ({ default: m.ExportPage })),
+);
+const TranscriptPanel = lazy(() =>
+	import("./TranscriptPage").then((m) => ({ default: m.TranscriptPanel })),
+);
 
 const DEFAULT_TIMELINE_HEIGHT = 260;
 const MIN_PLAYER_CONTENT_HEIGHT = 320;
@@ -114,10 +131,92 @@ function getPreviewProjectConfig(
 		};
 	}
 
+	if (!editorState.timeline.tracks["3d"] && config.timeline) {
+		config.timeline = {
+			...config.timeline,
+			camera3dSegments: [],
+		};
+	}
+
 	return config;
 }
 
 export function Editor() {
+	const currentWindow = getCurrentWindow();
+	let flushTitleSave: (() => Promise<void>) | undefined;
+	let setTitleReadOnly: ((readOnly: boolean) => void) | undefined;
+	let activeTitleSave: { generation: number; requestId: string } | undefined;
+	const registerTitleSave = (
+		registration: TitleSaveRegistration | undefined,
+	) => {
+		flushTitleSave = registration?.flush;
+		setTitleReadOnly = registration?.setReadOnly;
+		setTitleReadOnly?.(activeTitleSave !== undefined);
+	};
+
+	onMount(() => {
+		let disposed = false;
+		let titleSaveGeneration = 0;
+
+		const titleSaveCancelled = currentWindow.listen<{ requestId: string }>(
+			"editor-title-save-cancelled",
+			({ payload }) => {
+				if (activeTitleSave?.requestId !== payload.requestId) return;
+				activeTitleSave = undefined;
+				setTitleReadOnly?.(false);
+			},
+		);
+
+		const titleSaveRequest = titleSaveCancelled.then(() =>
+			currentWindow.listen<{ requestId: string }>(
+				"editor-title-save-request",
+				async ({ payload }) => {
+					if (disposed) return;
+
+					const generation = titleSaveGeneration + 1;
+					titleSaveGeneration = generation;
+					const { requestId } = payload;
+					activeTitleSave = { generation, requestId };
+					const readOnly = setTitleReadOnly;
+					readOnly?.(true);
+
+					let error: string | null = null;
+					try {
+						if (flushTitleSave) await flushTitleSave();
+					} catch (cause) {
+						error = cause instanceof Error ? cause.message : String(cause);
+					}
+
+					if (
+						disposed ||
+						activeTitleSave?.generation !== generation ||
+						activeTitleSave?.requestId !== requestId
+					)
+						return;
+
+					try {
+						await emitTo(currentWindow.label, "editor-title-save-finished", {
+							requestId,
+							windowLabel: currentWindow.label,
+							error,
+						});
+					} catch (cause) {
+						console.error("Failed to acknowledge editor title save:", cause);
+						return;
+					}
+				},
+			),
+		);
+
+		onCleanup(() => {
+			disposed = true;
+			activeTitleSave = undefined;
+			setTitleReadOnly?.(false);
+			void titleSaveRequest.then((unlisten) => unlisten()).catch(() => {});
+			void titleSaveCancelled.then((unlisten) => unlisten()).catch(() => {});
+		});
+	});
+
 	const [projectPath] = createResource(() => commands.getEditorProjectPath());
 
 	const rawMetaQuery = createQuery(() => ({
@@ -189,13 +288,7 @@ export function Editor() {
 	};
 
 	return (
-		<Switch
-			fallback={
-				<div class="flex items-center justify-center h-full w-full">
-					<div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-500" />
-				</div>
-			}
-		>
+		<Switch fallback={<EditorSkeleton />}>
 			<Match
 				when={importStatus() === "importing" ? (projectPath() ?? null) : null}
 			>
@@ -218,7 +311,11 @@ export function Editor() {
 						)}
 					>
 						<EditorInstanceContextProvider>
-							<EditorContent projectPath={path()} />
+							<EditorContent
+								projectPath={path()}
+								getTitleSave={() => flushTitleSave}
+								registerTitleSave={registerTitleSave}
+							/>
 						</EditorInstanceContextProvider>
 					</ErrorBoundary>
 				)}
@@ -227,7 +324,11 @@ export function Editor() {
 	);
 }
 
-function EditorContent(props: { projectPath: string }) {
+function EditorContent(props: {
+	projectPath: string;
+	getTitleSave: () => (() => Promise<void>) | undefined;
+	registerTitleSave: (registration: TitleSaveRegistration | undefined) => void;
+}) {
 	const ctx = useEditorInstanceContext();
 
 	const errorInfo = () => {
@@ -256,7 +357,7 @@ function EditorContent(props: { projectPath: string }) {
 	};
 
 	return (
-		<Switch>
+		<Switch fallback={<EditorSkeleton />}>
 			<Match when={errorInfo()}>
 				{(info) => (
 					<EditorErrorScreen
@@ -268,7 +369,10 @@ function EditorContent(props: { projectPath: string }) {
 			<Match when={readyData()}>
 				{(values) => (
 					<EditorContextProvider {...values()}>
-						<Inner />
+						<Inner
+							getTitleSave={props.getTitleSave}
+							registerTitleSave={props.registerTitleSave}
+						/>
 					</EditorContextProvider>
 				)}
 			</Match>
@@ -276,7 +380,10 @@ function EditorContent(props: { projectPath: string }) {
 	);
 }
 
-function Inner() {
+function Inner(props: {
+	getTitleSave: () => (() => Promise<void>) | undefined;
+	registerTitleSave: (registration: TitleSaveRegistration | undefined) => void;
+}) {
 	const {
 		project,
 		editorInstance,
@@ -347,21 +454,27 @@ function Inner() {
 	let allowExportClose = false;
 	let closePromptOpen = false;
 
-	onMount(async () => {
-		const unlisten = await currentWindow.onCloseRequested(async (event) => {
-			if (
-				allowExportClose ||
-				exportState.type === "idle" ||
-				exportState.type === "done"
-			) {
-				return;
-			}
+	onMount(() => {
+		const closeRequested = currentWindow.onCloseRequested(async (event) => {
+			if (allowExportClose) return;
 
 			event.preventDefault();
 			if (closePromptOpen) return;
 
 			closePromptOpen = true;
 			try {
+				try {
+					await props.getTitleSave()?.();
+				} catch {
+					return;
+				}
+
+				if (exportState.type === "idle" || exportState.type === "done") {
+					allowExportClose = true;
+					await currentWindow.close();
+					return;
+				}
+
 				const resumeExport = await ask(
 					"An export is currently running. Keep this editor open to continue it, or quit the editor and cancel the export.",
 					{
@@ -381,7 +494,9 @@ function Inner() {
 			}
 		});
 
-		onCleanup(() => unlisten());
+		onCleanup(() => {
+			void closeRequested.then((unlisten) => unlisten()).catch(() => {});
+		});
 	});
 
 	const [layoutRef, setLayoutRef] = createSignal<HTMLDivElement>();
@@ -551,6 +666,7 @@ function Inner() {
 				return {
 					caption: editorState.timeline.tracks.caption,
 					keyboard: editorState.timeline.tracks.keyboard,
+					threeD: editorState.timeline.tracks["3d"],
 				};
 			},
 			() => {
@@ -639,9 +755,16 @@ function Inner() {
 	};
 
 	return (
-		<Show when={!fullscreenMode()} fallback={<ExportPage />}>
+		<Show
+			when={!fullscreenMode()}
+			fallback={
+				<Suspense fallback={<EditorSkeleton />}>
+					<ExportPage />
+				</Suspense>
+			}
+		>
 			<div class="flex flex-col flex-1 min-h-0">
-				<Header />
+				<Header registerTitleSave={props.registerTitleSave} />
 				<div
 					class="flex overflow-y-hidden flex-col flex-1 gap-2 w-full min-h-0 leading-5"
 					data-tauri-drag-region
@@ -707,10 +830,12 @@ function Inner() {
 										<ConfigSidebar />
 									</div>
 									<Show when={clipsSidebarMounted()}>
-										<ClipsSidebar
-											open={isClipsMode()}
-											class={isClipsMode() ? undefined : "hidden"}
-										/>
+										<Suspense>
+											<ClipsSidebar
+												open={isClipsMode()}
+												class={isClipsMode() ? undefined : "hidden"}
+											/>
+										</Suspense>
 									</Show>
 								</div>
 							</Show>
@@ -739,7 +864,9 @@ function Inner() {
 										"min-width": "0",
 									}}
 								>
-									<TranscriptPanel />
+									<Suspense>
+										<TranscriptPanel />
+									</Suspense>
 								</div>
 							</Show>
 						</div>
@@ -931,6 +1058,8 @@ function Dialogs() {
 								let cropperRef: CropperRef | undefined;
 								let previewCanvas: HTMLCanvasElement | undefined;
 								const [crop, setCrop] = createSignal(CROP_ZERO);
+								const [cropInteracting, setCropInteracting] =
+									createSignal(false);
 								const [aspect, setAspect] = createSignal<Ratio | null>(null);
 
 								const [frameUrl, setFrameUrl] = createSignal<string | null>(
@@ -1266,6 +1395,7 @@ function Dialogs() {
 															<Cropper
 																ref={cropperRef}
 																onCropChange={setCrop}
+																onInteraction={setCropInteracting}
 																aspectRatio={aspect() ?? undefined}
 																targetSize={{
 																	x: display.width,
@@ -1297,6 +1427,29 @@ function Dialogs() {
 																	}
 																/>
 															</Cropper>
+															<Show
+																when={
+																	cropInteracting() &&
+																	crop().width > 0 &&
+																	crop().height > 0
+																}
+															>
+																<div
+																	aria-hidden="true"
+																	class="absolute z-40 border pointer-events-none border-black/90 shadow-[0_0_0_1px_rgba(255,255,255,0.9)]"
+																	style={{
+																		left: `${(crop().x / display.width) * 100}%`,
+																		top: `${(crop().y / display.height) * 100}%`,
+																		width: `${(crop().width / display.width) * 100}%`,
+																		height: `${(crop().height / display.height) * 100}%`,
+																	}}
+																>
+																	<div class="absolute left-0 top-[calc(100%/3)] w-full h-px bg-black/90 shadow-[0_1px_0_rgba(255,255,255,0.9)]" />
+																	<div class="absolute left-0 top-[calc(200%/3)] w-full h-px bg-black/90 shadow-[0_1px_0_rgba(255,255,255,0.9)]" />
+																	<div class="absolute top-0 left-[calc(100%/3)] w-px h-full bg-black/90 shadow-[1px_0_0_rgba(255,255,255,0.9)]" />
+																	<div class="absolute top-0 left-[calc(200%/3)] w-px h-full bg-black/90 shadow-[1px_0_0_rgba(255,255,255,0.9)]" />
+																</div>
+															</Show>
 														</div>
 														<Show when={!frameLoaded()}>
 															<div class="flex absolute inset-0 z-40 flex-col gap-3 justify-center items-center bg-gray-3">

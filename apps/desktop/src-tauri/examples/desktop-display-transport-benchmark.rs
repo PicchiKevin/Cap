@@ -7,8 +7,8 @@ use std::{
 
 use cap_desktop_lib::frame_ws::{WSFrame, WSFrameFormat, create_watch_frame_ws};
 use cap_editor::{
-    EditorFrameOutput, Playback, PlaybackRenderOutputFormat, PlaybackSkipReason, PlaybackTelemetry,
-    PlaybackTelemetryEvent, Renderer, finish_renderer_layers_creation,
+    EditorFrameOutput, FrameLayout, Playback, PlaybackRenderOutputFormat, PlaybackSkipReason,
+    PlaybackTelemetry, PlaybackTelemetryEvent, Renderer, finish_renderer_layers_creation,
     start_renderer_layers_creation,
 };
 use cap_project::{
@@ -132,6 +132,7 @@ async fn load_recording(
                     end: duration,
                     timescale: 1.0,
                     name: None,
+                    speed_audio_mode: None,
                 }]
             }
             StudioRecordingMeta::MultipleSegments { inner } => inner
@@ -150,6 +151,7 @@ async fn load_recording(
                         end: duration,
                         timescale: 1.0,
                         name: None,
+                        speed_audio_mode: None,
                     })
                 })
                 .collect(),
@@ -158,6 +160,7 @@ async fn load_recording(
         if !timeline_segments.is_empty() {
             project.timeline = Some(TimelineConfiguration {
                 segments: timeline_segments,
+                transitions: Vec::new(),
                 zoom_segments: Vec::new(),
                 scene_segments: Vec::new(),
                 mask_segments: Vec::new(),
@@ -165,6 +168,7 @@ async fn load_recording(
                 caption_segments: Vec::new(),
                 keyboard_segments: Vec::new(),
                 audio_segments: Vec::new(),
+                camera3d_segments: Vec::new(),
             });
         }
     }
@@ -238,8 +242,12 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(startup_delay_ms)).await;
 
     let layers_rx = start_renderer_layers_creation(&render_constants, &project);
+    let force_ffmpeg_for_editor = cfg!(target_os = "windows")
+        || std::env::var_os("CAP_EDITOR_FORCE_FFMPEG_DECODER").is_some();
     let segment_medias =
-        match cap_editor::create_segments(&recording_meta, meta.as_ref(), false).await {
+        match cap_editor::create_segments(&recording_meta, meta.as_ref(), force_ffmpeg_for_editor)
+            .await
+        {
             Ok(segments) => Arc::new(segments),
             Err(e) => {
                 eprintln!("Failed to create segments: {e}");
@@ -251,7 +259,7 @@ async fn main() {
     let (telemetry, mut telemetry_rx) = PlaybackTelemetry::channel();
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<usize>();
 
-    let frame_cb = Box::new(move |output: EditorFrameOutput| {
+    let frame_cb = Box::new(move |output: EditorFrameOutput, _: FrameLayout| {
         let ws_frame = match output {
             EditorFrameOutput::Nv12(frame) => {
                 let ws_format = match frame.format {
@@ -292,6 +300,8 @@ async fn main() {
                 let _ = frame_tx.send(bytes);
                 ws_frame
             }
+            #[cfg(target_os = "macos")]
+            EditorFrameOutput::Surface(_) => return,
         };
         frame_watch_tx.send(Some(Arc::new(ws_frame))).ok();
     });

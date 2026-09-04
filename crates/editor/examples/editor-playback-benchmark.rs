@@ -6,7 +6,7 @@ use std::{
 };
 
 use cap_editor::{
-    EditorFrameOutput, Playback, PlaybackFrameSource, PlaybackRenderOutputFormat,
+    EditorFrameOutput, FrameLayout, Playback, PlaybackFrameSource, PlaybackRenderOutputFormat,
     PlaybackSkipReason, PlaybackTelemetry, PlaybackTelemetryEvent, Renderer,
     finish_renderer_layers_creation, start_renderer_layers_creation,
 };
@@ -352,6 +352,7 @@ async fn load_recording(
                     end: duration,
                     timescale: 1.0,
                     name: None,
+                    speed_audio_mode: None,
                 }]
             }
             StudioRecordingMeta::MultipleSegments { inner } => inner
@@ -370,6 +371,7 @@ async fn load_recording(
                         end: duration,
                         timescale: 1.0,
                         name: None,
+                        speed_audio_mode: None,
                     })
                 })
                 .collect(),
@@ -378,6 +380,7 @@ async fn load_recording(
         if !timeline_segments.is_empty() {
             project.timeline = Some(TimelineConfiguration {
                 segments: timeline_segments,
+                transitions: Vec::new(),
                 zoom_segments: Vec::new(),
                 scene_segments: Vec::new(),
                 mask_segments: Vec::new(),
@@ -385,6 +388,7 @@ async fn load_recording(
                 caption_segments: Vec::new(),
                 keyboard_segments: Vec::new(),
                 audio_segments: Vec::new(),
+                camera3d_segments: Vec::new(),
             });
         }
     }
@@ -512,7 +516,7 @@ async fn main() {
 
     let (telemetry, mut telemetry_rx) = PlaybackTelemetry::channel();
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<usize>();
-    let frame_cb = Box::new(move |output: EditorFrameOutput| {
+    let frame_cb = Box::new(move |output: EditorFrameOutput, _: FrameLayout| {
         let bytes = match output {
             EditorFrameOutput::Nv12(frame) => {
                 let metadata_bytes = match frame.format {
@@ -523,6 +527,8 @@ async fn main() {
                 data.len() + metadata_bytes
             }
             EditorFrameOutput::Rgba(frame) => frame.data.len() + 24,
+            #[cfg(target_os = "macos")]
+            EditorFrameOutput::Surface(_) => return,
         };
         let _ = frame_tx.send(bytes);
     });

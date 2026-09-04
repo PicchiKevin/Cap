@@ -27,7 +27,7 @@ import {
 	normalizeCaptionSettings,
 } from "~/store/captions";
 import { defaultKeyboardSettings } from "~/store/keyboard";
-
+import { createTauriEventListener } from "~/utils/createEventListener";
 import { createPresets } from "~/utils/createPresets";
 import { createCustomDomainQuery } from "~/utils/queries";
 import {
@@ -37,9 +37,12 @@ import {
 	type FrameData,
 } from "~/utils/socket";
 import {
+	type ClipSpeedAudioMode,
+	type ColorCorrectionConfiguration,
 	commands,
 	type EditorPreviewQuality,
 	events,
+	type FrameLayoutEvent,
 	type FramesRendered,
 	type ImportedAudioTrack,
 	type MultipleSegments,
@@ -58,8 +61,43 @@ import {
 	MIN_AUDIO_SEGMENT_DURATION,
 } from "./audio";
 import { deriveCaptionTrackSegments, mapEditedTimeToSource } from "./captions";
+import {
+	type ClipTransition,
+	type ClipTransitionInput,
+	clampTransitionDuration,
+	clipDuration,
+	clipTimelineDuration,
+	clipTimelineOffsets,
+	getClipTransition,
+	normalizeClipTransitions,
+	rippleTimelineTrack,
+	timelineShiftAfterClipDurationChange,
+	transitionsAfterClipDelete,
+	transitionsAfterClipSplit,
+} from "./clip-transitions";
+import { normalizeColorCorrection } from "./colorCorrection";
 import type { MaskSegment } from "./masks";
+import type { SnapGuide } from "./snapping";
 import type { TextSegment } from "./text";
+import {
+	applySceneToRange,
+	CAMERA3D_SCENES,
+	type Camera3DSegment,
+	defaultCamera3DTracks,
+	evaluatePose,
+	getEndPose,
+	getMotionEasing,
+	getStartPose,
+	normalizeCamera3DSegments,
+	scaleKeyframeTimes,
+	sceneWithShotCount,
+	setMotion,
+} from "./three-d";
+import {
+	heldTimeBefore,
+	holdWindows,
+	totalHeldDuration,
+} from "./timeline-holds";
 import {
 	getUsedTrackCount,
 	normalizeTrackSegments,
@@ -140,7 +178,8 @@ export type TimelineTrackType =
 	| "zoom"
 	| "scene"
 	| "mask"
-	| "audio";
+	| "audio"
+	| "3d";
 
 export const MAX_ZOOM_IN = 3;
 const PROJECT_SAVE_DEBOUNCE_MS = 250;
@@ -164,13 +203,20 @@ export type EditorTimelineSegment = TimelineSegment & {
 
 type EditorTimelineConfiguration = Omit<
 	TimelineConfiguration,
-	"sceneSegments" | "maskSegments" | "segments" | "audioSegments"
+	| "sceneSegments"
+	| "maskSegments"
+	| "segments"
+	| "audioSegments"
+	| "transitions"
+	| "camera3dSegments"
 > & {
 	segments: EditorTimelineSegment[];
+	transitions: ClipTransition[];
 	sceneSegments?: SceneSegment[];
 	maskSegments: MaskSegment[];
 	textSegments: TextSegment[];
 	audioSegments?: AudioTrackSegment[];
+	camera3dSegments: Camera3DSegment[];
 };
 
 type EditorCaptionsData = NonNullable<ProjectConfiguration["captions"]> & {
@@ -186,6 +232,7 @@ export type EditorProjectConfiguration = Omit<
 	timeline?: EditorTimelineConfiguration | null;
 	captions: EditorCaptionsData | null;
 	hiddenTextSegments?: number[];
+	colorCorrection: ColorCorrectionConfiguration;
 };
 
 function withCornerDefaults<
@@ -218,6 +265,12 @@ export function normalizeProject(
 	const timeline = config.timeline
 		? {
 				...config.timeline,
+				transitions:
+					(
+						config.timeline as TimelineConfiguration & {
+							transitions?: ClipTransition[];
+						}
+					).transitions ?? [],
 				sceneSegments: config.timeline.sceneSegments ?? [],
 				captionSegments: config.timeline.captionSegments ?? [],
 				keyboardSegments: config.timeline.keyboardSegments ?? [],
@@ -242,6 +295,9 @@ export function normalizeProject(
 						}
 					).audioSegments ?? [],
 				),
+				camera3dSegments: normalizeCamera3DSegments(
+					config.timeline.camera3dSegments,
+				),
 			}
 		: undefined;
 	const captions = config.captions
@@ -258,6 +314,7 @@ export function normalizeProject(
 		captions,
 		background: withCornerDefaults(config.background),
 		camera: withCornerDefaults(config.camera),
+		colorCorrection: normalizeColorCorrection(config.colorCorrection),
 	};
 }
 
@@ -272,11 +329,13 @@ export function serializeProjectConfiguration(
 	const timeline = project.timeline
 		? {
 				...project.timeline,
+				transitions: project.timeline.transitions ?? [],
 				captionSegments: project.timeline.captionSegments ?? [],
 				keyboardSegments: project.timeline.keyboardSegments ?? [],
 				maskSegments: project.timeline.maskSegments ?? [],
 				textSegments: project.timeline.textSegments ?? [],
 				audioSegments: project.timeline.audioSegments ?? [],
+				camera3dSegments: project.timeline.camera3dSegments ?? [],
 			}
 		: project.timeline;
 
@@ -305,30 +364,203 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 			normalizeProject(props.editorInstance.savedProjectConfig),
 		);
 
-		const projectActions = {
-			splitClipSegment: (time: number) => {
-				setProject(
-					"timeline",
-					"segments",
-					produce((segments) => {
-						let searchTime = time;
-						let _prevDuration = 0;
-						const currentSegmentIndex = segments.findIndex((segment) => {
-							const duration =
-								(segment.end - segment.start) / segment.timescale;
-							if (searchTime > duration) {
-								searchTime -= duration;
-								_prevDuration += duration;
-								return false;
-							}
+		const setClipTransition = (
+			segmentIndex: number,
+			transition: ClipTransitionInput | null,
+		) => {
+			setProject(
+				produce((project) => {
+					const timeline = project.timeline;
+					if (!timeline || segmentIndex <= 0) return;
+					const segment = timeline.segments[segmentIndex];
+					const previous = timeline.segments[segmentIndex - 1];
+					if (!segment || !previous) return;
+					const transitions = timeline.transitions ?? [];
 
-							return true;
+					const oldDuration =
+						getClipTransition(timeline.segments, transitions, segmentIndex)
+							?.duration ?? 0;
+					const duration = transition
+						? clampTransitionDuration(transition.duration, previous, segment)
+						: 0;
+					const boundary =
+						clipTimelineOffsets(timeline.segments, transitions)[segmentIndex] +
+						oldDuration;
+					const shift = oldDuration - duration;
+
+					timeline.transitions = transitions.filter(
+						(value) => value.segmentIndex !== segmentIndex,
+					);
+					if (transition && duration > 0) {
+						timeline.transitions.push({
+							...transition,
+							segmentIndex,
+							duration,
 						});
+						timeline.transitions.sort(
+							(a, b) => a.segmentIndex - b.segmentIndex,
+						);
+					}
+
+					if (shift === 0) return;
+					const camera3dSegments = timeline.camera3dSegments ?? [];
+					const previousCamera3dDurations = camera3dSegments.map(
+						(segment) => segment.end - segment.start,
+					);
+					const tracks = [
+						timeline.zoomSegments,
+						timeline.sceneSegments ?? [],
+						timeline.maskSegments,
+						timeline.textSegments,
+						timeline.captionSegments ?? [],
+						timeline.keyboardSegments ?? [],
+						timeline.audioSegments ?? [],
+						camera3dSegments,
+					];
+					for (const track of tracks) {
+						rippleTimelineTrack(track, boundary, shift);
+					}
+					for (let index = 0; index < camera3dSegments.length; index++) {
+						const camera3dSegment = camera3dSegments[index];
+						const previousDuration = previousCamera3dDurations[index];
+						// Keyframe times are relative to the segment start, so a
+						// segment the ripple resized (the straddling case) has to
+						// have them rescaled onto its new length.
+						const nextDuration = camera3dSegment.end - camera3dSegment.start;
+						if (previousDuration <= 0 || nextDuration === previousDuration)
+							continue;
+						scaleKeyframeTimes(
+							camera3dSegment.tracks,
+							nextDuration / previousDuration,
+						);
+					}
+				}),
+			);
+		};
+
+		// Output-time boundaries of every clip that fall strictly inside a range.
+		// A 3D scene lines its cuts up with these so the camera changes shot on
+		// the same frame the footage does.
+		const camera3DClipCuts = (start: number, end: number) => {
+			const timeline = project.timeline;
+			if (!timeline) return [];
+			const offsets = clipTimelineOffsets(
+				timeline.segments,
+				timeline.transitions ?? [],
+			);
+			const cuts: number[] = [];
+			for (let index = 0; index < timeline.segments.length; index++) {
+				const boundaries = [
+					offsets[index],
+					offsets[index] + clipDuration(timeline.segments[index]),
+				];
+				for (const boundary of boundaries)
+					if (boundary > start && boundary < end) cuts.push(boundary);
+			}
+			return cuts;
+		};
+
+		/**
+		 * The chain a scene would lay over the whole timeline. The setup flow's
+		 * ghost placeholder and the action that commits it read this same
+		 * function, so the track previews exactly what lands.
+		 */
+		const camera3DScenePreview = (sceneId: string, shots: number) => {
+			const scene = CAMERA3D_SCENES.find((s) => s.id === sceneId);
+			if (!scene) return [];
+
+			const end = totalDuration();
+			return applySceneToRange(
+				sceneWithShotCount(scene, shots),
+				0,
+				end,
+				camera3DClipCuts(0, end),
+			);
+		};
+
+		const projectActions = {
+			setClipTransition,
+			normalizeClipTransitions: () => {
+				setProject(
+					produce((project) => {
+						const timeline = project.timeline;
+						if (!timeline) return;
+						const normalized = normalizeClipTransitions(
+							timeline.segments,
+							timeline.transitions ?? [],
+						);
+						if (
+							normalized.length === timeline.transitions.length &&
+							normalized.every((transition, index) => {
+								const current = timeline.transitions[index];
+								return (
+									current?.segmentIndex === transition.segmentIndex &&
+									current.type === transition.type &&
+									current.duration === transition.duration
+								);
+							})
+						)
+							return;
+						timeline.transitions = normalized;
+					}),
+				);
+			},
+			deleteClipTransition: (segmentIndex: number) => {
+				setClipTransition(segmentIndex, null);
+				setEditorState("timeline", "selection", null);
+			},
+			splitClipSegment: (time: number, requestedSegmentIndex?: number) => {
+				let didSplit = false;
+				setProject(
+					produce((project) => {
+						const timeline = project.timeline;
+						if (!timeline) return;
+						const segments = timeline.segments;
+						// The click position is in held-output time; clip offsets
+						// live in the gapless recording-flow domain.
+						time -= heldTimeBefore(holdWindows(timeline.textSegments), time);
+						const offsets = clipTimelineOffsets(
+							segments,
+							timeline.transitions ?? [],
+						);
+						let currentSegmentIndex = requestedSegmentIndex ?? -1;
+						if (currentSegmentIndex < 0) {
+							for (let index = 0; index < segments.length; index++) {
+								const duration =
+									(segments[index].end - segments[index].start) /
+									segments[index].timescale;
+								if (
+									time >= offsets[index] &&
+									time <= offsets[index] + duration
+								) {
+									currentSegmentIndex = index;
+								}
+							}
+						}
 
 						if (currentSegmentIndex === -1) return;
 						const segment = segments[currentSegmentIndex];
-
-						const splitPositionInRecording = searchTime * segment.timescale;
+						const localTime = time - offsets[currentSegmentIndex];
+						const duration = (segment.end - segment.start) / segment.timescale;
+						if (localTime <= 0 || localTime >= duration) return;
+						const incomingDuration =
+							getClipTransition(
+								segments,
+								timeline.transitions ?? [],
+								currentSegmentIndex,
+							)?.duration ?? 0;
+						const outgoingDuration =
+							getClipTransition(
+								segments,
+								timeline.transitions ?? [],
+								currentSegmentIndex + 1,
+							)?.duration ?? 0;
+						if (
+							localTime < incomingDuration * 2 ||
+							duration - localTime < outgoingDuration * 2
+						)
+							return;
+						const splitPositionInRecording = localTime * segment.timescale;
 
 						segments.splice(currentSegmentIndex + 1, 0, {
 							...segment,
@@ -337,8 +569,14 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 						});
 						segments[currentSegmentIndex].end =
 							segment.start + splitPositionInRecording;
+						timeline.transitions = transitionsAfterClipSplit(
+							timeline.transitions ?? [],
+							currentSegmentIndex,
+						);
+						didSplit = true;
 					}),
 				);
+				if (didSplit) setEditorState("timeline", "selection", null);
 			},
 			deleteClipSegment: (segmentIndex: number) => {
 				if (!project.timeline) return;
@@ -347,11 +585,14 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 
 				batch(() => {
 					setProject(
-						"timeline",
-						"segments",
-						produce((s) => {
-							if (!s) return;
-							s.splice(segmentIndex, 1);
+						produce((project) => {
+							const timeline = project.timeline;
+							if (!timeline) return;
+							timeline.segments.splice(segmentIndex, 1);
+							timeline.transitions = transitionsAfterClipDelete(
+								timeline.transitions ?? [],
+								segmentIndex,
+							);
 						}),
 					);
 					setEditorState("timeline", "selection", null);
@@ -395,6 +636,124 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 						}),
 					);
 					setEditorState("timeline", "selection", null);
+				});
+			},
+			splitCamera3DSegment: (index: number, time: number) => {
+				setProject(
+					"timeline",
+					"camera3dSegments",
+					produce((segments) => {
+						const segment = segments?.[index];
+						if (!segment) return;
+
+						const duration = segment.end - segment.start;
+						const remaining = duration - time;
+						if (time < 1 || remaining < 1) return;
+
+						// A split must not change what plays: both halves meet on the pose
+						// the segment held at the cut, so the left half moves start -> mid
+						// and the right half picks up mid -> end. Blur is segment-level, so
+						// it is simply carried onto both halves.
+						const startPose = getStartPose(segment);
+						const midPose = evaluatePose(segment, time);
+						const endPose = getEndPose(segment);
+						const easing = getMotionEasing(segment);
+
+						const right: Camera3DSegment = {
+							...segment,
+							start: segment.start + time,
+							end: segment.end,
+							properties: { ...segment.properties },
+							blur: { ...segment.blur },
+							tracks: defaultCamera3DTracks(),
+						};
+						setMotion(right, midPose, endPose, easing);
+						segments.splice(index + 1, 0, right);
+
+						const left = segments[index];
+						left.end = segment.start + time;
+						left.tracks = defaultCamera3DTracks();
+						setMotion(left, startPose, midPose, easing);
+						sortTrackSegments(segments);
+					}),
+				);
+			},
+			deleteCamera3DSegments: (segmentIndices: number[]) => {
+				batch(() => {
+					setProject(
+						"timeline",
+						"camera3dSegments",
+						produce((segments) => {
+							if (!segments) return;
+							const sorted = [...new Set(segmentIndices)]
+								.filter(
+									(i) => Number.isInteger(i) && i >= 0 && i < segments.length,
+								)
+								.sort((a, b) => b - a);
+							if (sorted.length === 0) return;
+							for (const i of sorted) segments.splice(i, 1);
+						}),
+					);
+					setEditorState("timeline", "selection", null);
+				});
+			},
+			applyCamera3DScene: (segmentIndex: number, sceneId: string) => {
+				const scene = CAMERA3D_SCENES.find((s) => s.id === sceneId);
+				const segment = project.timeline?.camera3dSegments?.[segmentIndex];
+				if (!scene || !segment) return;
+
+				const { start, end } = segment;
+				const generated = applySceneToRange(
+					scene,
+					start,
+					end,
+					camera3DClipCuts(start, end),
+				);
+				if (generated.length === 0) return;
+
+				batch(() => {
+					setProject(
+						"timeline",
+						"camera3dSegments",
+						produce((segments) => {
+							if (!segments) return;
+							segments.splice(segmentIndex, 1, ...generated);
+							sortTrackSegments(segments);
+						}),
+					);
+					setEditorState("timeline", "selection", {
+						type: "3d",
+						indices: generated.map((_, offset) => segmentIndex + offset),
+					});
+					setEditorState("playbackTime", start);
+					setEditorState("previewTime", null);
+				});
+			},
+			addCamera3DScene: (sceneId: string, shots: number) => {
+				// Only ever an empty-track offer: the scene owns the whole timeline,
+				// so it must not land on top of shots someone has already authored.
+				if (!project.timeline) return;
+				if ((project.timeline.camera3dSegments?.length ?? 0) > 0) return;
+
+				const generated = camera3DScenePreview(sceneId, shots);
+				if (generated.length === 0) return;
+
+				batch(() => {
+					setProject("timeline", "camera3dSegments", (v) => v ?? []);
+					setProject(
+						"timeline",
+						"camera3dSegments",
+						produce((segments) => {
+							if (!segments) return;
+							segments.push(...generated);
+							sortTrackSegments(segments);
+						}),
+					);
+					setEditorState("timeline", "camera3dSetup", null);
+					setEditorState("timeline", "tracks", "3d", true);
+					setEditorState("timeline", "selection", { type: "3d", indices: [0] });
+					setEditorState("playbackTime", 0);
+					setEditorState("previewTime", null);
 				});
 			},
 			splitMaskSegment: (index: number, time: number) => {
@@ -734,28 +1093,55 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 						const segment = timeline.segments[index];
 						if (!segment) return;
 
-						const currentLength =
-							(segment.end - segment.start) / segment.timescale;
-						const nextLength = (segment.end - segment.start) / timescale;
+						const oldDuration = clipTimelineDuration(
+							timeline.segments,
+							timeline.transitions ?? [],
+						);
+						const oldOffsets = clipTimelineOffsets(
+							timeline.segments,
+							timeline.transitions ?? [],
+						);
+						const incomingDuration =
+							getClipTransition(
+								timeline.segments,
+								timeline.transitions ?? [],
+								index,
+							)?.duration ?? 0;
+						segment.timescale = timescale;
+						timeline.transitions = normalizeClipTransitions(
+							timeline.segments,
+							timeline.transitions ?? [],
+						);
+						const newDuration = clipTimelineDuration(
+							timeline.segments,
+							timeline.transitions,
+						);
+						const newOffsets = clipTimelineOffsets(
+							timeline.segments,
+							timeline.transitions,
+						);
+						const absoluteStart = oldOffsets[index] + incomingDuration;
+						const oldNextBoundary = oldOffsets[index + 1] ?? oldDuration;
+						const newNextBoundary = newOffsets[index + 1] ?? newDuration;
 
-						const lengthDiff = nextLength - currentLength;
-
-						const absoluteStart = timeline.segments.reduce((acc, curr, i) => {
-							if (i >= index) return acc;
-							return acc + (curr.end - curr.start) / curr.timescale;
-						}, 0);
-
-						const diff = (v: number) => {
-							const diff = (lengthDiff * (v - absoluteStart)) / currentLength;
-
-							if (v > absoluteStart + currentLength) return lengthDiff;
-							else if (v > absoluteStart) return diff;
-							else return 0;
-						};
+						const diff = (value: number) =>
+							timelineShiftAfterClipDurationChange(
+								value,
+								oldOffsets[index],
+								newOffsets[index],
+								absoluteStart,
+								oldNextBoundary,
+								newNextBoundary,
+							);
 
 						for (const zoomSegment of timeline.zoomSegments) {
 							zoomSegment.start += diff(zoomSegment.start);
 							zoomSegment.end += diff(zoomSegment.end);
+						}
+
+						for (const sceneSegment of timeline.sceneSegments ?? []) {
+							sceneSegment.start += diff(sceneSegment.start);
+							sceneSegment.end += diff(sceneSegment.end);
 						}
 
 						for (const maskSegment of timeline.maskSegments) {
@@ -783,8 +1169,35 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 							keyboardSegment.end += diff(keyboardSegment.end);
 						}
 
-						segment.timescale = timescale;
+						for (const camera3dSegment of timeline.camera3dSegments ?? []) {
+							const previousDuration =
+								camera3dSegment.end - camera3dSegment.start;
+							camera3dSegment.start += diff(camera3dSegment.start);
+							camera3dSegment.end += diff(camera3dSegment.end);
+							// Keyframe times are relative to the segment start, so they
+							// have to follow the segment's new length rather than the
+							// absolute shift the other tracks use.
+							const nextDuration = camera3dSegment.end - camera3dSegment.start;
+							if (previousDuration <= 0 || nextDuration === previousDuration)
+								continue;
+							scaleKeyframeTimes(
+								camera3dSegment.tracks,
+								nextDuration / previousDuration,
+							);
+						}
 					}),
+				);
+			},
+			setClipSegmentSpeedAudioMode: (
+				index: number,
+				speedAudioMode: ClipSpeedAudioMode,
+			) => {
+				setProject(
+					"timeline",
+					"segments",
+					index,
+					"speedAudioMode",
+					speedAudioMode,
 				);
 			},
 		};
@@ -959,10 +1372,12 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 		);
 
 		const totalDuration = () =>
-			project.timeline?.segments.reduce(
-				(acc, s) => acc + (s.end - s.start) / s.timescale,
-				0,
-			) ?? props.editorInstance.recordingDuration;
+			project.timeline
+				? clipTimelineDuration(
+						project.timeline.segments,
+						project.timeline.transitions ?? [],
+					) + totalHeldDuration(holdWindows(project.timeline.textSegments))
+				: props.editorInstance.recordingDuration;
 
 		type State = {
 			zoom: number;
@@ -1001,11 +1416,17 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 			(project.timeline?.captionSegments?.length ?? 0) > 0;
 		const initialKeyboardTrackVisible =
 			project.keyboard?.settings.enabled ?? false;
+		const initialCamera3DTrackVisible =
+			(project.timeline?.camera3dSegments?.length ?? 0) > 0;
 
 		const [editorState, setEditorState] = createStore({
 			previewTime: null as number | null,
 			playbackTime: 0,
 			playing: false,
+			// On-canvas selection of the screen recording / camera boxes.
+			// Kept separate from timeline.selection, which drives the sidebar
+			// selection panel and is pattern-matched by many consumers.
+			canvasSelection: null as null | { type: "display" } | { type: "camera" },
 			captions: {
 				isGenerating: false,
 				isDownloading: false,
@@ -1016,16 +1437,19 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 			},
 			timeline: {
 				interactMode: "seek" as "seek" | "split",
+				splitPreview: null as null | { time: number; snapped: boolean },
 				selection: null as
 					| null
 					| { type: "zoom"; indices: number[] }
 					| { type: "clip"; indices: number[] }
+					| { type: "transition"; index: number }
 					| { type: "scene"; indices: number[] }
 					| { type: "mask"; indices: number[] }
 					| { type: "caption"; indices: number[] }
 					| { type: "keyboard"; indices: number[] }
 					| { type: "text"; indices: number[] }
-					| { type: "audio"; indices: number[] },
+					| { type: "audio"; indices: number[] }
+					| { type: "3d"; indices: number[] },
 				transform: {
 					// visible seconds
 					zoom: zoomOutLimit(),
@@ -1068,6 +1492,7 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 					keyboard: initialKeyboardTrackVisible,
 					zoom: true,
 					scene: true,
+					"3d": initialCamera3DTrackVisible,
 					mask: initialMaskTrackCount,
 					text: initialTextTrackCount,
 					audio: initialAudioTrackCount,
@@ -1077,8 +1502,19 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 				hoveredMaskTime: null as number | null,
 				audioPicker: null as number | null,
 				audioReplace: null as number | null,
+				// The empty 3D track's setup flow: the scene and shot count the
+				// sidebar is currently offering, previewed live on the track.
+				camera3dSetup: null as null | { sceneId: string; shots: number },
+				// Index of a just-created text segment that should open its
+				// inline canvas editor as soon as its overlay mounts (set by the
+				// Add-track picker, consumed by TextOverlay).
+				pendingTextEdit: null as number | null,
 			},
 		});
+
+		// Active smart-guide lines while an overlay drag is snapping; published
+		// by whichever overlay owns the drag, rendered once above the canvas.
+		const [snapGuides, setSnapGuides] = createSignal<SnapGuide[]>([]);
 
 		// Plain signals, not resources: audio decodes in the background after
 		// the editor opens, so these can resolve late — they must never suspend
@@ -1165,6 +1601,9 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 						time,
 						timeline.segments,
 						captionRecordingSegments,
+						timeline.transitions ?? [],
+						undefined,
+						"incoming",
 					);
 				const inverted = segments.flatMap((segment) => {
 					const start = toSource(segment.start);
@@ -1208,7 +1647,18 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 								`${s.start}|${s.end}|${s.timescale}|${s.recordingSegment ?? 0}`,
 						)
 						.join(",");
-					return `${captionsSig}@@${timelineSig}`;
+					const transitionSig = (timeline.transitions ?? [])
+						.map(
+							(transition) =>
+								`${transition.segmentIndex}|${transition.type}|${transition.duration}`,
+						)
+						.join(",");
+					// Fullscreen-text holds shift the projected track's output
+					// times, so moving/resizing one must re-derive too.
+					const holdSig = holdWindows(timeline.textSegments)
+						.map(([start, end]) => `${start}|${end}`)
+						.join(",");
+					return `${captionsSig}@@${timelineSig}@@${transitionSig}@@${holdSig}`;
 				},
 				() => {
 					const timeline = project.timeline;
@@ -1219,6 +1669,8 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 						timeline.segments,
 						captionRecordingSegments,
 						timeline.captionSegments ?? [],
+						timeline.transitions ?? [],
+						timeline.textSegments,
 					);
 					setProject(
 						"timeline",
@@ -1268,9 +1720,12 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 			project,
 			setProject,
 			projectActions,
+			camera3DScenePreview,
 			projectHistory: createStoreHistory(project, setProject),
 			editorState,
 			setEditorState,
+			snapGuides,
+			setSnapGuides,
 			totalDuration,
 			zoomOutLimit,
 			exportState,
@@ -1337,6 +1792,12 @@ export type TransformedMeta = ReturnType<typeof transformMeta>;
 
 const createEditorInstanceContext = () => {
 	const [latestFrame, setLatestFrame] = createLazySignal<FrameData>();
+
+	// Rendered display/camera placement of the latest preview frame, emitted
+	// by the renderer so on-canvas overlays hit-test exactly what was drawn.
+	const [latestFrameLayout, setLatestFrameLayout] =
+		createSignal<FrameLayoutEvent | null>(null);
+	createTauriEventListener(events.frameLayoutEvent, setLatestFrameLayout);
 
 	const [_isConnected, setIsConnected] = createSignal(false);
 	const [isWorkerReady, setIsWorkerReady] = createSignal(false);
@@ -1433,6 +1894,7 @@ const createEditorInstanceContext = () => {
 		editorInstance,
 		refetchEditorInstance,
 		latestFrame,
+		latestFrameLayout,
 		presets: createPresets(),
 		metaQuery,
 		isWorkerReady,

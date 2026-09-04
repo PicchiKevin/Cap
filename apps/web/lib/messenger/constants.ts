@@ -86,8 +86,9 @@ PLATFORM SUPPORT:
 
 PRICING (early adopter beta pricing, locked in for lifetime of subscription):
 - Free plan: personal use, Studio Mode, unlimited local recordings, shareable links up to 5 minutes, export to MP4 or GIF, web recorder
-- Desktop License: $58 one-time (lifetime) or $29/year, commercial usage rights, Studio Mode with full editor, unlimited local recordings, shareable links up to 5 minutes, export to MP4 or GIF
-- Cap Pro: $8.16/mo per user (billed annually) or $12/mo per user (billed monthly), includes everything in Desktop License plus unlimited cloud storage and bandwidth, unlimited shareable links (no 5-minute limit), auto-generated AI titles/summaries/chapters/transcriptions, custom domain (cap.yourdomain.com), password-protected shares, viewer analytics, team workspaces, Loom video importer, custom S3 bucket and Google Drive support, priority support
+- Desktop License: $58/£58/€58 one-time (lifetime) or $29/£29/€29 per year, commercial usage rights, Studio Mode with full editor, unlimited local recordings, shareable links up to 5 minutes, export to MP4 or GIF. Currency is selected automatically at checkout, exactly the same way as Cap Pro.
+- Cap Pro: $12/£12/€12 per user per month (billed monthly) or $98/£98/€98 per user per year (billed annually, which works out to $8.16/£8.16/€8.16 per user per month), includes everything in Desktop License plus unlimited cloud storage and bandwidth, unlimited shareable links (no 5-minute limit), auto-generated AI titles/summaries/chapters/transcriptions, custom domain (cap.yourdomain.com), password-protected shares, viewer analytics, team workspaces, Loom video importer, custom S3 bucket and Google Drive support, priority support
+- Currency (applies to both Cap Pro and the Desktop License): the price is the same number in every currency, only the symbol changes. UK customers are billed in GBP and eurozone customers in EUR, selected automatically at checkout from the customer's location. Everyone else is billed in USD. There is nothing the customer needs to do to pick a currency.
 - Enterprise: custom pricing, contact via https://cal.com/cap.so/15min, includes SLAs, priority support, Loom video importer, bulk discounts, managed self-hosting, SAML SSO via WorkOS, advanced security controls
 - Early adopters keep their pricing forever, even after beta ends and regular prices change.
 - Student discount available at https://cap.so/student-discount
@@ -178,7 +179,7 @@ AI FEATURES (CAP PRO):
 - Auto-generated titles: AI creates descriptive titles from video content
 - Auto-generated summaries: markdown summaries of video content
 - Auto-generated chapters: clickable timestamped chapters for easy navigation
-- Transcription: automatic speech-to-text via Deepgram, generates VTT captions, editable, downloadable, supports translation to other languages
+- Transcription: automatic speech-to-text via AssemblyAI, generates VTT captions, editable, downloadable, supports translation to other languages
 - All AI processing happens server-side, never on the users device
 
 LOOM IMPORT (CAP PRO):
@@ -215,7 +216,7 @@ SELF-HOSTING:
 - Docs at https://cap.so/self-hosting
 - Desktop app can point to a self-hosted server via Settings > General > Self Host
 - Required: WEB_URL, DATABASE_ENCRYPTION_KEY, NEXTAUTH_SECRET, MYSQL_PASSWORD, S3 configuration
-- Optional: email sending (Resend), AI features (Deepgram, Groq/OpenAI), Google OAuth, SSO
+- Optional: email sending (Resend), AI features (AssemblyAI, Groq/OpenAI), Google OAuth, SSO
 
 REFERRAL PROGRAM:
 - Earn rewards by referring others to Cap

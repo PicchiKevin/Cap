@@ -10,6 +10,7 @@ import { useTimelineContext } from "./context";
 import {
 	SegmentContent,
 	SegmentHandle,
+	SegmentLabel,
 	SegmentRoot,
 	TrackRoot,
 	useSetPreviewTime,
@@ -119,10 +120,10 @@ export function MaskTrack(props: {
 
 	const addSegmentAt = (time: number) => {
 		const length = Math.min(minDuration(), totalDuration());
-		if (length <= 0) return;
+		if (length <= 0) return false;
 
 		const placement = findPlacement(time, length);
-		if (!placement) return;
+		if (!placement) return false;
 
 		setProject(
 			"timeline",
@@ -136,6 +137,22 @@ export function MaskTrack(props: {
 				sortTrackSegments(segments);
 			}),
 		);
+
+		// Select the new segment right away so its canvas handles and config
+		// sidebar appear without an extra click.
+		const newIndex = (project.timeline?.maskSegments ?? []).findIndex(
+			(segment) =>
+				segment.start === placement.start &&
+				getSegmentTrack(segment) === props.laneIndex,
+		);
+		if (newIndex !== -1) {
+			setEditorState("timeline", "selection", {
+				type: "mask",
+				indices: [newIndex],
+			});
+		}
+
+		return true;
 	};
 
 	const newSegmentDetails = createMemo(() => {
@@ -161,7 +178,13 @@ export function MaskTrack(props: {
 			editorState.previewTime ??
 			editorState.playbackTime ??
 			secsPerPixel() * (e.clientX - (timelineBounds.left ?? 0));
-		addSegmentAt(timelineTime);
+		if (!addSegmentAt(timelineTime)) return;
+		// This click created and selected a segment — stop it reaching the
+		// timeline container, whose mouseup handler would immediately clear
+		// the selection again. Take over its playhead update instead.
+		e.stopPropagation();
+		setEditorState("timeline", "audioPicker", null);
+		props.handleUpdatePlayhead(e);
 	};
 
 	const syncPreviewTimeToSegment = (
@@ -340,6 +363,7 @@ export function MaskTrack(props: {
 									: "border border-transparent",
 							)}
 							innerClass="ring-red-5"
+							title={`Mask · ${contentLabel()}`}
 							segment={segment}
 							onMouseEnter={(e) => {
 								setHoveredSegmentState(e, index, segment);
@@ -454,16 +478,21 @@ export function MaskTrack(props: {
 									},
 								)}
 							>
-								{(() => {
-									return (
+								<SegmentLabel
+									full={() => (
 										<div class="flex flex-col gap-0.5 justify-center items-center text-xs whitespace-nowrap text-gray-1 dark:text-gray-12">
 											<span class="opacity-70">Mask</span>
 											<div class="flex gap-1 items-center text-md">
 												<span>{contentLabel()}</span>
 											</div>
 										</div>
-									);
-								})()}
+									)}
+									compact={() => (
+										<div class="flex gap-1 items-center text-xs whitespace-nowrap text-gray-1 dark:text-gray-12">
+											<span class="truncate">{contentLabel()}</span>
+										</div>
+									)}
+								/>
 							</SegmentContent>
 							<SegmentHandle
 								position="end"

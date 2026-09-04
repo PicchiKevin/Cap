@@ -16,18 +16,33 @@ import type {
 	VideoMetadata,
 } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
-import { AwsCredentials, Storage } from "@cap/web-backend";
+import { AwsCredentials } from "@cap/web-backend/src/Aws";
+import { Storage } from "@cap/web-backend/src/Storage/index";
 import { Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
-import { Effect } from "effect";
-import { FatalError } from "workflow";
-import { runPromise } from "@/lib/server";
+import { Effect, Option } from "effect";
+import { FatalError, sleep } from "workflow";
+import { retireDesktopRecordingJobForOutputReplacement } from "@/lib/desktop-recording-jobs";
+import {
+	type EditTranscript,
+	editTranscriptWordsToCaptionVtt,
+	getEditTranscriptObjectKey,
+	parseEditTranscript,
+	remapEditTranscriptThroughSpec,
+} from "@/lib/edit-transcript";
+import { decryptEditTranscriptObject } from "@/lib/edit-transcript-storage";
+import { startAiGeneration } from "@/lib/generate-ai";
+import {
+	createMediaServerCapacityError,
+	isMediaServerCapacityError,
+} from "@/lib/media-server-backpressure";
 import { transcribeVideo } from "@/lib/transcribe";
 import {
 	getEditSpecOutputDuration,
 	remapCurrentOutputTimeThroughEdit,
 } from "@/lib/video-edits";
 import { decodeStorageVideo } from "@/lib/video-storage";
+import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
 interface EditVideoWorkflowPayload {
 	videoId: string;
@@ -48,14 +63,15 @@ interface VideoEditRenderResult {
 	};
 }
 
-const MEDIA_SERVER_START_MAX_ATTEMPTS = 6;
-const MEDIA_SERVER_START_RETRY_BASE_MS = 2000;
+const MEDIA_SERVER_START_MAX_ATTEMPTS = 2;
+const MEDIA_SERVER_START_RETRY_BASE_MS = 250;
 const MEDIA_SERVER_COMPLETION_MAX_ATTEMPTS = 720;
 const MEDIA_SERVER_COMPLETION_POLL_INTERVAL_MS = 5000;
 const MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS = 3 * 60 * 60;
 const MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS = 3 * 60 * 60;
 const MEDIA_SERVER_OUTPUT_VERIFICATION_MAX_ATTEMPTS = 4;
 const MEDIA_SERVER_OUTPUT_VERIFICATION_RETRY_MS = 1000;
+const EDIT_TRANSCRIPT_CURRENCY_TOLERANCE_MS = 250;
 
 function isPositiveNumber(value: number | null): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -98,17 +114,43 @@ export async function editVideoWorkflow(
 
 	try {
 		await validateEditRequest(videoId, sourceKey);
-		const result = await renderVideoEditOnMediaServer(payload);
+		let result: VideoEditRenderResult;
+		let capacityRetryCount = 0;
+		while (true) {
+			try {
+				result = await renderVideoEditOnMediaServer(payload);
+				break;
+			} catch (error) {
+				if (!isMediaServerCapacityError(error)) throw error;
+				await markEditWaitingForCapacity(videoId);
+				await sleep(`${Math.min(120, 15 + capacityRetryCount * 15)}s`);
+				capacityRetryCount++;
+			}
+		}
 		await verifyRenderedEditOutput(videoId, userId, editSpec, result.metadata);
 		await invalidateEditedVideoCache(videoId, editSpec);
-		await saveEditResultAndComplete(
+		const { transcriptRemapped } = await saveEditResultAndComplete(
 			videoId,
 			sourceKey,
 			previousSpec,
 			editSpec,
 			result.metadata,
 		);
-		await queueTranscriptionRegeneration(videoId, userId, aiGenerationEnabled);
+
+		if (transcriptRemapped) {
+			// Captions were derived from the immutable word transcript, so the
+			// transcription stays COMPLETE and no new paid pass is needed.
+			if (aiGenerationEnabled) {
+				await queueAiGeneration(videoId, userId);
+			}
+		} else {
+			await queueTranscriptionRegeneration(
+				videoId,
+				userId,
+				aiGenerationEnabled,
+			);
+		}
+
 		return result;
 	} catch (error) {
 		const errorMessage = error instanceof Error ? error.message : String(error);
@@ -229,6 +271,14 @@ async function startMediaServerEditJob(
 			continue;
 		}
 
+		if (shouldRetry) {
+			throw createMediaServerCapacityError({
+				response,
+				message: errorMessage,
+				videoId: body.videoId,
+			});
+		}
+
 		throw new Error(errorMessage);
 	}
 
@@ -259,13 +309,13 @@ async function renderVideoEditOnMediaServer(
 
 	const [bucket] = await Storage.getAccessForVideo(
 		decodeStorageVideo(video),
-	).pipe(runPromise);
+	).pipe(runWorkflowPromise);
 
 	const sourceUrl = await bucket
 		.getInternalSignedObjectUrl(sourceKey, {
 			expiresIn: MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS,
 		})
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
 	const outputKey = `${userId}/${videoId}/result.mp4`;
 	const thumbnailKey = `${userId}/${videoId}/screenshot/screen-capture.jpg`;
@@ -279,13 +329,17 @@ async function renderVideoEditOnMediaServer(
 			},
 			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
 		)
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
-	const outputVerificationUrl = await bucket
+	const [outputBucket] = await Storage.getAccessForVideo(
+		decodeStorageVideo(video),
+		{ resolvePublishedOutput: false },
+	).pipe(runWorkflowPromise);
+	const outputVerificationUrl = await outputBucket
 		.getInternalSignedObjectUrl(outputKey, {
 			expiresIn: MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS,
 		})
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
 	const thumbnailPresignedUrl = await bucket
 		.getInternalPresignedPutUrl(
@@ -295,7 +349,7 @@ async function renderVideoEditOnMediaServer(
 			},
 			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
 		)
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
 	const previewGifPresignedUrl = await bucket
 		.getInternalPresignedPutUrl(
@@ -306,7 +360,7 @@ async function renderVideoEditOnMediaServer(
 			},
 			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
 		)
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
 	const webhookUrl = `${webhookBaseUrl}/api/webhooks/media-server/progress?retryable=true`;
 	const webhookSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET;
@@ -336,6 +390,19 @@ async function renderVideoEditOnMediaServer(
 	});
 
 	return await waitForEditCompletion(videoId);
+}
+
+async function markEditWaitingForCapacity(videoId: string): Promise<void> {
+	"use step";
+
+	await db()
+		.update(videoUploads)
+		.set({
+			processingMessage: "Queued for video editing...",
+			processingError: null,
+			updatedAt: new Date(),
+		})
+		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
 }
 
 function getMetadataFromVideoRow(
@@ -413,7 +480,7 @@ async function probeVideoOnMediaServer(
 	return metadata;
 }
 
-async function verifyRenderedEditOutput(
+export async function verifyRenderedEditOutput(
 	videoId: string,
 	userId: string,
 	editSpec: VideoEditSpec,
@@ -442,15 +509,15 @@ async function verifyRenderedEditOutput(
 		throw new FatalError("Video does not exist");
 	}
 
-	const [bucket] = await Storage.getAccessForVideo(
-		decodeStorageVideo(video),
-	).pipe(runPromise);
+	const [bucket] = await Storage.getAccessForVideo(decodeStorageVideo(video), {
+		resolvePublishedOutput: false,
+	}).pipe(runWorkflowPromise);
 	const outputKey = `${userId}/${videoId}/result.mp4`;
 	const outputUrl = await bucket
 		.getInternalSignedObjectUrl(outputKey, {
 			expiresIn: MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS,
 		})
-		.pipe(runPromise);
+		.pipe(runWorkflowPromise);
 
 	let lastError: Error | undefined;
 
@@ -494,6 +561,26 @@ function clearAiMetadata(metadata: VideoMetadata | null): VideoMetadata {
 	return nextMetadata;
 }
 
+async function queueAiGeneration(
+	videoId: string,
+	userId: string,
+): Promise<void> {
+	"use step";
+
+	try {
+		const result = await startAiGeneration(videoId as Video.VideoId, userId);
+
+		if (!result.success) {
+			console.warn("[editVideoWorkflow] Failed to queue AI generation", {
+				videoId,
+				message: result.message,
+			});
+		}
+	} catch (error) {
+		console.warn("[editVideoWorkflow] Failed to queue AI generation", error);
+	}
+}
+
 async function queueTranscriptionRegeneration(
 	videoId: string,
 	userId: string,
@@ -519,18 +606,84 @@ async function queueTranscriptionRegeneration(
 	}
 }
 
+/**
+ * Loads the immutable word transcript (stored in the ORIGINAL media timeline)
+ * and returns it only when it still describes the original media.
+ */
+async function loadOriginalEditTranscript(
+	video: typeof videos.$inferSelect,
+	editSpec: VideoEditSpec,
+) {
+	const [bucket] = await Storage.getAccessForVideo(
+		decodeStorageVideo(video),
+	).pipe(runWorkflowPromise);
+	const stored = await bucket
+		.getObject(getEditTranscriptObjectKey(video.ownerId, video.id))
+		.pipe(runWorkflowPromise);
+
+	const decrypted = Option.isSome(stored)
+		? decryptEditTranscriptObject(stored.value, video.ownerId, video.id)
+		: null;
+	const transcript = decrypted ? parseEditTranscript(decrypted) : null;
+	if (!transcript) return null;
+
+	const expectedDurationMs = Math.round(editSpec.sourceDuration * 1000);
+	return Math.abs(transcript.durationMs - expectedDurationMs) <=
+		EDIT_TRANSCRIPT_CURRENCY_TOLERANCE_MS
+		? transcript
+		: null;
+}
+
+/**
+ * Replaces every derived transcript object (captions plus stale translations
+ * and status markers) with captions remapped through the new edit spec. The
+ * word transcript itself is never touched — it is the single source of truth.
+ */
+async function rewriteTranscriptObjectsForEdit(
+	video: typeof videos.$inferSelect,
+	transcript: EditTranscript,
+	editSpec: VideoEditSpec,
+) {
+	const [bucket] = await Storage.getAccessForVideo(
+		decodeStorageVideo(video),
+	).pipe(runWorkflowPromise);
+	const transcriptKey = getEditTranscriptObjectKey(video.ownerId, video.id);
+	const prefix = `${video.ownerId}/${video.id}/transcription`;
+	const listed = await bucket.listObjects({ prefix }).pipe(runWorkflowPromise);
+	const objects = (listed.Contents ?? [])
+		.map((object) => ({ Key: object.Key }))
+		.filter(
+			(object): object is { Key: string } =>
+				Boolean(object.Key) && object.Key !== transcriptKey,
+		);
+
+	if (objects.length > 0) {
+		await bucket.deleteObjects(objects).pipe(runWorkflowPromise);
+	}
+
+	await bucket
+		.putObject(
+			`${video.ownerId}/${video.id}/transcription.vtt`,
+			editTranscriptWordsToCaptionVtt(
+				remapEditTranscriptThroughSpec(transcript, editSpec).words,
+			),
+			{ contentType: "text/vtt" },
+		)
+		.pipe(runWorkflowPromise);
+}
+
 async function clearTranscriptObjects(video: typeof videos.$inferSelect) {
 	const [bucket] = await Storage.getAccessForVideo(
 		decodeStorageVideo(video),
-	).pipe(runPromise);
+	).pipe(runWorkflowPromise);
 	const prefix = `${video.ownerId}/${video.id}/transcription`;
-	const listed = await bucket.listObjects({ prefix }).pipe(runPromise);
+	const listed = await bucket.listObjects({ prefix }).pipe(runWorkflowPromise);
 	const objects = (listed.Contents ?? [])
 		.map((object) => ({ Key: object.Key }))
 		.filter((object): object is { Key: string } => Boolean(object.Key));
 
 	if (objects.length > 0) {
-		await bucket.deleteObjects(objects).pipe(runPromise);
+		await bucket.deleteObjects(objects).pipe(runWorkflowPromise);
 	}
 }
 
@@ -631,7 +784,7 @@ async function invalidateEditedVideoCache(
 	try {
 		const cloudfront = new CloudFrontClient({
 			region: serverEnv().CAP_AWS_REGION || "us-east-1",
-			credentials: await runPromise(
+			credentials: await runWorkflowPromise(
 				Effect.map(AwsCredentials, (credentials) => credentials.credentials),
 			),
 		});
@@ -662,13 +815,13 @@ async function invalidateEditedVideoCache(
 	}
 }
 
-async function saveEditResultAndComplete(
+export async function saveEditResultAndComplete(
 	videoId: string,
 	sourceKey: string,
 	previousSpec: VideoEditSpec,
 	editSpec: VideoEditSpec,
 	metadata: { duration: number; width: number; height: number; fps: number },
-): Promise<void> {
+): Promise<{ transcriptRemapped: boolean }> {
 	"use step";
 
 	const duration = getValidDuration(metadata.duration);
@@ -681,9 +834,36 @@ async function saveEditResultAndComplete(
 		throw new FatalError("Video does not exist");
 	}
 
-	const nextMetadata = clearAiMetadata(video.metadata as VideoMetadata | null);
+	let originalTranscript: EditTranscript | null = null;
+	try {
+		originalTranscript = await loadOriginalEditTranscript(video, editSpec);
+	} catch (error) {
+		console.warn(
+			"[editVideoWorkflow] Failed to load stored edit transcript",
+			error,
+		);
+	}
 
 	await db().transaction(async (tx) => {
+		await retireDesktopRecordingJobForOutputReplacement(tx, {
+			videoId: video.id,
+			userId: video.ownerId,
+		});
+		const [lockedVideo] = await tx
+			.select()
+			.from(videos)
+			.where(eq(videos.id, video.id))
+			.for("update");
+		if (
+			!lockedVideo ||
+			lockedVideo.ownerId !== video.ownerId ||
+			lockedVideo.bucket !== video.bucket ||
+			lockedVideo.storageIntegrationId !== video.storageIntegrationId
+		) {
+			throw new Error("Recording storage changed while the edit was rendering");
+		}
+		const nextMetadata = clearAiMetadata(lockedVideo.metadata);
+		delete nextMetadata.desktopRecordingUpload;
 		await tx
 			.update(videos)
 			.set({
@@ -691,7 +871,12 @@ async function saveEditResultAndComplete(
 				height: metadata.height,
 				fps: metadata.fps,
 				metadata: nextMetadata,
-				transcriptionStatus: null,
+				...(lockedVideo.source.type === "desktopMP4"
+					? { source: { type: "desktopMP4" as const } }
+					: {}),
+				// Derivable captions keep the transcription COMPLETE; only legacy
+				// videos without a stored word transcript get re-transcribed.
+				...(originalTranscript ? {} : { transcriptionStatus: null }),
 				...(duration === undefined ? {} : { duration }),
 			})
 			.where(eq(videos.id, videoId as Video.VideoId));
@@ -745,6 +930,26 @@ async function saveEditResultAndComplete(
 			);
 	});
 
+	if (originalTranscript) {
+		try {
+			await rewriteTranscriptObjectsForEdit(
+				video,
+				originalTranscript,
+				editSpec,
+			);
+			return { transcriptRemapped: true };
+		} catch (error) {
+			console.warn(
+				"[editVideoWorkflow] Failed to remap transcript objects",
+				error,
+			);
+			await db()
+				.update(videos)
+				.set({ transcriptionStatus: null })
+				.where(eq(videos.id, videoId as Video.VideoId));
+		}
+	}
+
 	try {
 		await clearTranscriptObjects(video);
 	} catch (error) {
@@ -753,6 +958,8 @@ async function saveEditResultAndComplete(
 			error,
 		);
 	}
+
+	return { transcriptRemapped: false };
 }
 
 async function clearEditProcessingState(

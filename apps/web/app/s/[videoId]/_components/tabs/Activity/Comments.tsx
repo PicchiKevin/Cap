@@ -1,5 +1,4 @@
-import { Button } from "@cap/ui";
-import { Comment, User, type Video } from "@cap/web-domain";
+import type { Comment, User, Video } from "@cap/web-domain";
 import {
 	faChevronDown,
 	faChevronRight,
@@ -25,14 +24,20 @@ import { deleteComment } from "@/actions/videos/delete-comment";
 import { newComment } from "@/actions/videos/new-comment";
 import { useCurrentUser } from "@/app/Layout/AuthContext";
 import type { CommentType } from "../../../Share";
+import { ActivityComposer } from "./ActivityComposer";
 import CommentThread from "./Comment";
-import CommentInput from "./CommentInput";
+import type CommentInput from "./CommentInput";
 import EmptyState from "./EmptyState";
-import { DONE_MESSAGE, latestDoneAt, useReopenedThreads } from "./threadState";
+import {
+	DONE_MESSAGE,
+	latestResolution,
+	useReopenedThreads,
+} from "./threadState";
 
 type Thread = {
 	root: CommentType;
 	replies: CommentType[];
+	resolution: CommentType | null;
 	isDone: boolean;
 };
 
@@ -48,6 +53,8 @@ export const Comments = Object.assign(
 			onSeek?: (time: number) => void;
 			setShowAuthOverlay: (v: boolean) => void;
 			commentsDisabled: boolean;
+			ownerName?: string | null;
+			canRecordMedia?: boolean;
 		}
 	>((props, ref) => {
 		const {
@@ -61,16 +68,13 @@ export const Comments = Object.assign(
 		const commentParams = useSearchParams().get("comment");
 		const replyParams = useSearchParams().get("reply");
 		const user = useCurrentUser();
-
 		const [replyingTo, setReplyingTo] = useState<Comment.CommentId | null>(
 			null,
 		);
 		const [showResolved, setShowResolved] = useState(false);
-
 		const { isThreadDone, reopen, clearReopen } = useReopenedThreads(
 			props.videoId,
 		);
-
 		const commentsContainerRef = useRef<HTMLDivElement>(null);
 
 		useEffect(() => {
@@ -82,12 +86,10 @@ export const Comments = Object.assign(
 		}, [commentParams, replyParams]);
 
 		const scrollToBottom = useCallback(() => {
-			if (commentsContainerRef.current) {
-				commentsContainerRef.current.scrollTo({
-					top: commentsContainerRef.current.scrollHeight,
-					behavior: "smooth",
-				});
-			}
+			commentsContainerRef.current?.scrollTo({
+				top: commentsContainerRef.current.scrollHeight,
+				behavior: "smooth",
+			});
 		}, []);
 
 		useImperativeHandle(ref, () => ({ scrollToBottom }), [scrollToBottom]);
@@ -101,45 +103,77 @@ export const Comments = Object.assign(
 					if (!reply.parentCommentId || reply.parentCommentId === "")
 						return false;
 					if (reply.parentCommentId === root.id) return true;
-					// replies-to-replies are flattened into their top-level thread
 					const parent = optimisticComments.find(
-						(c) => c.id === reply.parentCommentId,
+						(comment) => comment.id === reply.parentCommentId,
 					);
 					return parent?.parentCommentId === root.id;
 				});
-				const doneAt = latestDoneAt(replies);
+				const resolution = latestResolution(replies);
 				return {
 					root,
 					replies,
-					isDone: isThreadDone(root.id, doneAt),
+					resolution,
+					isDone: isThreadDone(root.id, resolution),
 				};
 			});
-
 			return {
-				openThreads: threads.filter((t) => !t.isDone),
-				resolvedThreads: threads.filter((t) => t.isDone),
+				openThreads: threads.filter((thread) => !thread.isDone),
+				resolvedThreads: threads.filter((thread) => thread.isDone),
 			};
 		}, [optimisticComments, isThreadDone]);
+
+		const deepLinkId = commentParams ?? replyParams;
+		const deepLinkTargetsResolved = Boolean(
+			deepLinkId &&
+				resolvedThreads.some(
+					(thread) =>
+						thread.root.id === deepLinkId ||
+						thread.replies.some((reply) => reply.id === deepLinkId),
+				),
+		);
+		useEffect(() => {
+			if (deepLinkTargetsResolved) setShowResolved(true);
+		}, [deepLinkTargetsResolved]);
+		useEffect(() => {
+			if (!deepLinkId) return;
+			const timer = window.setTimeout(() => {
+				const target = document.getElementById(`comment-${deepLinkId}`);
+				target?.scrollIntoView({ behavior: "smooth", block: "center" });
+				(target as HTMLElement | null)?.focus({ preventScroll: true });
+			}, 0);
+			return () => window.clearTimeout(timer);
+		}, [deepLinkId]);
+
+		const currentVideoTime = () => {
+			const videoElement = document.querySelector("video") as HTMLVideoElement;
+			return videoElement?.currentTime || 0;
+		};
 
 		const postComment = async (
 			content: string,
 			parentCommentId: Comment.CommentId,
 			timestamp: number | null,
+			event: Comment.Event | null = null,
 		) => {
 			if (!user) return;
-
+			const clientKey = `temp-${Date.now()}`;
 			const optimisticComment: CommentType = {
-				id: Comment.CommentId.make(`temp-${Date.now()}`),
-				authorId: User.UserId.make(user.id),
-				authorName: user?.name,
+				id: clientKey as Comment.CommentId,
+				clientKey,
+				authorId: user.id as User.UserId,
+				authorName: user.name,
 				authorImage: user.imageUrl,
 				content,
 				createdAt: new Date(),
 				videoId: props.videoId,
 				parentCommentId,
-				type: "text",
+				type: event ? "event" : "text",
 				timestamp,
 				updatedAt: new Date(),
+				mediaKey: null,
+				mediaDuration: null,
+				mediaMeta: null,
+				event,
 				sending: true,
 			};
 
@@ -152,25 +186,17 @@ export const Comments = Object.assign(
 				videoId: props.videoId,
 				authorImage: user.imageUrl,
 				parentCommentId,
-				type: "text",
+				type: event ? "event" : "text",
 				timestamp,
+				event,
 			});
-			handleCommentSuccess(data);
+			handleCommentSuccess({ ...data, clientKey });
 			return data;
-		};
-
-		const currentVideoTime = () => {
-			const videoElement = document.querySelector("video") as HTMLVideoElement;
-			return videoElement?.currentTime || 0;
 		};
 
 		const handleNewComment = async (content: string) => {
 			try {
-				await postComment(
-					content,
-					Comment.CommentId.make(""),
-					currentVideoTime(),
-				);
+				await postComment(content, "" as Comment.CommentId, currentVideoTime());
 			} catch (error) {
 				console.error("Error posting comment:", error);
 			}
@@ -178,24 +204,12 @@ export const Comments = Object.assign(
 
 		const handleReply = async (content: string) => {
 			if (!replyingTo) return;
-
-			const parentComment = optimisticComments.find((c) => c.id === replyingTo);
-			const actualParentId = parentComment?.parentCommentId
-				? parentComment.parentCommentId
-				: replyingTo;
-
 			try {
-				const data = await postComment(
-					content,
-					actualParentId,
-					currentVideoTime(),
-				);
+				const data = await postComment(content, replyingTo, currentVideoTime());
 				if (data) {
-					const newReplyElement = document.getElementById(`comment-${data.id}`);
-					newReplyElement?.scrollIntoView({
-						behavior: "smooth",
-						block: "center",
-					});
+					document
+						.getElementById(`comment-${data.id}`)
+						?.scrollIntoView({ behavior: "smooth", block: "center" });
 				}
 				setReplyingTo(null);
 			} catch (error) {
@@ -208,21 +222,12 @@ export const Comments = Object.assign(
 				props.setShowAuthOverlay(true);
 				return;
 			}
-			// a fresh done-message must win over any earlier local reopen
-			clearReopen(threadId);
 			try {
-				await postComment(DONE_MESSAGE, threadId, null);
+				await postComment(DONE_MESSAGE, threadId, null, { type: "resolution" });
+				clearReopen(threadId);
 			} catch (error) {
 				console.error("Error resolving thread:", error);
 			}
-		};
-
-		const handleReopen = (threadId: Comment.CommentId) => {
-			reopen(threadId);
-		};
-
-		const handleCancelReply = () => {
-			setReplyingTo(null);
 		};
 
 		const handleDeleteComment = async (
@@ -235,34 +240,41 @@ export const Comments = Object.assign(
 					parentId,
 					videoId: props.videoId,
 				});
-				setComments((prev) => prev.filter((c) => c.id !== commentId));
+				setComments((comments) =>
+					comments.filter((comment) => comment.id !== commentId),
+				);
 			} catch (error) {
 				console.error("Failed to delete comment:", error);
 			}
 		};
 
-		const onReply = (id: Comment.CommentId) => {
+		const onReply = (commentId: Comment.CommentId) => {
 			if (!user) {
 				props.setShowAuthOverlay(true);
-			} else {
-				setReplyingTo(id);
+				return;
 			}
+			setReplyingTo(commentId);
 		};
 
 		const renderThread = (thread: Thread) => (
 			<CommentThread
-				key={thread.root.id}
+				key={thread.root.clientKey ?? thread.root.id}
 				comment={thread.root}
 				replies={thread.replies}
 				isDone={thread.isDone}
 				onReply={onReply}
 				replyingToId={replyingTo}
 				handleReply={handleReply}
-				onCancelReply={handleCancelReply}
+				onCancelReply={() => setReplyingTo(null)}
 				onDelete={handleDeleteComment}
 				onResolve={handleResolve}
-				onReopen={handleReopen}
+				onReopen={() => {
+					if (thread.resolution) reopen(thread.root.id, thread.resolution.id);
+				}}
 				onSeek={onSeek}
+				forceShowReplies={Boolean(
+					deepLinkId && thread.replies.some((reply) => reply.id === deepLinkId),
+				)}
 			/>
 		);
 
@@ -276,9 +288,18 @@ export const Comments = Object.assign(
 				}}
 				setShowAuthOverlay={props.setShowAuthOverlay}
 				commentsContainerRef={commentsContainerRef}
+				videoId={props.videoId}
+				ownerName={props.ownerName}
+				canRecordMedia={props.canRecordMedia}
+				onOptimisticComment={(comment) => {
+					startTransition(() => {
+						setOptimisticComments(comment);
+					});
+				}}
+				onCommentSuccess={handleCommentSuccess}
 			>
 				{commentsDisabled ? (
-					<div className="p-4 space-y-6 h-full">
+					<div className="h-full space-y-6 p-4">
 						<EmptyState
 							icon={<FontAwesomeIcon icon={faCommentSlash} />}
 							commentsDisabled={commentsDisabled}
@@ -287,14 +308,13 @@ export const Comments = Object.assign(
 				) : !hasThreads ? (
 					<EmptyState />
 				) : (
-					<div className="p-3 space-y-2.5">
+					<div className="space-y-2.5 p-3">
 						{openThreads.map(renderThread)}
-
 						{openThreads.length === 0 && resolvedThreads.length > 0 && (
 							<div className="flex flex-col items-center py-6 text-center">
 								<FontAwesomeIcon
 									icon={faCircleCheck}
-									className="mb-2 text-green-500 size-6"
+									className="mb-2 size-6 text-green-500"
 								/>
 								<p className="text-sm font-medium text-gray-12">
 									All threads resolved
@@ -302,16 +322,15 @@ export const Comments = Object.assign(
 								<p className="text-xs text-gray-9">Nothing left to do here.</p>
 							</div>
 						)}
-
 						{resolvedThreads.length > 0 && (
 							<div className="space-y-2.5">
 								<button
 									type="button"
-									onClick={() => setShowResolved((v) => !v)}
-									className="flex gap-2 items-center w-full text-xs font-medium text-gray-9 hover:text-gray-12 transition-colors"
+									onClick={() => setShowResolved((visible) => !visible)}
+									className="flex w-full items-center gap-2 text-xs font-medium text-gray-9 transition-colors hover:text-gray-12"
 								>
-									<div className="flex-1 h-px bg-gray-4" />
-									<span className="flex gap-1.5 items-center">
+									<div className="h-px flex-1 bg-gray-4" />
+									<span className="flex items-center gap-1.5">
 										<FontAwesomeIcon
 											className="size-[9px]"
 											icon={showResolved ? faChevronDown : faChevronRight}
@@ -319,7 +338,7 @@ export const Comments = Object.assign(
 										{resolvedThreads.length} resolved{" "}
 										{resolvedThreads.length === 1 ? "thread" : "threads"}
 									</span>
-									<div className="flex-1 h-px bg-gray-4" />
+									<div className="h-px flex-1 bg-gray-4" />
 								</button>
 								{showResolved && (
 									<div className="space-y-2.5">
@@ -342,41 +361,37 @@ export const Comments = Object.assign(
 					"user" | "placholder" | "buttonLabel"
 				>;
 				commentsContainerRef?: React.RefObject<HTMLDivElement | null>;
+				videoId?: Video.VideoId;
+				ownerName?: string | null;
+				canRecordMedia?: boolean;
+				onOptimisticComment?: (comment: CommentType) => void;
+				onCommentSuccess?: (comment: CommentType) => void;
 			}>,
-		) => {
-			const user = useCurrentUser();
-
-			return (
-				<>
-					<div
-						ref={props.commentsContainerRef}
-						className="overflow-y-auto flex-1 min-h-0"
-					>
-						{props.children}
+		) => (
+			<>
+				<div
+					ref={props.commentsContainerRef}
+					className="min-h-0 flex-1 overflow-y-auto"
+				>
+					{props.children}
+				</div>
+				{!props.commentInputProps?.disabled && props.videoId && (
+					<div className="flex-none border-t border-gray-5 bg-gray-2 p-2">
+						<ActivityComposer
+							videoId={props.videoId}
+							ownerName={props.ownerName}
+							onSubmit={(content) =>
+								props.commentInputProps?.onSubmit?.(content)
+							}
+							setShowAuthOverlay={props.setShowAuthOverlay}
+							canRecordMedia={props.canRecordMedia}
+							onOptimisticComment={props.onOptimisticComment}
+							onCommentSuccess={props.onCommentSuccess}
+						/>
 					</div>
-
-					{!props.commentInputProps?.disabled && (
-						<div className="flex-none p-2 border-t border-gray-5 bg-gray-2">
-							{user ? (
-								<CommentInput
-									{...props.commentInputProps}
-									placeholder="Leave a comment"
-									buttonLabel="Comment"
-								/>
-							) : (
-								<Button
-									className="min-w-full"
-									variant="primary"
-									onClick={() => props.setShowAuthOverlay(true)}
-								>
-									Sign in to leave a comment
-								</Button>
-							)}
-						</div>
-					)}
-				</>
-			);
-		},
+				)}
+			</>
+		),
 		Skeleton: (props: { setShowAuthOverlay: (v: boolean) => void }) => (
 			<Comments.Shell {...props} commentInputProps={{ disabled: true }} />
 		),

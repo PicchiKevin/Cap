@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type BunFile, file, spawn } from "bun";
 import type { VideoMetadata } from "./job-manager";
@@ -11,6 +11,10 @@ import {
 	withTimeout,
 } from "./media-common";
 import { probeVideoFile } from "./media-probe";
+import {
+	RecordingTimingError,
+	readRecordingVideoTiming,
+} from "./recording-timing";
 import { registerSubprocess, terminateProcess } from "./subprocess";
 import {
 	createTempFile,
@@ -21,9 +25,16 @@ import {
 
 const PROCESS_TIMEOUT_PER_SECOND_MS = 20_000;
 const MAX_PROCESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+// HLS/DASH sources are pulled as many sequential segment requests rather than
+// one streamed fetch, so per-request overhead scales with video length. A
+// flat 10-minute budget is enough for typical short recordings but not for a
+// long (e.g. 60+ minute) manifest with 1000+ segments.
+const STREAMING_DOWNLOAD_TIMEOUT_PER_SECOND_MS = 5_000;
+const MAX_STREAMING_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
 const THUMBNAIL_TIMEOUT_MS = 60_000;
 const PREVIEW_GIF_TIMEOUT_MS = 30_000;
 const PROBE_H264_LEVEL_TIMEOUT_MS = 10_000;
+const FFMPEG_HLS_CAPABILITY_TIMEOUT_MS = 10_000;
 const UPLOAD_MAX_RETRIES = 4;
 const UPLOAD_RETRY_BASE_MS = 250;
 const MAX_STDERR_BYTES = 64 * 1024;
@@ -34,16 +45,20 @@ const MAX_LEVEL_5_1_WIDTH = 4096;
 const MAX_LEVEL_5_1_HEIGHT = 2304;
 const MULTIPART_MIN_PART_SIZE_BYTES = 5 * 1024 * 1024;
 const MULTIPART_MAX_PARTS = 10_000;
+const MULTIPART_ABORT_TIMEOUT_MS = 30_000;
 const STORAGE_ERROR_BODY_LIMIT_BYTES = 2_048;
 
 export type StorageUploadTarget =
 	| {
 			type: "put";
 			url: string;
+			ifNoneMatch?: "*";
 	  }
 	| {
 			type: "multipart";
 			videoId: string;
+			generation?: string;
+			attemptId?: string;
 			key: string;
 			uploadId: string;
 			partSize: number;
@@ -52,6 +67,10 @@ export type StorageUploadTarget =
 			abortUrl: string;
 			webhookSecret?: string;
 	  };
+
+export interface StorageUploadReceipt {
+	objectIdentity?: string;
+}
 
 type UploadedPart = {
 	partNumber: number;
@@ -67,6 +86,7 @@ export interface VideoProcessingOptions {
 	crf?: number;
 	preset?: "ultrafast" | "fast" | "medium" | "slow";
 	remuxOnly?: boolean;
+	normalizeH264Level?: boolean;
 	timeoutMs?: number;
 }
 
@@ -122,6 +142,18 @@ interface DashRepresentationPlaylist {
 	path: string;
 }
 
+export interface FfmpegHlsCapabilities {
+	allowedSegmentExtensions: boolean;
+	extensionPicky: boolean;
+}
+
+const LEGACY_FFMPEG_HLS_CAPABILITIES: FfmpegHlsCapabilities = {
+	allowedSegmentExtensions: false,
+	extensionPicky: false,
+};
+
+let ffmpegHlsCapabilitiesPromise: Promise<FfmpegHlsCapabilities> | undefined;
+
 const DEFAULT_OPTIONS: Required<VideoProcessingOptions> = {
 	maxWidth: 1920,
 	maxHeight: 1080,
@@ -130,6 +162,7 @@ const DEFAULT_OPTIONS: Required<VideoProcessingOptions> = {
 	crf: 23,
 	preset: "medium",
 	remuxOnly: false,
+	normalizeH264Level: false,
 	timeoutMs: PROCESS_TIMEOUT_MS,
 };
 
@@ -183,11 +216,21 @@ function resolveResourceUrl(
 	baseUrl: string,
 	query: string,
 ): string {
-	if (resource.startsWith("http://") || resource.startsWith("https://")) {
-		return withQuery(resource, query);
+	const resolved = new URL(resource, baseUrl);
+	if (resolved.protocol !== "http:" && resolved.protocol !== "https:") {
+		throw new Error(
+			`Unsupported media resource protocol: ${resolved.protocol}`,
+		);
 	}
 
-	return withQuery(new URL(resource, baseUrl).toString(), query);
+	return withQuery(resolved.toString(), query);
+}
+
+function getFetchSignal(timeoutMs: number, abortSignal?: AbortSignal) {
+	const timeoutSignal = AbortSignal.timeout(timeoutMs);
+	return abortSignal
+		? AbortSignal.any([abortSignal, timeoutSignal])
+		: timeoutSignal;
 }
 
 function redactUrl(value: string): string {
@@ -227,12 +270,13 @@ export async function materializeHlsPlaylist(
 	playlistUrl: string,
 	dirPath: string,
 	cache = new Map<string, string>(),
+	abortSignal?: AbortSignal,
 ): Promise<string> {
 	const cached = cache.get(playlistUrl);
 	if (cached) return cached;
 
 	const response = await fetch(playlistUrl, {
-		signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+		signal: getFetchSignal(DOWNLOAD_TIMEOUT_MS, abortSignal),
 	});
 
 	if (!response.ok) {
@@ -258,7 +302,7 @@ export async function materializeHlsPlaylist(
 			if (!trimmed.startsWith("#")) {
 				const resolved = resolveResourceUrl(trimmed, baseUrl, query);
 				return isHlsUrl(resolved)
-					? await materializeHlsPlaylist(resolved, dirPath, cache)
+					? await materializeHlsPlaylist(resolved, dirPath, cache, abortSignal)
 					: resolved;
 			}
 
@@ -273,7 +317,7 @@ export async function materializeHlsPlaylist(
 
 				const resolved = resolveResourceUrl(original, baseUrl, query);
 				const replacement = isHlsUrl(resolved)
-					? await materializeHlsPlaylist(resolved, dirPath, cache)
+					? await materializeHlsPlaylist(resolved, dirPath, cache, abortSignal)
 					: resolved;
 
 				rewritten = rewritten.replace(
@@ -293,9 +337,10 @@ export async function materializeHlsPlaylist(
 export async function materializeMpdManifest(
 	manifestUrl: string,
 	dirPath: string,
+	abortSignal?: AbortSignal,
 ): Promise<string> {
 	const response = await fetch(manifestUrl, {
-		signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+		signal: getFetchSignal(DOWNLOAD_TIMEOUT_MS, abortSignal),
 	});
 
 	if (!response.ok) {
@@ -309,11 +354,26 @@ export async function materializeMpdManifest(
 	const baseUrl = new URL(".", parsedUrl).toString();
 	const query = parsedUrl.search;
 	const filePath = join(dirPath, `${randomUUID()}.mpd`);
+	const rewrittenElements = content.replace(
+		/<(BaseURL|Location)(\b[^>]*)>([\s\S]*?)<\/\1>/gi,
+		(_, tag: string, attributes: string, resource: string) => {
+			const resolved = resolveResourceUrl(
+				decodeXmlAttribute(resource.trim()),
+				baseUrl,
+				query,
+			);
+			return `<${tag}${attributes}>${escapeXmlAttribute(resolved)}</${tag}>`;
+		},
+	);
 
-	const rewritten = content.replace(
-		/(initialization|media)="([^"]+)"/g,
+	const rewritten = rewrittenElements.replace(
+		/(initialization|media|sourceURL|xlink:href|href)="([^"]+)"/gi,
 		(_, attribute: string, resource: string) => {
-			const resolved = resolveResourceUrl(resource, baseUrl, query);
+			const resolved = resolveResourceUrl(
+				decodeXmlAttribute(resource),
+				baseUrl,
+				query,
+			);
 			return `${attribute}="${escapeXmlAttribute(resolved)}"`;
 		},
 	);
@@ -460,11 +520,11 @@ function getDashResourceBaseUrl(
 		"BaseURL",
 	);
 	const baseUrl = adaptationBaseUrl
-		? new URL(adaptationBaseUrl, manifestBaseUrl).toString()
+		? resolveResourceUrl(adaptationBaseUrl, manifestBaseUrl, "")
 		: manifestBaseUrl;
 
 	return representationBaseUrl
-		? new URL(representationBaseUrl, baseUrl).toString()
+		? resolveResourceUrl(representationBaseUrl, baseUrl, "")
 		: baseUrl;
 }
 
@@ -656,9 +716,10 @@ function shouldFallbackToGenericMpd(error: unknown): boolean {
 export async function materializeMpdAsHlsPlaylist(
 	manifestUrl: string,
 	dirPath: string,
+	abortSignal?: AbortSignal,
 ): Promise<string> {
 	const response = await fetch(manifestUrl, {
-		signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+		signal: getFetchSignal(DOWNLOAD_TIMEOUT_MS, abortSignal),
 	});
 
 	if (!response.ok) {
@@ -821,21 +882,41 @@ export async function materializeMpdAsHlsPlaylist(
 export async function materializeStreamingInput(
 	videoUrl: string,
 	dirPath: string,
+	abortSignal?: AbortSignal,
 ): Promise<string> {
-	if (isHlsUrl(videoUrl)) {
-		return await materializeHlsPlaylist(videoUrl, dirPath);
-	}
+	let inputPath: string;
 
-	if (isMpdUrl(videoUrl)) {
+	if (isHlsUrl(videoUrl)) {
+		inputPath = await materializeHlsPlaylist(
+			videoUrl,
+			dirPath,
+			undefined,
+			abortSignal,
+		);
+	} else if (isMpdUrl(videoUrl)) {
 		try {
-			return await materializeMpdAsHlsPlaylist(videoUrl, dirPath);
+			inputPath = await materializeMpdAsHlsPlaylist(
+				videoUrl,
+				dirPath,
+				abortSignal,
+			);
 		} catch (err) {
 			if (!shouldFallbackToGenericMpd(err)) throw err;
-			return await materializeMpdManifest(videoUrl, dirPath);
+			inputPath = await materializeMpdManifest(videoUrl, dirPath, abortSignal);
+		}
+	} else {
+		return videoUrl;
+	}
+
+	for (const entry of await readdir(dirPath)) {
+		if (!entry.endsWith(".m3u8") && !entry.endsWith(".mpd")) continue;
+		const content = await file(join(dirPath, entry)).text();
+		if (/\b(?:file|data):/i.test(content)) {
+			throw new Error("Unsupported manifest resource protocol");
 		}
 	}
 
-	return videoUrl;
+	return inputPath;
 }
 
 async function drainStream(
@@ -912,6 +993,7 @@ async function runFfmpegCommand(
 	timeoutMs: number,
 	abortSignal?: AbortSignal,
 ): Promise<void> {
+	if (abortSignal?.aborted) throw new Error("Video processing was cancelled");
 	const proc = registerSubprocess(
 		spawn({
 			cmd: args,
@@ -928,6 +1010,7 @@ async function runFfmpegCommand(
 	}
 
 	try {
+		if (abortSignal?.aborted) throw new Error("Video processing was cancelled");
 		await withTimeout(
 			(async () => {
 				void drainStream(proc.stdout as ReadableStream<Uint8Array>);
@@ -956,9 +1039,72 @@ async function runFfmpegCommand(
 	}
 }
 
+export function parseFfmpegHlsCapabilities(
+	helpText: string,
+): FfmpegHlsCapabilities {
+	return {
+		allowedSegmentExtensions: helpText.includes("-allowed_segment_extensions"),
+		extensionPicky: helpText.includes("-extension_picky"),
+	};
+}
+
+async function detectFfmpegHlsCapabilities(): Promise<FfmpegHlsCapabilities> {
+	const proc = registerSubprocess(
+		spawn({
+			cmd: ["ffmpeg", "-hide_banner", "-h", "demuxer=hls"],
+			stdout: "pipe",
+			stderr: "pipe",
+		}),
+	);
+
+	try {
+		const [stdoutText, stderrText, exitCode] = await withTimeout(
+			Promise.all([
+				readStreamWithLimit(
+					proc.stdout as ReadableStream<Uint8Array>,
+					MAX_STDERR_BYTES,
+				),
+				readStreamWithLimit(
+					proc.stderr as ReadableStream<Uint8Array>,
+					MAX_STDERR_BYTES,
+				),
+				proc.exited,
+			]),
+			FFMPEG_HLS_CAPABILITY_TIMEOUT_MS,
+			() => terminateProcess(proc),
+		);
+
+		if (exitCode !== 0) {
+			throw new Error(
+				`Failed to inspect FFmpeg HLS options: ${stderrText.slice(-1000)}`,
+			);
+		}
+
+		return parseFfmpegHlsCapabilities(`${stdoutText}\n${stderrText}`);
+	} finally {
+		await terminateProcess(proc);
+	}
+}
+
+export async function getFfmpegHlsCapabilities(): Promise<FfmpegHlsCapabilities> {
+	const capabilitiesPromise =
+		ffmpegHlsCapabilitiesPromise ?? detectFfmpegHlsCapabilities();
+	ffmpegHlsCapabilitiesPromise = capabilitiesPromise;
+
+	try {
+		return await capabilitiesPromise;
+	} catch (error) {
+		if (ffmpegHlsCapabilitiesPromise === capabilitiesPromise) {
+			ffmpegHlsCapabilitiesPromise = undefined;
+		}
+		throw error;
+	}
+}
+
 export function buildStreamingDownloadFfmpegArgs(
 	inputPath: string,
 	outputPath: string,
+	capabilities: FfmpegHlsCapabilities = LEGACY_FFMPEG_HLS_CAPABILITIES,
 ): string[] {
 	return [
 		"ffmpeg",
@@ -968,10 +1114,10 @@ export function buildStreamingDownloadFfmpegArgs(
 		"file,http,https,tcp,tls,crypto,data",
 		"-allowed_extensions",
 		"ALL",
-		"-allowed_segment_extensions",
-		"ALL",
-		"-extension_picky",
-		"0",
+		...(capabilities.allowedSegmentExtensions
+			? ["-allowed_segment_extensions", "ALL"]
+			: []),
+		...(capabilities.extensionPicky ? ["-extension_picky", "0"] : []),
 		"-i",
 		inputPath,
 		"-map",
@@ -981,6 +1127,49 @@ export function buildStreamingDownloadFfmpegArgs(
 		"-y",
 		outputPath,
 	];
+}
+
+export async function estimateMaterializedStreamingDurationSeconds(
+	dirPath: string,
+): Promise<number | null> {
+	let longestDuration = 0;
+
+	for (const entry of await readdir(dirPath)) {
+		if (!entry.endsWith(".m3u8") && !entry.endsWith(".mpd")) continue;
+		const content = await file(join(dirPath, entry)).text();
+
+		if (entry.endsWith(".mpd")) {
+			const durationAttribute = content.match(
+				/\bmediaPresentationDuration\s*=\s*["']([^"']+)["']/i,
+			)?.[1];
+			const duration = parseIsoDurationSeconds(durationAttribute);
+			if (duration) longestDuration = Math.max(longestDuration, duration);
+			continue;
+		}
+
+		let playlistDuration = 0;
+		for (const match of content.matchAll(/^#EXTINF:([\d.]+)/gm)) {
+			const segmentDuration = Number(match[1]);
+			if (Number.isFinite(segmentDuration) && segmentDuration > 0) {
+				playlistDuration += segmentDuration;
+			}
+		}
+		longestDuration = Math.max(longestDuration, playlistDuration);
+	}
+
+	return longestDuration > 0 ? longestDuration : null;
+}
+
+function getStreamingDownloadTimeoutMs(durationSeconds: number | null): number {
+	if (!durationSeconds) return DOWNLOAD_TIMEOUT_MS;
+
+	return Math.min(
+		MAX_STREAMING_DOWNLOAD_TIMEOUT_MS,
+		Math.max(
+			DOWNLOAD_TIMEOUT_MS,
+			Math.ceil(durationSeconds * STREAMING_DOWNLOAD_TIMEOUT_PER_SECOND_MS),
+		),
+	);
 }
 
 async function downloadStreamingVideoToTemp(
@@ -996,11 +1185,23 @@ async function downloadStreamingVideoToTemp(
 	};
 
 	try {
-		const inputPath = await materializeStreamingInput(videoUrl, manifestDir);
+		const ffmpegHlsCapabilities = await getFfmpegHlsCapabilities();
+		const inputPath = await materializeStreamingInput(
+			videoUrl,
+			manifestDir,
+			abortSignal,
+		);
+		const durationSeconds =
+			await estimateMaterializedStreamingDurationSeconds(manifestDir);
+		const downloadTimeoutMs = getStreamingDownloadTimeoutMs(durationSeconds);
 
 		await runFfmpegCommand(
-			buildStreamingDownloadFfmpegArgs(inputPath, tempFile.path),
-			DOWNLOAD_TIMEOUT_MS,
+			buildStreamingDownloadFfmpegArgs(
+				inputPath,
+				tempFile.path,
+				ffmpegHlsCapabilities,
+			),
+			downloadTimeoutMs,
 			abortSignal,
 		);
 
@@ -1291,6 +1492,13 @@ export async function processVideo(
 			? await probeH264Level(inputPath, abortSignal)
 			: null;
 	const targetH264Level = pickMobileSafeH264Level(metadata, opts);
+	const normalizeH264Level =
+		opts.normalizeH264Level &&
+		metadata.videoCodec === "h264" &&
+		sourceH264Level !== null &&
+		sourceH264Level > targetH264Level.value &&
+		metadata.width <= opts.maxWidth &&
+		metadata.height <= opts.maxHeight;
 	const videoTranscode = remuxOnly
 		? false
 		: needsVideoTranscode(metadata, opts, sourceH264Level);
@@ -1314,7 +1522,14 @@ export async function processVideo(
 		inputPath,
 	];
 
-	if (videoTranscode) {
+	if (normalizeH264Level) {
+		ffmpegArgs.push(
+			"-c:v",
+			"copy",
+			"-bsf:v",
+			`h264_metadata=level=${targetH264Level.ffmpegValue}`,
+		);
+	} else if (videoTranscode) {
 		ffmpegArgs.push(
 			"-c:v",
 			"libx264",
@@ -1750,22 +1965,89 @@ function isRetryableUploadStatus(status: number): boolean {
 }
 
 function isGoogleDriveResumableUrl(url: string): boolean {
-	return url.includes("googleapis.com/upload/drive/");
+	const parsed = new URL(url);
+	return (
+		(parsed.hostname === "googleapis.com" ||
+			parsed.hostname.endsWith(".googleapis.com")) &&
+		parsed.pathname.startsWith("/upload/drive/")
+	);
+}
+
+function strongUploadIdentity(value: unknown): string | undefined {
+	return typeof value === "string" &&
+		value.length <= 1_024 &&
+		/^"[\x21\x23-\x7E\x80-\xFF]+"$/.test(value)
+		? value
+		: undefined;
+}
+
+async function readUploadReceipt(
+	response: Response,
+	url: string,
+	contentLength: number,
+): Promise<StorageUploadReceipt> {
+	if (!isGoogleDriveResumableUrl(url)) {
+		await response.body?.cancel().catch(() => {});
+		return {
+			objectIdentity: strongUploadIdentity(response.headers.get("etag")),
+		};
+	}
+	const body = response.body
+		? await readStreamWithLimit(response.body, MAX_STDERR_BYTES).catch(() => "")
+		: "";
+	let metadata: unknown;
+	try {
+		metadata = JSON.parse(body);
+	} catch {
+		return {};
+	}
+	if (!metadata || typeof metadata !== "object") return {};
+	const { id, size, sha256Checksum, headRevisionId } = metadata as Record<
+		string,
+		unknown
+	>;
+	if (
+		typeof id !== "string" ||
+		!/^[a-zA-Z0-9_-]{1,200}$/.test(id) ||
+		typeof sha256Checksum !== "string" ||
+		!/^[a-fA-F0-9]{64}$/.test(sha256Checksum) ||
+		typeof headRevisionId !== "string" ||
+		!headRevisionId ||
+		typeof size !== "string" ||
+		!/^\d+$/.test(size) ||
+		!Number.isSafeInteger(Number(size)) ||
+		Number(size) !== contentLength ||
+		contentLength <= 0
+	) {
+		return {};
+	}
+	const digest = createHash("sha256")
+		.update(JSON.stringify([id, Number(size), sha256Checksum.toLowerCase()]))
+		.digest("hex");
+	return { objectIdentity: `"cap-drive-content-v1:${digest}"` };
 }
 
 async function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function uploadSignal(abortSignal?: AbortSignal) {
+	const timeout = AbortSignal.timeout(UPLOAD_TIMEOUT_MS);
+	return abortSignal ? AbortSignal.any([abortSignal, timeout]) : timeout;
+}
+
 async function uploadWithRetry(
 	presignedUrl: string,
 	contentType: string,
 	contentLength: number,
-	bodyFactory: () => Blob | Uint8Array | ArrayBuffer | BunFile,
-): Promise<void> {
+	bodyFactory: () => Blob | BunFile,
+	ifNoneMatch?: "*",
+	abortSignal?: AbortSignal,
+): Promise<StorageUploadReceipt> {
 	let lastError: Error | undefined;
 
 	for (let attempt = 0; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
+		abortSignal?.throwIfAborted();
 		let response: Response;
 
 		try {
@@ -1773,6 +2055,7 @@ async function uploadWithRetry(
 				"Content-Type": contentType,
 				"Content-Length": contentLength.toString(),
 			};
+			if (ifNoneMatch) headers["If-None-Match"] = ifNoneMatch;
 			if (isGoogleDriveResumableUrl(presignedUrl) && contentLength > 0) {
 				headers["Content-Range"] =
 					`bytes 0-${contentLength - 1}/${contentLength}`;
@@ -1782,9 +2065,10 @@ async function uploadWithRetry(
 				method: "PUT",
 				headers,
 				body: bodyFactory(),
-				signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+				signal: uploadSignal(abortSignal),
 			});
 		} catch (err) {
+			abortSignal?.throwIfAborted();
 			const uploadError = err instanceof Error ? err : new Error(String(err));
 
 			if (attempt === UPLOAD_MAX_RETRIES) {
@@ -1797,7 +2081,13 @@ async function uploadWithRetry(
 		}
 
 		if (response.ok) {
-			return;
+			const receipt = await readUploadReceipt(
+				response,
+				presignedUrl,
+				contentLength,
+			);
+			abortSignal?.throwIfAborted();
+			return receipt;
 		}
 
 		const responseError = await storageResponseError(
@@ -1836,10 +2126,10 @@ export async function uploadFileToS3(
 	filePath: string,
 	presignedUrl: string,
 	contentType: string,
-): Promise<void> {
+): Promise<StorageUploadReceipt> {
 	const fileHandle = file(filePath);
 
-	await uploadWithRetry(presignedUrl, contentType, fileHandle.size, () =>
+	return uploadWithRetry(presignedUrl, contentType, fileHandle.size, () =>
 		file(filePath),
 	);
 }
@@ -1848,7 +2138,9 @@ async function postMultipartJson<TBody extends Record<string, unknown>>(
 	url: string,
 	body: TBody,
 	webhookSecret: string | undefined,
+	abortSignal?: AbortSignal,
 ): Promise<Response> {
+	abortSignal?.throwIfAborted();
 	const headers: Record<string, string> = {
 		"Content-Type": "application/json",
 	};
@@ -1860,7 +2152,7 @@ async function postMultipartJson<TBody extends Record<string, unknown>>(
 		method: "POST",
 		headers,
 		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+		signal: uploadSignal(abortSignal),
 	});
 }
 
@@ -1868,17 +2160,21 @@ async function getMultipartPartUrl(
 	target: Extract<StorageUploadTarget, { type: "multipart" }>,
 	partNumber: number,
 	contentLength: number,
+	abortSignal?: AbortSignal,
 ): Promise<string> {
 	const response = await postMultipartJson(
 		target.signPartUrl,
 		{
 			videoId: target.videoId,
+			generation: target.generation,
+			attemptId: target.attemptId,
 			key: target.key,
 			uploadId: target.uploadId,
 			partNumber,
 			contentLength,
 		},
 		target.webhookSecret,
+		abortSignal,
 	);
 
 	if (!response.ok) {
@@ -1886,6 +2182,7 @@ async function getMultipartPartUrl(
 	}
 
 	const data = await response.json().catch(() => null);
+	abortSignal?.throwIfAborted();
 	const url = (data as { url?: unknown } | null)?.url;
 	if (typeof url !== "string" || !url) {
 		throw new Error("Multipart part signing returned an invalid URL");
@@ -1899,10 +2196,12 @@ async function uploadMultipartPart(
 	body: Blob,
 	contentLength: number,
 	partNumber: number,
+	abortSignal?: AbortSignal,
 ): Promise<string> {
 	let lastError: Error | undefined;
 
 	for (let attempt = 0; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
+		abortSignal?.throwIfAborted();
 		let response: Response;
 		try {
 			response = await fetch(url, {
@@ -1911,9 +2210,10 @@ async function uploadMultipartPart(
 					"Content-Length": contentLength.toString(),
 				},
 				body,
-				signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+				signal: uploadSignal(abortSignal),
 			});
 		} catch (err) {
+			abortSignal?.throwIfAborted();
 			const uploadError = err instanceof Error ? err : new Error(String(err));
 
 			if (attempt === UPLOAD_MAX_RETRIES) {
@@ -1927,6 +2227,8 @@ async function uploadMultipartPart(
 
 		if (response.ok) {
 			const etag = response.headers.get("etag");
+			await response.body?.cancel().catch(() => {});
+			abortSignal?.throwIfAborted();
 			if (!etag) {
 				throw new Error(`Multipart upload part ${partNumber} missing ETag`);
 			}
@@ -1955,16 +2257,20 @@ async function uploadMultipartPart(
 async function completeMultipartUpload(
 	target: Extract<StorageUploadTarget, { type: "multipart" }>,
 	parts: UploadedPart[],
-): Promise<void> {
+	abortSignal?: AbortSignal,
+): Promise<StorageUploadReceipt> {
 	const response = await postMultipartJson(
 		target.completeUrl,
 		{
 			videoId: target.videoId,
+			generation: target.generation,
+			attemptId: target.attemptId,
 			key: target.key,
 			uploadId: target.uploadId,
 			parts,
 		},
 		target.webhookSecret,
+		abortSignal,
 	);
 
 	if (!response.ok) {
@@ -1973,6 +2279,15 @@ async function completeMultipartUpload(
 			response,
 		);
 	}
+	const result: unknown = await response.json().catch(() => null);
+	abortSignal?.throwIfAborted();
+	return {
+		objectIdentity: strongUploadIdentity(
+			result && typeof result === "object" && "objectIdentity" in result
+				? result.objectIdentity
+				: undefined,
+		),
+	};
 }
 
 async function abortMultipartUpload(
@@ -1982,27 +2297,33 @@ async function abortMultipartUpload(
 		target.abortUrl,
 		{
 			videoId: target.videoId,
+			generation: target.generation,
+			attemptId: target.attemptId,
 			key: target.key,
 			uploadId: target.uploadId,
 		},
 		target.webhookSecret,
+		AbortSignal.timeout(MULTIPART_ABORT_TIMEOUT_MS),
 	);
 
 	if (!response.ok) {
 		throw await storageResponseError("Multipart upload abort failed", response);
 	}
+	await response.body?.cancel().catch(() => {});
 }
 
 async function uploadFileMultipart(
 	filePath: string,
 	target: Extract<StorageUploadTarget, { type: "multipart" }>,
-): Promise<void> {
+	abortSignal?: AbortSignal,
+): Promise<StorageUploadReceipt> {
 	const fileHandle = file(filePath);
 	const contentLength = fileHandle.size;
 	const partSize = Math.floor(target.partSize);
 	const parts: UploadedPart[] = [];
 
 	try {
+		abortSignal?.throwIfAborted();
 		if (contentLength <= 0) {
 			throw new Error("Multipart upload requires a non-empty file");
 		}
@@ -2022,17 +2343,23 @@ async function uploadFileMultipart(
 			const start = (partNumber - 1) * partSize;
 			const end = Math.min(start + partSize, contentLength);
 			const partLength = end - start;
-			const url = await getMultipartPartUrl(target, partNumber, partLength);
+			const url = await getMultipartPartUrl(
+				target,
+				partNumber,
+				partLength,
+				abortSignal,
+			);
 			const etag = await uploadMultipartPart(
 				url,
 				fileHandle.slice(start, end),
 				partLength,
 				partNumber,
+				abortSignal,
 			);
 			parts.push({ partNumber, etag, size: partLength });
 		}
 
-		await completeMultipartUpload(target, parts);
+		return await completeMultipartUpload(target, parts, abortSignal);
 	} catch (error) {
 		await abortMultipartUpload(target).catch((abortError) => {
 			console.warn(
@@ -2055,13 +2382,20 @@ export async function uploadFileToStorage(
 	filePath: string,
 	target: StorageUploadTarget,
 	contentType: string,
-): Promise<void> {
+	abortSignal?: AbortSignal,
+): Promise<StorageUploadReceipt> {
 	if (target.type === "put") {
-		await uploadFileToS3(filePath, target.url, contentType);
-		return;
+		return uploadWithRetry(
+			target.url,
+			contentType,
+			file(filePath).size,
+			() => file(filePath),
+			target.ifNoneMatch,
+			abortSignal,
+		);
 	}
 
-	await uploadFileMultipart(filePath, target);
+	return uploadFileMultipart(filePath, target, abortSignal);
 }
 
 export async function copyFileToMp4(
@@ -2081,11 +2415,22 @@ export async function muxMediaTracksToMp4(
 	outputPath: string,
 	abortSignal?: AbortSignal,
 ): Promise<void> {
+	if (abortSignal?.aborted) throw new Error("Recording mux was cancelled");
+	const startedAt = performance.now();
+	const timing = await readRecordingVideoTiming(videoInputPath, {
+		abortSignal,
+		timeoutMs: PROCESS_TIMEOUT_MS,
+	});
+	if (abortSignal?.aborted) throw new Error("Recording mux was cancelled");
+	const lastTimestamp = timing.lastTimestampTicks - timing.firstTimestampTicks;
+	// FFmpeg 7 can discard a fragmented MP4's stored final sample duration.
+	const videoTimingFilter = `setts=pts=PTS:dts=DTS:duration=if(eq(PTS-STARTPTS\\,${lastTimestamp})\\,${timing.lastDurationTicks}\\,DURATION)`;
 	const args = audioInputPath
 		? [
 				"ffmpeg",
 				"-hide_banner",
 				"-y",
+				"-copyts",
 				"-i",
 				videoInputPath,
 				"-i",
@@ -2096,7 +2441,12 @@ export async function muxMediaTracksToMp4(
 				"1:a:0",
 				"-c",
 				"copy",
-				"-shortest",
+				"-bsf:v",
+				videoTimingFilter,
+				"-avoid_negative_ts",
+				"disabled",
+				"-movie_timescale",
+				"1000000",
 				"-movflags",
 				"+faststart",
 				outputPath,
@@ -2105,17 +2455,28 @@ export async function muxMediaTracksToMp4(
 				"ffmpeg",
 				"-hide_banner",
 				"-y",
+				"-copyts",
 				"-i",
 				videoInputPath,
 				"-map",
 				"0:v:0",
 				"-c:v",
 				"copy",
+				"-bsf:v",
+				videoTimingFilter,
 				"-an",
+				"-avoid_negative_ts",
+				"disabled",
+				"-movie_timescale",
+				"1000000",
 				"-movflags",
 				"+faststart",
 				outputPath,
 			];
 
-	await runFfmpegCommand(args, PROCESS_TIMEOUT_MS, abortSignal);
+	const remainingMs = PROCESS_TIMEOUT_MS - (performance.now() - startedAt);
+	if (remainingMs <= 0) {
+		throw new RecordingTimingError("Recording mux timed out", true);
+	}
+	await runFfmpegCommand(args, remainingMs, abortSignal);
 }

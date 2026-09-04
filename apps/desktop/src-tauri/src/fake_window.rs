@@ -18,6 +18,8 @@ use crate::{App, ArcLock, RecordingState};
 const RECORDING_CONTROLS_LABEL: &str = "in-progress-recording";
 const RECORDING_CONTROLS_WIDTH: f64 = 320.0;
 const RECORDING_CONTROLS_HEIGHT: f64 = 150.0;
+const RECORDING_CONTROLS_BAR_HEIGHT: f64 = 40.0;
+const RECORDING_CONTROLS_BOTTOM_PADDING: f64 = 12.0;
 const RECORDING_CONTROLS_OFFSET_Y: f64 = 120.0;
 const TICK_INTERVAL: Duration = Duration::from_millis(50);
 const DEAD_WINDOW_ERROR_THRESHOLD: u8 = 5;
@@ -168,6 +170,30 @@ fn should_ignore_cursor_events(
     default_ignore || !allow_default_interaction
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_cursor_in_window_scale(
+    cursor: tauri::PhysicalPosition<f64>,
+    primary_scale: f64,
+    window_scale: f64,
+) -> Option<tauri::PhysicalPosition<f64>> {
+    if !primary_scale.is_finite()
+        || primary_scale <= 0.0
+        || !window_scale.is_finite()
+        || window_scale <= 0.0
+        || !cursor.x.is_finite()
+        || !cursor.y.is_finite()
+    {
+        return None;
+    }
+    // Tao scales global mouse coordinates by the primary display, but window
+    // positions and DOM bounds use the window's display scale.
+    let factor = window_scale / primary_scale;
+    Some(tauri::PhysicalPosition::new(
+        cursor.x * factor,
+        cursor.y * factor,
+    ))
+}
+
 fn recording_controls_size_allows_default_interaction(
     window_size: tauri::PhysicalSize<u32>,
     scale_factor: f64,
@@ -254,6 +280,43 @@ fn calculate_bottom_center_position(display: &Display) -> Option<(f64, f64)> {
 }
 
 const TARGET_CONTROLS_OFFSET_Y: f64 = 48.0;
+const AREA_CONTROLS_MARGIN: f64 = 16.0;
+
+fn calculate_area_recording_controls_position(
+    display_bounds: LogicalBounds,
+    area_bounds: LogicalBounds,
+) -> (f64, f64) {
+    let display_left = display_bounds.position().x();
+    let display_top = display_bounds.position().y();
+    let display_right = display_left + display_bounds.size().width();
+    let display_bottom = display_top + display_bounds.size().height();
+    let area_left = display_left + area_bounds.position().x();
+    let area_top = display_top + area_bounds.position().y();
+    let area_bottom = area_top + area_bounds.size().height();
+
+    let max_x = (display_right - RECORDING_CONTROLS_WIDTH).max(display_left);
+    let pos_x = (area_left + (area_bounds.size().width() - RECORDING_CONTROLS_WIDTH) / 2.0)
+        .clamp(display_left, max_x);
+    let bar_top_offset = RECORDING_CONTROLS_HEIGHT
+        - RECORDING_CONTROLS_BOTTOM_PADDING
+        - RECORDING_CONTROLS_BAR_HEIGHT;
+    let bar_bottom_offset = RECORDING_CONTROLS_HEIGHT - RECORDING_CONTROLS_BOTTOM_PADDING;
+
+    let below_y = area_bottom + AREA_CONTROLS_MARGIN - bar_top_offset;
+    if below_y >= display_top && below_y + RECORDING_CONTROLS_HEIGHT <= display_bottom {
+        return (pos_x, below_y);
+    }
+
+    let above_y = area_top - AREA_CONTROLS_MARGIN - bar_bottom_offset;
+    if above_y >= display_top && above_y + RECORDING_CONTROLS_HEIGHT <= display_bottom {
+        return (pos_x, above_y);
+    }
+
+    let max_y = (display_bottom - RECORDING_CONTROLS_HEIGHT).max(display_top);
+    let fallback_y = (area_bottom - RECORDING_CONTROLS_HEIGHT - TARGET_CONTROLS_OFFSET_Y)
+        .clamp(display_top, max_y);
+    (pos_x, fallback_y)
+}
 
 pub fn calculate_recording_controls_position_for_target(
     capture_target: &ScreenCaptureTarget,
@@ -272,13 +335,10 @@ pub fn calculate_recording_controls_position_for_target(
         ScreenCaptureTarget::Area { screen, bounds } => {
             let display = Display::from_id(screen)?;
             let display_bounds = display.raw_handle().logical_bounds()?;
-            let abs_x = display_bounds.position().x() + bounds.position().x();
-            let abs_y = display_bounds.position().y() + bounds.position().y();
-            let pos_x = abs_x + (bounds.size().width() - RECORDING_CONTROLS_WIDTH) / 2.0;
-            let pos_y = abs_y + bounds.size().height()
-                - RECORDING_CONTROLS_HEIGHT
-                - TARGET_CONTROLS_OFFSET_Y;
-            Some((pos_x, pos_y))
+            Some(calculate_area_recording_controls_position(
+                display_bounds,
+                *bounds,
+            ))
         }
         _ => None,
     }
@@ -355,8 +415,9 @@ pub fn spawn_fake_window_listener(app: AppHandle, window: WebviewWindow) {
                                     None => true,
                                 };
                                 if changed {
-                                    let _ =
-                                        window.set_position(tauri::LogicalPosition::new(px, py));
+                                    let _ = window.set_position(
+                                        crate::windows::logical_point_position(px, py),
+                                    );
                                     last_target_pos = Some((px, py));
                                 }
                                 handled = true;
@@ -376,7 +437,8 @@ pub fn spawn_fake_window_listener(app: AppHandle, window: WebviewWindow) {
                         && let Some(display) = get_display_by_id(&cursor_display_id)
                         && let Some((pos_x, pos_y)) = calculate_bottom_center_position(&display)
                     {
-                        let _ = window.set_position(tauri::LogicalPosition::new(pos_x, pos_y));
+                        let _ = window
+                            .set_position(crate::windows::logical_point_position(pos_x, pos_y));
                         current_display_id = Some(cursor_display_id);
                     }
                 }
@@ -428,6 +490,18 @@ pub fn spawn_fake_window_listener(app: AppHandle, window: WebviewWindow) {
             };
 
             consecutive_errors = 0;
+            #[cfg(target_os = "macos")]
+            let mouse_position = match window.primary_monitor().ok().flatten().and_then(|monitor| {
+                macos_cursor_in_window_scale(mouse_position, monitor.scale_factor(), scale_factor)
+            }) {
+                Some(position) => position,
+                None => {
+                    let ignore = !is_recording_controls
+                        || !prepare_recording_controls_default_interaction(&window);
+                    let _ = window.set_ignore_cursor_events(ignore);
+                    continue;
+                }
+            };
             let allow_default_interaction = if is_recording_controls {
                 prepare_recording_controls_default_interaction(&window)
             } else {
@@ -493,6 +567,48 @@ mod tests {
 
     fn bounds(x: f64, y: f64, width: f64, height: f64) -> LogicalBounds {
         LogicalBounds::new(LogicalPosition::new(x, y), LogicalSize::new(width, height))
+    }
+
+    #[test]
+    fn macos_hit_testing_uses_the_same_scale_on_secondary_displays() {
+        let mut windows = HashMap::new();
+        windows.insert("controls".to_string(), bounds(10.0, 20.0, 100.0, 40.0));
+        for (origin, primary_scale, window_scale) in [
+            ((1920.0, 100.0), 2.0, 1.0),
+            ((-1280.0, 100.0), 1.0, 2.0),
+            ((0.0, -900.0), 2.0, 1.0),
+            ((0.0, 0.0), 2.0, 2.0),
+        ] {
+            let position =
+                tauri::LogicalPosition::new(origin.0, origin.1).to_physical::<i32>(window_scale);
+            for (offset, ignored) in [((30.0, 30.0), false), ((150.0, 80.0), true)] {
+                let mouse = tauri::LogicalPosition::new(origin.0 + offset.0, origin.1 + offset.1)
+                    .to_physical::<f64>(primary_scale);
+                let mouse =
+                    macos_cursor_in_window_scale(mouse, primary_scale, window_scale).unwrap();
+                assert_eq!(
+                    should_ignore_cursor_events(
+                        position,
+                        mouse,
+                        window_scale,
+                        &windows,
+                        false,
+                        true,
+                    ),
+                    ignored,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn macos_hit_testing_rejects_invalid_coordinate_scales() {
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                macos_cursor_in_window_scale(tauri::PhysicalPosition::new(20.0, 30.0), scale, 2.0,)
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -601,5 +717,48 @@ mod tests {
             tauri::PhysicalSize::new(1920, 1080),
             2.0,
         ));
+    }
+
+    #[test]
+    fn area_recording_controls_prefer_below_the_capture() {
+        let display = bounds(100.0, 200.0, 1920.0, 1080.0);
+        let area = bounds(200.0, 100.0, 800.0, 500.0);
+
+        let position = calculate_area_recording_controls_position(display, area);
+
+        assert_eq!(position, (540.0, 718.0));
+    }
+
+    #[test]
+    fn area_recording_controls_move_above_when_below_does_not_fit() {
+        let display = bounds(0.0, 0.0, 1920.0, 1080.0);
+        let area = bounds(300.0, 600.0, 800.0, 440.0);
+
+        let position = calculate_area_recording_controls_position(display, area);
+
+        assert_eq!(position, (540.0, 446.0));
+    }
+
+    #[test]
+    fn area_recording_controls_keep_the_existing_inside_fallback() {
+        let display = bounds(0.0, 0.0, 1920.0, 1080.0);
+        let area = bounds(300.0, 40.0, 800.0, 1000.0);
+
+        let position = calculate_area_recording_controls_position(display, area);
+
+        assert_eq!(position, (540.0, 842.0));
+    }
+
+    #[test]
+    fn area_recording_controls_stay_within_horizontal_display_edges() {
+        let display = bounds(100.0, 200.0, 1920.0, 1080.0);
+        let left_area = bounds(0.0, 100.0, 150.0, 300.0);
+        let right_area = bounds(1770.0, 100.0, 150.0, 300.0);
+
+        let left_position = calculate_area_recording_controls_position(display, left_area);
+        let right_position = calculate_area_recording_controls_position(display, right_area);
+
+        assert_eq!(left_position.0, 100.0);
+        assert_eq!(right_position.0, 1700.0);
     }
 }

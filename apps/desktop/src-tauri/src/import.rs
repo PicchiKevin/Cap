@@ -286,6 +286,7 @@ fn ensure_multiple_segments(meta: &mut RecordingMeta) -> Result<&mut MultipleSeg
                     system_audio: None,
                     cursor: segment.cursor,
                     keyboard: None,
+                    display_notch: None,
                 }],
                 cursors: Cursors::default(),
                 status: Some(StudioRecordingStatus::Complete),
@@ -322,6 +323,7 @@ fn full_timeline_for_segments(
                 start: 0.0,
                 end: duration,
                 name: None,
+                speed_audio_mode: None,
             })
         })
         .collect()
@@ -355,6 +357,7 @@ fn full_timeline_for_source_segments(
                 start: 0.0,
                 end: duration,
                 name: None,
+                speed_audio_mode: None,
             })
         })
         .collect()
@@ -368,6 +371,7 @@ fn ensure_project_timeline<'a>(
     if config.timeline.is_none() {
         config.timeline = Some(TimelineConfiguration {
             segments: full_timeline_for_segments(project_path, segments)?,
+            transitions: Vec::new(),
             zoom_segments: Vec::new(),
             scene_segments: Vec::new(),
             mask_segments: Vec::new(),
@@ -375,6 +379,7 @@ fn ensure_project_timeline<'a>(
             caption_segments: Vec::new(),
             keyboard_segments: Vec::new(),
             audio_segments: Vec::new(),
+            camera3d_segments: Vec::new(),
         });
     }
 
@@ -395,8 +400,13 @@ fn add_clip_configs(
 
         if let Some(existing) = config.clips.iter_mut().find(|clip| clip.index == index) {
             existing.offsets = offsets;
+            existing.offsets_auto_calculated = true;
         } else {
-            config.clips.push(ClipConfiguration { index, offsets });
+            config.clips.push(ClipConfiguration {
+                index,
+                offsets,
+                offsets_auto_calculated: true,
+            });
         }
     }
 }
@@ -836,6 +846,7 @@ fn single_segment_to_multiple(segment: &SingleSegment) -> MultipleSegment {
         system_audio: None,
         cursor: segment.cursor.clone(),
         keyboard: None,
+        display_notch: None,
     }
 }
 
@@ -908,6 +919,7 @@ fn source_timeline_segments_for_import(
             start,
             end,
             name: None,
+            speed_audio_mode: None,
         });
     }
 
@@ -1010,6 +1022,7 @@ fn copy_source_segment(
         system_audio,
         cursor,
         keyboard,
+        display_notch: source_segment.display_notch,
     })
 }
 
@@ -1064,6 +1077,17 @@ fn get_audio_stream_info(input: &avformat::context::Input) -> Option<(usize, Aud
     let audio_info = AudioInfo::from_decoder(&decoder).ok()?;
 
     Some((stream_index, audio_info))
+}
+
+fn reference_video_frame(frame: &ffmpeg::frame::Video) -> ffmpeg::frame::Video {
+    let mut referenced = ffmpeg::frame::Video::empty();
+    let status = unsafe { ffmpeg::ffi::av_frame_ref(referenced.as_mut_ptr(), frame.as_ptr()) };
+
+    if status < 0 {
+        frame.clone()
+    } else {
+        referenced
+    }
 }
 
 fn transcode_video(
@@ -1224,7 +1248,7 @@ fn transcode_video(
                     scaled_frame.set_pts(video_frame.pts());
                     scaled_frame
                 } else {
-                    video_frame.clone()
+                    reference_video_frame(&video_frame)
                 };
 
                 video_encoder
@@ -1290,10 +1314,10 @@ fn transcode_video(
                 scaled_frame.set_pts(video_frame.pts());
                 scaled_frame
             } else {
-                video_frame.clone()
+                reference_video_frame(&video_frame)
             }
         } else {
-            video_frame.clone()
+            reference_video_frame(&video_frame)
         };
 
         video_encoder
@@ -1348,11 +1372,7 @@ fn transcode_video(
 pub async fn start_video_import(app: AppHandle, source_path: PathBuf) -> Result<PathBuf, String> {
     info!("Starting video import from: {:?}", source_path);
 
-    let recordings_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("recordings");
+    let recordings_dir = crate::general_settings::GeneralSettingsStore::recordings_dir(&app);
 
     let project_name = generate_project_name(&source_path);
     let sanitized_name = sanitize_filename(&project_name);
@@ -1420,6 +1440,7 @@ pub async fn start_video_import(app: AppHandle, source_path: PathBuf) -> Result<
                     system_audio: None,
                     cursor: None,
                     keyboard: None,
+                    display_notch: None,
                 }],
                 cursors: Cursors::default(),
                 status: Some(StudioRecordingStatus::InProgress),
@@ -1515,6 +1536,7 @@ pub async fn start_video_import(app: AppHandle, source_path: PathBuf) -> Result<
                                     system_audio,
                                     cursor: None,
                                     keyboard: None,
+                                    display_notch: None,
                                 }],
                                 cursors: Cursors::default(),
                                 status: Some(StudioRecordingStatus::Complete),
@@ -1689,6 +1711,7 @@ async fn append_mp4_to_editor_project(
         system_audio,
         cursor: None,
         keyboard: None,
+        display_notch: None,
     };
 
     {
@@ -1705,6 +1728,7 @@ async fn append_mp4_to_editor_project(
             start: 0.0,
             end: duration,
             name: None,
+            speed_audio_mode: None,
         });
     add_clip_configs(
         &mut config,
@@ -1835,6 +1859,7 @@ async fn append_cap_project_to_editor_project(
                 start: source_segment.start,
                 end: source_segment.end,
                 name: None,
+                speed_audio_mode: source_segment.speed_audio_mode,
             });
         }
     }
@@ -2068,6 +2093,43 @@ pub async fn check_import_ready(project_path: PathBuf) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_video_frames_share_reference_counted_pixel_storage() {
+        let mut source = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, 16, 12);
+        source.set_pts(Some(417));
+        source.data_mut(0)[..4].copy_from_slice(&[11, 22, 33, 44]);
+        let original = source.data(0).as_ptr();
+
+        let referenced = reference_video_frame(&source);
+
+        assert_eq!(referenced.data(0).as_ptr(), original);
+        assert_eq!(referenced.format(), ffmpeg::format::Pixel::YUV420P);
+        assert_eq!((referenced.width(), referenced.height()), (16, 12));
+        assert_eq!(referenced.pts(), Some(417));
+        let buffer = unsafe { (*source.as_ptr()).buf[0] };
+        assert!(!buffer.is_null());
+        assert_eq!(unsafe { ffmpeg::ffi::av_buffer_get_ref_count(buffer) }, 2);
+
+        drop(source);
+
+        assert_eq!(&referenced.data(0)[..4], &[11, 22, 33, 44]);
+        let retained = unsafe { (*referenced.as_ptr()).buf[0] };
+        assert_eq!(unsafe { ffmpeg::ffi::av_buffer_get_ref_count(retained) }, 1);
+    }
+
+    #[test]
+    fn imported_video_frame_references_preserve_non_yuv_formats() {
+        let mut source = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::BGRA, 12, 8);
+        source.set_pts(Some(93));
+
+        let referenced = reference_video_frame(&source);
+
+        assert_eq!(referenced.data(0).as_ptr(), source.data(0).as_ptr());
+        assert_eq!(referenced.format(), ffmpeg::format::Pixel::BGRA);
+        assert_eq!((referenced.width(), referenced.height()), (12, 8));
+        assert_eq!(referenced.pts(), Some(93));
+    }
 
     #[test]
     fn source_asset_path_allows_file_inside_source_project() {

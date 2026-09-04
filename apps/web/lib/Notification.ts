@@ -4,14 +4,12 @@ import { FirstView } from "@cap/database/emails/first-view";
 import { NewComment } from "@cap/database/emails/new-comment";
 import { nanoId } from "@cap/database/helpers";
 import { comments, notifications, users, videos } from "@cap/database/schema";
-import { buildEnv, serverEnv } from "@cap/env";
+import { serverEnv } from "@cap/env";
 import type { Notification, NotificationBase } from "@cap/web-api-contract";
 import { Comment, User, Video } from "@cap/web-domain";
-import { and, eq, gte, isNull, ne, or, sql } from "drizzle-orm";
-import { revalidatePath } from "next/cache";
+import { and, eq, gte, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { UserPreferences } from "@/app/(org)/dashboard/dashboard-data";
 import { getSessionHash } from "@/lib/anonymous-names";
-import { sendSlackCommentNotification } from "@/lib/slack-notifications";
 
 export type NotificationType = Notification["type"];
 
@@ -103,19 +101,6 @@ export async function createNotification(
 
 		const { type, ...data } = notification;
 
-		// Slack DMs go to all thread participants, independent of the single
-		// in-app notification below and its early returns (owner-authored
-		// replies, per-user pauses, dedup) — hence dispatched up front.
-		if (type === "comment" || type === "reply") {
-			void sendSlackCommentNotification({
-				videoId: notification.videoId,
-				authorId: notification.authorId,
-				comment: notification.comment,
-				parentCommentId:
-					type === "reply" ? (notification.parentCommentId ?? null) : null,
-			});
-		}
-
 		if (type === "reply" && notification.parentCommentId) {
 			const [parentComment] = await db()
 				.select({ authorId: comments.authorId })
@@ -171,7 +156,6 @@ export async function createNotification(
 				videoId: notification.videoId,
 			});
 
-			revalidatePath("/dashboard");
 			return { success: true, notificationId };
 		}
 
@@ -247,8 +231,6 @@ export async function createNotification(
 			videoId: notification.videoId,
 		});
 
-		revalidatePath("/dashboard");
-
 		if (type === "comment") {
 			await sendNewCommentEmail({
 				videoId: notification.videoId,
@@ -287,7 +269,9 @@ async function sendNewCommentEmail(params: {
 			.where(
 				and(
 					eq(comments.videoId, Video.VideoId.make(params.videoId)),
-					eq(comments.type, "text"),
+					// Media comments email through the same path as text comments, so
+					// they must share the throttle window with them.
+					inArray(comments.type, ["text", "video", "audio"]),
 					or(
 						isNull(comments.parentCommentId),
 						eq(comments.parentCommentId, Comment.CommentId.make("")),
@@ -325,9 +309,7 @@ async function sendNewCommentEmail(params: {
 
 		const commenterName = commenter?.name || "Someone";
 
-		const videoUrl = buildEnv.NEXT_PUBLIC_IS_CAP
-			? `https://cap.link/${params.videoId}`
-			: `${serverEnv().WEB_URL}/s/${params.videoId}`;
+		const videoUrl = `${serverEnv().WEB_URL}/s/${params.videoId}`;
 
 		await sendEmail({
 			email: recipient.email,
@@ -414,7 +396,6 @@ export async function createAnonymousViewNotification({
 			videoId,
 			dedupKey,
 		});
-		revalidatePath("/dashboard");
 	} catch (error) {
 		if (isDuplicateEntryError(error)) return;
 		throw error;
@@ -483,9 +464,7 @@ export async function sendFirstViewEmail(
 			viewerName = viewer?.name || viewer?.email || "Someone";
 		}
 
-		const videoUrl = buildEnv.NEXT_PUBLIC_IS_CAP
-			? `https://cap.link/${params.videoId}`
-			: `${serverEnv().WEB_URL}/s/${params.videoId}`;
+		const videoUrl = `${serverEnv().WEB_URL}/s/${params.videoId}`;
 
 		const displayName = videoWithOwner.videoName || "Untitled Video";
 

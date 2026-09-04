@@ -8,9 +8,8 @@ import {
 	provideOptionalAuth,
 	Storage,
 	VideosPolicy,
-	VideosRepo,
 } from "@cap/web-backend";
-import { Policy, Video } from "@cap/web-domain";
+import { Video } from "@cap/web-domain";
 import { zValidator } from "@hono/zod-validator";
 import { and, eq } from "drizzle-orm";
 import { Effect, Option, Schedule } from "effect";
@@ -18,6 +17,10 @@ import { Hono, type MiddlewareHandler } from "hono";
 import { z } from "zod";
 import { withAuth } from "@/app/api/utils";
 import { invalidateGoogleDriveStorageQuotaCache } from "@/lib/google-drive-storage-quota";
+import {
+	queueVideoTranscription,
+	shouldQueueTranscriptionAfterMultipartComplete,
+} from "@/lib/queue-video-transcription";
 import { runPromise } from "@/lib/server";
 import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { stringOrNumberOptional } from "@/utils/zod";
@@ -87,13 +90,10 @@ app.post(
 		const videoId = Video.VideoId.make(videoIdRaw);
 
 		const resp = await Effect.gen(function* () {
-			const repo = yield* VideosRepo;
 			const policy = yield* VideosPolicy;
 			const db = yield* Database;
 
-			const video = yield* repo
-				.getById(videoId)
-				.pipe(Policy.withPolicy(policy.isOwner(videoId)));
+			const video = yield* policy.getOwnedById(videoId);
 			if (Option.isNone(video)) return yield* new Video.NotFoundError();
 
 			yield* db.use((db) =>
@@ -129,11 +129,8 @@ app.post(
 		try {
 			try {
 				const uploadId = await Effect.gen(function* () {
-					const repo = yield* VideosRepo;
 					const policy = yield* VideosPolicy;
-					const maybeVideo = yield* repo
-						.getById(videoId)
-						.pipe(Policy.withPolicy(policy.isOwner(videoId)));
+					const maybeVideo = yield* policy.getOwnedById(videoId);
 					if (Option.isNone(maybeVideo)) {
 						return yield* new Video.NotFoundError();
 					}
@@ -227,11 +224,8 @@ app.post(
 						"videoId" in body ? body.videoId : videoIdFromFileKey;
 					if (!videoIdRaw) throw new Error("Video id not found");
 					const videoId = Video.VideoId.make(videoIdRaw);
-					const repo = yield* VideosRepo;
 					const policy = yield* VideosPolicy;
-					const maybeVideo = yield* repo
-						.getById(videoId)
-						.pipe(Policy.withPolicy(policy.isOwner(videoId)));
+					const maybeVideo = yield* policy.getOwnedById(videoId);
 					if (Option.isNone(maybeVideo)) {
 						return yield* new Video.NotFoundError();
 					}
@@ -311,7 +305,6 @@ app.post(
 		const user = c.get("user");
 
 		return Effect.gen(function* () {
-			const repo = yield* VideosRepo;
 			const policy = yield* VideosPolicy;
 			const db = yield* Database;
 
@@ -323,9 +316,7 @@ app.post(
 			if (!videoIdRaw) return c.text("Video id not found", 400);
 			const videoId = Video.VideoId.make(videoIdRaw);
 
-			const maybeVideo = yield* repo
-				.getById(videoId)
-				.pipe(Policy.withPolicy(policy.isOwner(videoId)));
+			const maybeVideo = yield* policy.getOwnedById(videoId);
 			if (Option.isNone(maybeVideo)) {
 				c.status(404);
 				return c.text(`Video '${encodeURIComponent(videoId)}' not found`);
@@ -461,6 +452,7 @@ app.post(
 				});
 
 				return yield* Effect.gen(function* () {
+					let objectIdentity = result.ETag;
 					console.log(
 						`Multipart upload completed successfully: ${
 							result.Location || "no location"
@@ -527,6 +519,7 @@ app.post(
 
 						return c.json({
 							location: result.Location,
+							objectIdentity,
 							success: true,
 							fileKey,
 							processingStarted,
@@ -542,11 +535,16 @@ app.post(
 							.copyObject(`${bucket.bucketName}/${fileKey}`, fileKey, {
 								ContentType: "video/mp4",
 								MetadataDirective: "REPLACE",
+								...(result.ETag ? { CopySourceIfMatch: result.ETag } : {}),
 							})
 							.pipe(
-								Effect.tap((result) =>
-									Effect.log("Copy for metadata fix successful:", result),
-								),
+								Effect.tap((copyResult) => {
+									objectIdentity = copyResult.CopyObjectResult?.ETag;
+									return Effect.log(
+										"Copy for metadata fix successful:",
+										copyResult,
+									);
+								}),
 								Effect.catchAll((e) =>
 									Effect.logError(
 										"Warning: Failed to copy object to fix metadata:",
@@ -590,6 +588,7 @@ app.post(
 					);
 
 					const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
+					let mediaProcessingPending = false;
 					if (
 						bucket.provider === "s3" &&
 						video.source.type === "webMP4" &&
@@ -622,7 +621,7 @@ app.post(
 								{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
 							);
 
-						yield* Effect.tryPromise({
+						mediaProcessingPending = yield* Effect.tryPromise({
 							try: async () => {
 								const response = await fetch(
 									`${mediaServerUrl}/video/process`,
@@ -651,19 +650,48 @@ app.post(
 										`Media server remux failed: ${response.status} ${errorText}`,
 									);
 								}
+
+								return true;
 							},
 							catch: (cause) =>
 								cause instanceof Error ? cause : new Error(String(cause)),
 						}).pipe(
 							Effect.catchAll((error) => {
 								console.error("Failed to queue faststart remux:", error);
-								return Effect.succeed(null);
+								return Effect.succeed(false);
 							}),
+						);
+					}
+
+					if (
+						shouldQueueTranscriptionAfterMultipartComplete(
+							video.source.type,
+							mediaProcessingPending,
+						)
+					) {
+						yield* Effect.tryPromise(() =>
+							queueVideoTranscription(Video.VideoId.make(videoId)),
+						).pipe(
+							Effect.tap((result) =>
+								result.success
+									? Effect.succeed(undefined)
+									: Effect.logWarning(
+											"Failed to queue transcription after multipart upload",
+											{ videoId, message: result.message },
+										),
+							),
+							Effect.catchAll((error) =>
+								Effect.logWarning(
+									"Failed to queue transcription after multipart upload",
+									{ videoId, error },
+								),
+							),
 						);
 					}
 
 					return c.json({
 						location: result.Location,
+						objectIdentity,
 						success: true,
 						fileKey,
 					});
@@ -725,13 +753,10 @@ app.post("/abort", abortRequestValidator, (c) => {
 	const videoId = Video.VideoId.make(videoIdRaw);
 
 	return Effect.gen(function* () {
-		const repo = yield* VideosRepo;
 		const policy = yield* VideosPolicy;
 		const db = yield* Database;
 
-		const maybeVideo = yield* repo
-			.getById(videoId)
-			.pipe(Policy.withPolicy(policy.isOwner(videoId)));
+		const maybeVideo = yield* policy.getOwnedById(videoId);
 		if (Option.isNone(maybeVideo)) {
 			c.status(404);
 			return c.text(`Video '${encodeURIComponent(videoId)}' not found`);

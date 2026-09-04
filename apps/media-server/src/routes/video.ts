@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import { file } from "bun";
 import { Hono } from "hono";
 import { z } from "zod";
 import { validateMediaServerSecret } from "../lib/auth";
-import type { VideoMetadata } from "../lib/job-manager";
+import type { RecordingErrorCode, VideoMetadata } from "../lib/job-manager";
 import {
+	beginRecordingProcessing,
+	beginRecordingVerification,
 	canAcceptNewVideoProcess,
 	createJob,
 	deleteJob,
@@ -15,10 +18,12 @@ import {
 	getJobProgress,
 	getMaxConcurrentVideoProcesses,
 	getSystemResources,
+	hasCriticalMemoryPressure,
 	sendWebhook,
 	touchJob,
 	updateJob,
 } from "../lib/job-manager";
+import { PROCESS_TIMEOUT_MS } from "../lib/media-common";
 import { renderEditedVideo } from "../lib/media-edit";
 import {
 	canAcceptNewProbeOperation as canAcceptNewProbeProcess,
@@ -42,6 +47,14 @@ import {
 	uploadFileToStorage,
 	uploadToS3,
 } from "../lib/media-video";
+import {
+	hashRecordingFile,
+	inspectRecordingSources,
+	isRetryableRecordingVerificationError,
+	verifyRecording,
+	verifyRemoteRecording,
+	verifyRemoteRecordingBytes,
+} from "../lib/recording-verification";
 import type { TempFileHandle } from "../lib/temp-files";
 import { cleanupStaleTempFiles } from "../lib/temp-files";
 import {
@@ -53,9 +66,17 @@ import {
 
 const video = new Hono();
 const PROCESSING_HEARTBEAT_MS = 60 * 1000;
+const SEGMENTED_RECORDING_TIMEOUT_MS = 3 * PROCESS_TIMEOUT_MS + 35 * 60 * 1000;
+const POST_VERIFICATION_ASSET_BUDGET_MS = 5 * 60 * 1000;
+const RECORDING_VERIFICATION_RETRY_ERROR =
+	"Recording verification temporarily unavailable (503)";
 const MEDIA_ENGINE_ERROR_CODE = ["FF", "MPEG_ERROR"].join("");
 const PROBE_ERROR_CODE = ["FF", "PROBE_ERROR"].join("");
 const VIDEO_BUSY_RETRY_AFTER_SECONDS = 15;
+const VIDEO_MEMORY_PRESSURE_ERROR =
+	"SERVER_BUSY: container memory pressure is too high";
+const SEGMENT_DOWNLOAD_MAX_ATTEMPTS = 3;
+const SEGMENT_DOWNLOAD_RETRY_BASE_MS = 250;
 
 const probeSchema = z.object({
 	videoUrl: z.string().url(),
@@ -84,11 +105,13 @@ const processSchema = z.object({
 	webhookUrl: z.string().url().optional(),
 	webhookSecret: z.string().optional(),
 	inputExtension: z.string().optional(),
+	priority: z.enum(["normal", "bulk"]).optional(),
 	maxWidth: z.number().max(4096).optional(),
 	maxHeight: z.number().max(4096).optional(),
 	crf: z.number().min(0).max(51).optional(),
 	preset: z.enum(["ultrafast", "fast", "medium", "slow"]).optional(),
 	remuxOnly: z.boolean().optional(),
+	normalizeH264Level: z.boolean().optional(),
 });
 
 const editRangeSchema = z
@@ -205,7 +228,11 @@ function summarizeVideoInput(videoUrl: string, inputExtension?: string) {
 }
 
 function isBusyError(err: unknown): boolean {
-	return err instanceof Error && err.message.includes("Server is busy");
+	return (
+		err instanceof Error &&
+		(err.message.includes("Server is busy") ||
+			err.message.includes("SERVER_BUSY"))
+	);
 }
 
 function isTimeoutError(err: unknown): boolean {
@@ -295,6 +322,34 @@ async function withJobHeartbeat<T>(
 
 	try {
 		return await operation();
+	} finally {
+		clearInterval(interval);
+	}
+}
+
+async function withMuxMemoryGuard<T>(
+	abortController: AbortController,
+	operation: () => Promise<T>,
+): Promise<T> {
+	let memoryPressureExceeded = false;
+	const interval = setInterval(() => {
+		if (!hasCriticalMemoryPressure()) return;
+		memoryPressureExceeded = true;
+		abortController.abort();
+	}, 1000);
+	interval.unref?.();
+
+	try {
+		const result = await operation();
+		if (memoryPressureExceeded) {
+			throw new Error(VIDEO_MEMORY_PRESSURE_ERROR);
+		}
+		return result;
+	} catch (error) {
+		if (memoryPressureExceeded) {
+			throw new Error(VIDEO_MEMORY_PRESSURE_ERROR);
+		}
+		throw error;
 	} finally {
 		clearInterval(interval);
 	}
@@ -614,9 +669,14 @@ video.post("/process", async (c) => {
 		);
 	}
 
-	if (!canAcceptNewVideoProcess()) {
+	const capacity = getVideoCapacitySnapshot();
+	const bulkCapacityReached =
+		result.data.priority === "bulk" &&
+		capacity.effectiveMaxVideoProcesses > 1 &&
+		capacity.activeVideoProcesses >= capacity.effectiveMaxVideoProcesses - 1;
+	if (bulkCapacityReached || !canAcceptNewVideoProcess()) {
 		c.header("Retry-After", VIDEO_BUSY_RETRY_AFTER_SECONDS.toString());
-		return c.json(getBusyResponseBody(getVideoCapacitySnapshot()), 503);
+		return c.json(getBusyResponseBody(capacity), 503);
 	}
 
 	const {
@@ -839,6 +899,7 @@ async function processWithResilientRetry(
 		crf: options.crf,
 		preset: options.preset,
 		remuxOnly: options.remuxOnly,
+		normalizeH264Level: options.normalizeH264Level,
 	};
 
 	const onProgress = (progress: number, message: string) => {
@@ -1049,10 +1110,8 @@ async function editVideoAsync(
 			await sendWebhook(downloadingJob);
 		}
 
-		const inputTempFile = await downloadVideoToTemp(
-			sourceUrl,
-			".mp4",
-			abortController.signal,
+		const inputTempFile = await withJobHeartbeat(jobId, () =>
+			downloadVideoToTemp(sourceUrl, ".mp4", abortController.signal),
 		);
 		updateJob(jobId, { inputTempFile });
 
@@ -1215,10 +1274,12 @@ async function processVideoAsync(
 		});
 		await sendWebhook(job);
 
-		const inputTempFile = await downloadVideoToTemp(
-			videoUrl,
-			options.inputExtension,
-			abortController.signal,
+		const inputTempFile = await withJobHeartbeat(jobId, () =>
+			downloadVideoToTemp(
+				videoUrl,
+				options.inputExtension,
+				abortController.signal,
+			),
 		);
 		updateJob(jobId, { inputTempFile });
 
@@ -1496,10 +1557,13 @@ const muxSegmentsOutputUploadSchema = z.discriminatedUnion("type", [
 	z.object({
 		type: z.literal("put"),
 		url: z.string().url(),
+		ifNoneMatch: z.literal("*").optional(),
 	}),
 	z.object({
 		type: z.literal("multipart"),
 		videoId: z.string(),
+		generation: z.string().min(1).max(200).optional(),
+		attemptId: z.string().min(1).max(200).optional(),
 		key: z.string().min(1),
 		uploadId: z.string().min(1),
 		partSize: z
@@ -1513,8 +1577,278 @@ const muxSegmentsOutputUploadSchema = z.discriminatedUnion("type", [
 	}),
 ]);
 
+const strongObjectIdentitySchema = z
+	.string()
+	.max(1_024)
+	.regex(/^"[\x21\x23-\x7E\x80-\xFF]+"$/);
+const recordingAttemptFields = {
+	generation: z.string().min(1).max(200).optional(),
+	attemptId: z.string().min(1).max(200).optional(),
+	outputKey: z.string().min(1).max(1_024).optional(),
+	inventorySha256: z
+		.string()
+		.regex(/^[a-f0-9]{64}$/)
+		.optional(),
+};
+
+const recordingVerificationSchema = z
+	.object({
+		...recordingAttemptFields,
+		videoId: z.string(),
+		userId: z.string(),
+		videoUrl: z.string().url(),
+		fileSize: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+		duration: z.number().finite().positive().optional(),
+		requiredAudio: z.boolean(),
+		objectIdentity: strongObjectIdentitySchema,
+		originalObjectIdentity: strongObjectIdentitySchema.optional(),
+		sourceObjectIdentity: strongObjectIdentitySchema.optional(),
+		webhookUrl: z.string().url(),
+		webhookSecret: z.string().optional(),
+	})
+	.refine(
+		(body) => {
+			const fenced = Boolean(
+				body.generation ||
+					body.attemptId ||
+					body.outputKey ||
+					body.inventorySha256 ||
+					body.originalObjectIdentity ||
+					body.sourceObjectIdentity,
+			);
+			return fenced
+				? Boolean(
+						body.generation &&
+							body.attemptId &&
+							body.outputKey &&
+							body.inventorySha256 &&
+							body.originalObjectIdentity &&
+							body.sourceObjectIdentity,
+					)
+				: body.duration !== undefined;
+		},
+		{ message: "Complete recording attempt context is required" },
+	);
+
+function recordingJobId(
+	kind: string,
+	body: {
+		userId: string;
+		videoId: string;
+		generation?: string;
+		attemptId?: string;
+	},
+): string {
+	return body.generation && body.attemptId
+		? `job_recording_${createHash("sha256")
+				.update(
+					JSON.stringify([
+						kind,
+						body.userId,
+						body.videoId,
+						body.generation,
+						body.attemptId,
+					]),
+				)
+				.digest("hex")}`
+		: generateJobId();
+}
+
+function recordingRequestKey(values: unknown[]): string {
+	return createHash("sha256").update(JSON.stringify(values)).digest("hex");
+}
+
+function classifySourceError(error: unknown): RecordingErrorCode {
+	if (
+		isRetryableRecordingVerificationError(error) ||
+		isBusyError(error) ||
+		isTimeoutError(error)
+	)
+		return "processing-unavailable";
+	if (!(error instanceof Error)) return "processing-unavailable";
+	if (
+		/Cannot allocate memory|Resource temporarily unavailable|No space left|Unknown encoder|Unknown decoder|Permission denied|Function not implemented|Option not found/i.test(
+			error.message,
+		)
+	)
+		return "processing-unavailable";
+	if (/object changed|HTTP error 412|Server returned 412/.test(error.message))
+		return "source-changed";
+	if (/HTTP error 404|Server returned 404/.test(error.message))
+		return "source-missing";
+	if (
+		/Decoded recording|Invalid decoded recording|Recording has no decoded|Recording video packets are missing|Recording timing has no video track|does not match the completed local file|Verified recording size/.test(
+			error.message,
+		)
+	)
+		return "source-invalid";
+	if (
+		error.message.includes("Recording full decode failed") &&
+		/invalid|corrupt|error while decoding|moov atom not found|Cannot determine format.*EOF|partial file/i.test(
+			error.message,
+		)
+	)
+		return "source-invalid";
+	return "processing-unavailable";
+}
+
+video.post("/verify-recording", async (c) => {
+	if (!validateMediaServerSecret(c))
+		return c.json({ error: "Unauthorized" }, 401);
+	const parsed = recordingVerificationSchema.safeParse(await c.req.json());
+	if (!parsed.success)
+		return c.json({ error: "Invalid verification request" }, 400);
+	const body = parsed.data;
+	const jobId = recordingJobId("mp4", body);
+	const requestKey = recordingRequestKey([
+		body.fileSize,
+		body.duration,
+		body.requiredAudio,
+		body.originalObjectIdentity,
+		body.sourceObjectIdentity,
+		body.outputKey,
+		body.inventorySha256,
+	]);
+	const existing = getJob(jobId);
+	if (existing) {
+		if (existing.recordingRequestKey !== requestKey)
+			return c.json({ error: "Recording attempt context changed" }, 409);
+		return c.json({ jobId });
+	}
+	if (!canAcceptNewVideoProcess()) {
+		c.header("Retry-After", VIDEO_BUSY_RETRY_AFTER_SECONDS.toString());
+		return c.json(getMuxBusyResponseBody(getVideoCapacitySnapshot()), 503);
+	}
+	createJob(
+		jobId,
+		body.videoId,
+		body.userId,
+		body.webhookUrl,
+		body.webhookSecret,
+	);
+	updateJob(jobId, {
+		generation: body.generation,
+		attemptId: body.attemptId,
+		inventorySha256: body.inventorySha256,
+		recordingRequestKey: requestKey,
+	});
+	void verifyUploadedRecordingAsync(jobId, body);
+	return c.json({ jobId });
+});
+
+async function verifyUploadedRecordingAsync(
+	jobId: string,
+	body: z.infer<typeof recordingVerificationSchema>,
+) {
+	const abortController = new AbortController();
+	updateJob(jobId, { abortController, phase: "processing", progress: 0 });
+	try {
+		const metadata = await probeVideo(body.videoUrl).catch(() => {
+			throw new Error(RECORDING_VERIFICATION_RETRY_ERROR);
+		});
+		if (
+			metadata.fileSize !== body.fileSize ||
+			(body.duration !== undefined &&
+				!isDurationClose(metadata.duration, body.duration)) ||
+			(body.requiredAudio && !metadata.audioCodec)
+		) {
+			throw new Error(
+				"Uploaded recording does not match the completed local file",
+			);
+		}
+		if (
+			!beginRecordingVerification(
+				jobId,
+				PROCESS_TIMEOUT_MS + POST_VERIFICATION_ASSET_BUDGET_MS,
+			)
+		)
+			throw new Error("Recording verification job is no longer active");
+		const verified = await withJobHeartbeat(jobId, () =>
+			withMuxMemoryGuard(abortController, () =>
+				verifyRemoteRecording(body.videoUrl, {
+					expectedDuration: body.duration,
+					allowObservedDuration: body.duration === undefined,
+					requireAudio: body.requiredAudio,
+					expectedObjectIdentity:
+						body.sourceObjectIdentity ?? body.objectIdentity,
+					expectedFileSize: body.fileSize,
+					hashContent: Boolean(body.generation),
+					abortSignal: abortController.signal,
+				}),
+			),
+		);
+		if (verified.fileSize !== body.fileSize)
+			throw new Error("Verified recording size does not match the local file");
+		if (body.generation && !verified.remoteSha256)
+			throw new Error("Recording byte identity is missing");
+		updateJob(jobId, {
+			phase: "complete",
+			progress: 100,
+			metadata: {
+				...metadata,
+				duration: verified.video.duration,
+				audioCodec: verified.audio ? (metadata.audioCodec ?? "unknown") : null,
+				fileSize: verified.fileSize,
+			},
+			recordingVerification: {
+				request: {
+					version: 1,
+					artifact: {
+						kind: "mp4",
+						fileSize: body.fileSize,
+						duration: body.duration ?? verified.video.duration,
+						objectIdentity: body.originalObjectIdentity ?? body.objectIdentity,
+					},
+					requiredAudio: body.requiredAudio,
+				},
+				fullDecode: true,
+				objectIdentity: verified.objectIdentity,
+				...(body.outputKey
+					? { outputKey: body.outputKey, outputSha256: verified.remoteSha256 }
+					: {}),
+			},
+		});
+	} catch (error) {
+		const retryable =
+			isRetryableRecordingVerificationError(error) ||
+			(error instanceof Error &&
+				(error.message === VIDEO_MEMORY_PRESSURE_ERROR ||
+					error.message === RECORDING_VERIFICATION_RETRY_ERROR));
+		updateJob(jobId, {
+			phase:
+				!retryable && abortController.signal.aborted ? "cancelled" : "error",
+			error: retryable
+				? RECORDING_VERIFICATION_RETRY_ERROR
+				: "Uploaded recording content could not be verified; retain the local recording",
+			errorCode: retryable
+				? "processing-unavailable"
+				: classifySourceError(error),
+		});
+	}
+	const job = getJob(jobId);
+	if (job) await sendWebhook(job);
+}
+
 const muxSegmentsSchema = z
 	.object({
+		...recordingAttemptFields,
+		requiredAudio: z.boolean().optional(),
+		sourceObjects: z
+			.array(
+				z.object({
+					url: z.string().url(),
+					objectIdentity: strongObjectIdentitySchema,
+					size: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+				}),
+			)
+			.max(100_002)
+			.optional(),
+		manifestSha256: z
+			.string()
+			.regex(/^[a-f0-9]{64}$/)
+			.optional(),
+		expectedDuration: z.number().finite().positive().optional(),
+		outputVerificationUrl: z.string().url().optional(),
 		videoId: z.string(),
 		userId: z.string(),
 		outputPresignedUrl: z.string().url().optional(),
@@ -1531,7 +1865,94 @@ const muxSegmentsSchema = z
 	.refine((body) => body.outputPresignedUrl || body.outputUpload, {
 		message: "outputPresignedUrl or outputUpload is required",
 		path: ["outputUpload"],
+	})
+	.superRefine((body, ctx) => {
+		const fenced = Boolean(
+			body.generation ||
+				body.attemptId ||
+				body.outputKey ||
+				body.inventorySha256 ||
+				body.sourceObjects,
+		);
+		if (
+			fenced &&
+			!(
+				body.generation &&
+				body.attemptId &&
+				body.outputKey &&
+				body.inventorySha256 &&
+				body.sourceObjects &&
+				body.manifestSha256 &&
+				body.outputVerificationUrl
+			)
+		) {
+			ctx.addIssue({
+				code: "custom",
+				message: "Complete recording attempt context is required",
+			});
+		}
+		if (
+			Boolean(body.audioInitUrl) !== Boolean(body.audioSegmentUrls?.length) ||
+			(body.requiredAudio && !body.audioSegmentUrls?.length)
+		) {
+			ctx.addIssue({
+				code: "custom",
+				message: "Required audio sources are incomplete",
+			});
+		}
+		if (body.sourceObjects) {
+			const urls = [
+				body.videoInitUrl,
+				...body.videoSegmentUrls,
+				...(body.audioInitUrl
+					? [body.audioInitUrl, ...(body.audioSegmentUrls ?? [])]
+					: []),
+			];
+			const indexed = new Map(
+				body.sourceObjects.map((source) => [source.url, source]),
+			);
+			if (
+				indexed.size !== body.sourceObjects.length ||
+				new Set(urls).size !== urls.length ||
+				indexed.size !== urls.length ||
+				urls.some((url) => !indexed.has(url))
+			) {
+				ctx.addIssue({
+					code: "custom",
+					message:
+						"Recording source inventory does not exactly cover its inputs",
+				});
+			}
+		}
+		if (
+			fenced &&
+			(body.outputUpload?.type === "put"
+				? body.outputUpload.ifNoneMatch !== "*"
+				: body.outputUpload?.type !== "multipart" ||
+					body.outputUpload.key !== body.outputKey ||
+					body.outputUpload.videoId !== body.videoId ||
+					body.outputUpload.generation !== body.generation ||
+					body.outputUpload.attemptId !== body.attemptId)
+		) {
+			ctx.addIssue({
+				code: "custom",
+				message: "Recording candidate must use an immutable upload target",
+			});
+		}
 	});
+
+type MuxSourceObject = NonNullable<
+	z.infer<typeof muxSegmentsSchema>["sourceObjects"]
+>[number];
+type MuxContext = Pick<
+	z.infer<typeof muxSegmentsSchema>,
+	| "generation"
+	| "attemptId"
+	| "outputKey"
+	| "inventorySha256"
+	| "sourceObjects"
+	| "requiredAudio"
+>;
 
 function getMuxSegmentsOutputUpload(
 	body: z.infer<typeof muxSegmentsSchema>,
@@ -1564,7 +1985,19 @@ video.post("/mux-segments", async (c) => {
 		webhookUrl,
 		webhookSecret,
 	} = body.data;
-	const jobId = generateJobId();
+	const jobId = recordingJobId("segments", body.data);
+	const requestKey = recordingRequestKey([
+		body.data.manifestSha256,
+		body.data.inventorySha256,
+		body.data.outputKey,
+		body.data.requiredAudio,
+	]);
+	const existing = getJob(jobId);
+	if (existing) {
+		if (existing.recordingRequestKey !== requestKey)
+			return c.json({ error: "Recording attempt context changed" }, 409);
+		return c.json({ jobId, status: "queued", videoId });
+	}
 
 	if (!canAcceptNewVideoProcess()) {
 		c.header("Retry-After", VIDEO_BUSY_RETRY_AFTER_SECONDS.toString());
@@ -1580,6 +2013,13 @@ video.post("/mux-segments", async (c) => {
 		audioSegmentUrls: audioSegUrls,
 	} = body.data;
 	const outputUpload = getMuxSegmentsOutputUpload(body.data);
+	updateJob(jobId, {
+		manifestSha256: body.data.manifestSha256,
+		generation: body.data.generation,
+		attemptId: body.data.attemptId,
+		inventorySha256: body.data.inventorySha256,
+		recordingRequestKey: requestKey,
+	});
 
 	muxSegmentsAsync(
 		jobId,
@@ -1591,6 +2031,8 @@ video.post("/mux-segments", async (c) => {
 		videoSegUrls,
 		audioInitUrl ?? null,
 		audioSegUrls ?? null,
+		body.data.outputVerificationUrl,
+		body.data,
 	).catch((err) => {
 		console.error(`[mux-segments] Async mux error for job ${jobId}:`, err);
 		const currentJob = getJob(jobId);
@@ -1617,16 +2059,35 @@ video.post("/mux-segments", async (c) => {
 async function streamConcatFiles(
 	inputPaths: string[],
 	outputPath: string,
+	abortSignal?: AbortSignal,
 ): Promise<void> {
-	const { open, readFile } = await import("node:fs/promises");
-	const handle = await open(outputPath, "w");
+	const writer = file(outputPath).writer();
+	let lastMemoryCheckAt = 0;
 	try {
 		for (const filePath of inputPaths) {
-			const data = await readFile(filePath);
-			await handle.write(data);
+			const reader = file(filePath).stream().getReader();
+			try {
+				while (true) {
+					abortSignal?.throwIfAborted();
+					const { done, value } = await reader.read();
+					if (done) break;
+					await writer.write(value);
+					await writer.flush();
+					const now = Date.now();
+					if (now - lastMemoryCheckAt >= 1000) {
+						lastMemoryCheckAt = now;
+						if (hasCriticalMemoryPressure()) {
+							throw new Error(VIDEO_MEMORY_PRESSURE_ERROR);
+						}
+					}
+				}
+			} finally {
+				await reader.cancel().catch(() => {});
+				reader.releaseLock();
+			}
 		}
 	} finally {
-		await handle.close();
+		await writer.end();
 	}
 }
 
@@ -1639,16 +2100,166 @@ function redactPresignedUrl(url: string): string {
 	}
 }
 
-async function downloadUrlToFile(url: string, destPath: string): Promise<void> {
-	const resp = await fetch(url, { signal: AbortSignal.timeout(120_000) });
+class MediaDownloadError extends Error {
+	constructor(
+		message: string,
+		readonly retryable: boolean,
+		readonly errorCode: RecordingErrorCode = "processing-unavailable",
+	) {
+		super(message);
+	}
+}
+
+function isRetryableDownloadStatus(status: number): boolean {
+	return (
+		status === 408 ||
+		status === 425 ||
+		status === 429 ||
+		status === 500 ||
+		status === 502 ||
+		status === 503 ||
+		status === 504
+	);
+}
+
+async function downloadUrlToFileOnce(
+	url: string,
+	destPath: string,
+	abortSignal?: AbortSignal,
+	source?: MuxSourceObject,
+): Promise<void> {
+	const abortController = new AbortController();
+	const timeoutSignal = AbortSignal.timeout(120_000);
+	const resp = await fetch(url, {
+		headers: source
+			? {
+					"If-Match": source.objectIdentity,
+					"X-Cap-Recording-Verification": "1",
+				}
+			: undefined,
+		signal: abortSignal
+			? AbortSignal.any([abortController.signal, abortSignal, timeoutSignal])
+			: AbortSignal.any([abortController.signal, timeoutSignal]),
+	});
 	if (!resp.ok) {
-		throw new Error(
+		await resp.body?.cancel().catch(() => {});
+		throw new MediaDownloadError(
 			`Download failed (${resp.status}): ${redactPresignedUrl(url)}`,
+			isRetryableDownloadStatus(resp.status) ||
+				(Boolean(source) && resp.status === 404),
+			source && resp.status === 412
+				? "source-changed"
+				: source && resp.status === 404
+					? "source-missing"
+					: "processing-unavailable",
 		);
 	}
-	const data = Buffer.from(await resp.arrayBuffer());
-	const { writeFile } = await import("node:fs/promises");
-	await writeFile(destPath, data);
+	if (
+		source &&
+		(resp.status !== 200 ||
+			resp.headers.get("etag") !== source.objectIdentity ||
+			(resp.headers.has("content-length") &&
+				Number(resp.headers.get("content-length")) !== source.size))
+	) {
+		await resp.body?.cancel().catch(() => {});
+		throw new MediaDownloadError(
+			"Recording source object changed while downloading",
+			false,
+			"source-changed",
+		);
+	}
+	if (!resp.body) {
+		throw new MediaDownloadError(
+			`Download returned no body: ${redactPresignedUrl(url)}`,
+			true,
+		);
+	}
+
+	const reader = resp.body.getReader();
+	const writer = file(destPath).writer();
+	let lastMemoryCheckAt = 0;
+	let failure: unknown;
+	let bytesRead = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			bytesRead += value.byteLength;
+			if (source && bytesRead > source.size)
+				throw new MediaDownloadError(
+					"Recording source size changed while downloading",
+					false,
+					"source-changed",
+				);
+			await writer.write(value);
+			await writer.flush();
+			const now = Date.now();
+			if (now - lastMemoryCheckAt >= 1000) {
+				lastMemoryCheckAt = now;
+				if (hasCriticalMemoryPressure()) {
+					throw new Error(VIDEO_MEMORY_PRESSURE_ERROR);
+				}
+			}
+		}
+		if (source && bytesRead !== source.size)
+			throw new MediaDownloadError(
+				"Recording source size changed while downloading",
+				false,
+				"source-changed",
+			);
+	} catch (error) {
+		failure = error;
+		abortController.abort();
+		await reader.cancel().catch(() => {});
+	} finally {
+		reader.releaseLock();
+		try {
+			await writer.end();
+		} catch (error) {
+			failure ??= error;
+		}
+	}
+
+	if (failure !== undefined) {
+		const { rm } = await import("node:fs/promises");
+		await rm(destPath, { force: true }).catch(() => {});
+		throw failure instanceof Error
+			? failure
+			: new Error("Download failed while streaming response body");
+	}
+}
+
+async function downloadUrlToFile(
+	url: string,
+	destPath: string,
+	abortSignal?: AbortSignal,
+	source?: MuxSourceObject,
+): Promise<void> {
+	let lastError: Error | undefined;
+
+	for (let attempt = 0; attempt < SEGMENT_DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+		abortSignal?.throwIfAborted();
+		try {
+			await downloadUrlToFileOnce(url, destPath, abortSignal, source);
+			return;
+		} catch (error) {
+			if (abortSignal?.aborted) throw error;
+			if (isBusyError(error)) throw error;
+
+			const downloadError =
+				error instanceof Error ? error : new Error(String(error));
+			if (error instanceof MediaDownloadError && !error.retryable) {
+				throw downloadError;
+			}
+			lastError = downloadError;
+		}
+
+		if (attempt < SEGMENT_DOWNLOAD_MAX_ATTEMPTS - 1) {
+			await Bun.sleep(SEGMENT_DOWNLOAD_RETRY_BASE_MS * 2 ** attempt);
+		}
+	}
+
+	throw lastError ?? new Error("Download failed");
 }
 
 async function downloadSegmentsBatchTracked(
@@ -1657,30 +2268,51 @@ async function downloadSegmentsBatchTracked(
 	jobId: string,
 	progressBase: number,
 	progressRange: number,
-): Promise<number> {
+	abortSignal?: AbortSignal,
+	sources?: Map<string, MuxSourceObject>,
+): Promise<string[]> {
 	const { join } = await import("node:path");
 	let completed = 0;
-	let failed = 0;
+	let fatalError: Error | undefined;
 	const total = urls.length;
+	const indexWidth = Math.max(3, String(total).length);
+	const outputPaths = new Array<string>(total);
 	const pending = [...urls.entries()];
+	let pendingIndex = 0;
+	const batchAbortController = new AbortController();
+	const batchSignal = abortSignal
+		? AbortSignal.any([abortSignal, batchAbortController.signal])
+		: batchAbortController.signal;
 	const CONCURRENCY = 10;
 
 	async function worker() {
-		while (pending.length > 0) {
-			const entry = pending.shift();
+		while (pendingIndex < pending.length && !fatalError) {
+			const entry = pending[pendingIndex++];
 			if (!entry) break;
 			const [i, url] = entry;
 			try {
+				const outputPath = join(
+					dir,
+					`segment_${String(i + 1).padStart(indexWidth, "0")}.m4s`,
+				);
+				outputPaths[i] = outputPath;
 				await downloadUrlToFile(
 					url,
-					join(dir, `segment_${String(i + 1).padStart(3, "0")}.m4s`),
+					outputPath,
+					batchSignal,
+					sources?.get(url),
 				);
 			} catch (err) {
-				failed++;
-				console.error(
-					`[mux-segments] Failed to download segment ${i + 1}/${total}:`,
-					err instanceof Error ? err.message : err,
-				);
+				if (!fatalError) {
+					fatalError = err instanceof Error ? err : new Error(String(err));
+					pendingIndex = pending.length;
+					batchAbortController.abort();
+					console.error(
+						`[mux-segments] Failed to download segment ${i + 1}/${total}:`,
+						err instanceof Error ? err.message : err,
+					);
+				}
+				break;
 			}
 			completed++;
 			if (total > 0) {
@@ -1696,7 +2328,8 @@ async function downloadSegmentsBatchTracked(
 	await Promise.all(
 		Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker()),
 	);
-	return failed;
+	if (fatalError) throw fatalError;
+	return outputPaths;
 }
 
 function sendCurrentJobWebhook(jobId: string): void {
@@ -1718,9 +2351,11 @@ async function muxSegmentsAsync(
 	videoSegmentUrls: string[],
 	audioInitUrl: string | null,
 	audioSegmentUrls: string[] | null,
+	outputVerificationUrl?: string,
+	context: MuxContext = {},
 ): Promise<void> {
 	const { ensureTempDir } = await import("../lib/temp-files");
-	const { mkdir, readdir } = await import("node:fs/promises");
+	const { lstat, mkdir, rm } = await import("node:fs/promises");
 	const { join } = await import("node:path");
 
 	const workDir = join(
@@ -1731,8 +2366,28 @@ async function muxSegmentsAsync(
 	const abortController = new AbortController();
 	updateJob(jobId, { abortController });
 	let outputUploadStarted = false;
+	let processingTimeout: ReturnType<typeof setTimeout> | undefined;
+	let errorCode: RecordingErrorCode = "processing-unavailable";
+	const sources = context.sourceObjects
+		? new Map(context.sourceObjects.map((source) => [source.url, source]))
+		: undefined;
+	const startedAt = Date.now();
 
 	try {
+		if (!beginRecordingProcessing(jobId, SEGMENTED_RECORDING_TIMEOUT_MS))
+			throw new Error("Recording processing job is no longer active");
+		processingTimeout = setTimeout(() => {
+			errorCode = "processing-unavailable";
+			abortController.abort(new Error("Recording processing timed out"));
+		}, SEGMENTED_RECORDING_TIMEOUT_MS);
+		processingTimeout.unref?.();
+		logVideoEvent("video_mux_started", {
+			jobId,
+			videoId,
+			videoSegmentCount: videoSegmentUrls.length,
+			audioSegmentCount: audioSegmentUrls?.length ?? 0,
+			...getVideoCapacitySnapshot(),
+		});
 		await ensureTempDir();
 		updateJob(jobId, { phase: "downloading", progress: 0 });
 		sendCurrentJobWebhook(jobId);
@@ -1743,58 +2398,48 @@ async function muxSegmentsAsync(
 		await mkdir(videoDir, { recursive: true });
 		await mkdir(audioDir, { recursive: true });
 
-		await downloadUrlToFile(videoInitUrl, join(videoDir, "init.mp4"));
+		await downloadUrlToFile(
+			videoInitUrl,
+			join(videoDir, "init.mp4"),
+			abortController.signal,
+			sources?.get(videoInitUrl),
+		);
 		updateJob(jobId, { phase: "downloading", progress: 5 });
 		sendCurrentJobWebhook(jobId);
 
-		const videoFailed = await downloadSegmentsBatchTracked(
+		const videoSegmentFiles = await downloadSegmentsBatchTracked(
 			videoSegmentUrls,
 			videoDir,
 			jobId,
 			5,
 			45,
+			abortController.signal,
+			sources,
 		);
 
-		if (videoFailed > 0) {
-			const failRatio = videoFailed / videoSegmentUrls.length;
-			if (failRatio >= 0.5) {
-				throw new Error(
-					`Too many video segments failed: ${videoFailed}/${videoSegmentUrls.length} (${Math.round(failRatio * 100)}%)`,
-				);
-			}
-			console.warn(
-				`[mux-segments] ${videoFailed}/${videoSegmentUrls.length} video segments failed to download for ${videoId}`,
-			);
-		}
-
-		let audioInput =
+		const audioInput =
 			audioInitUrl !== null &&
 			audioSegmentUrls !== null &&
 			audioSegmentUrls.length > 0
 				? { initUrl: audioInitUrl, segmentUrls: audioSegmentUrls }
 				: null;
+		let audioSegmentFiles: string[] = [];
 		if (audioInput) {
-			await downloadUrlToFile(audioInput.initUrl, join(audioDir, "init.mp4"));
-			const audioFailed = await downloadSegmentsBatchTracked(
+			await downloadUrlToFile(
+				audioInput.initUrl,
+				join(audioDir, "init.mp4"),
+				abortController.signal,
+				sources?.get(audioInput.initUrl),
+			);
+			audioSegmentFiles = await downloadSegmentsBatchTracked(
 				audioInput.segmentUrls,
 				audioDir,
 				jobId,
 				50,
 				10,
+				abortController.signal,
+				sources,
 			);
-			if (audioFailed > 0) {
-				const audioFailRatio = audioFailed / audioInput.segmentUrls.length;
-				if (audioFailRatio >= 0.5) {
-					console.warn(
-						`[mux-segments] ${audioFailed}/${audioInput.segmentUrls.length} audio segments failed for ${videoId} (${Math.round(audioFailRatio * 100)}%), proceeding without audio`,
-					);
-					audioInput = null;
-				} else {
-					console.warn(
-						`[mux-segments] ${audioFailed}/${audioInput.segmentUrls.length} audio segments failed to download for ${videoId}`,
-					);
-				}
-			}
 		}
 
 		updateJob(jobId, { phase: "processing", progress: 60 });
@@ -1802,67 +2447,197 @@ async function muxSegmentsAsync(
 
 		const combinedVideoPath = join(workDir, "combined_video.mp4");
 		const videoInitPath = join(videoDir, "init.mp4");
-		const videoSegmentFiles = (await readdir(videoDir))
-			.filter((f) => f.endsWith(".m4s"))
-			.sort()
-			.map((f) => join(videoDir, f));
 
 		await streamConcatFiles(
 			[videoInitPath, ...videoSegmentFiles],
 			combinedVideoPath,
-		);
-
-		const videoOnlyPath = join(workDir, "video_only.mp4");
-		await muxMediaTracksToMp4(
-			combinedVideoPath,
-			null,
-			videoOnlyPath,
 			abortController.signal,
 		);
+		await rm(videoDir, { recursive: true, force: true });
 
-		let resultPath: string;
+		let combinedAudioPath: string | null = null;
 
 		if (audioInput) {
-			const combinedAudioPath = join(workDir, "combined_audio.mp4");
+			combinedAudioPath = join(workDir, "combined_audio.mp4");
 			const audioInitPath = join(audioDir, "init.mp4");
-			const audioSegmentFiles = (await readdir(audioDir))
-				.filter((f) => f.endsWith(".m4s"))
-				.sort()
-				.map((f) => join(audioDir, f));
 
 			await streamConcatFiles(
 				[audioInitPath, ...audioSegmentFiles],
 				combinedAudioPath,
+				abortController.signal,
 			);
+			await rm(audioDir, { recursive: true, force: true });
+		}
 
-			resultPath = join(workDir, "result.mp4");
-			await muxMediaTracksToMp4(
-				videoOnlyPath,
-				combinedAudioPath,
-				resultPath,
-				abortController.signal,
-			);
-		} else {
-			resultPath = join(workDir, "result.mp4");
-			await muxMediaTracksToMp4(
-				videoOnlyPath,
-				null,
-				resultPath,
-				abortController.signal,
+		if (hasCriticalMemoryPressure()) {
+			throw new Error(VIDEO_MEMORY_PRESSURE_ERROR);
+		}
+		logVideoEvent("video_mux_inputs_materialized", {
+			jobId,
+			videoId,
+			combinedVideoSize: file(combinedVideoPath).size,
+			combinedAudioSize: combinedAudioPath ? file(combinedAudioPath).size : 0,
+			resources: getSystemResources(),
+		});
+
+		const sourceEvidence = await withJobHeartbeat(jobId, () =>
+			withMuxMemoryGuard(abortController, () =>
+				inspectRecordingSources(combinedVideoPath, combinedAudioPath, {
+					abortSignal: abortController.signal,
+				}),
+			),
+		).catch((error: unknown) => {
+			errorCode = classifySourceError(error);
+			throw error;
+		});
+		const requiredAudio = context.requiredAudio ?? Boolean(audioInput);
+		const resultPath = join(workDir, "result.mp4");
+		errorCode = "output-invalid";
+		await withJobHeartbeat(jobId, () =>
+			withMuxMemoryGuard(abortController, () =>
+				muxMediaTracksToMp4(
+					combinedVideoPath,
+					combinedAudioPath,
+					resultPath,
+					abortController.signal,
+				),
+			),
+		);
+		const beforeDecode = await lstat(resultPath, { bigint: true });
+		if (!beforeDecode.isFile())
+			throw new Error("Recording verification requires a local regular file");
+		const localVerified = await withJobHeartbeat(jobId, () =>
+			withMuxMemoryGuard(abortController, () =>
+				verifyRecording(resultPath, {
+					requireAudio: requiredAudio,
+					sourceEvidence,
+					abortSignal: abortController.signal,
+				}),
+			),
+		);
+		if (!localVerified.sourcePreserved)
+			throw new Error("Recording source preservation was not verified");
+		const outputSha256 = await withJobHeartbeat(jobId, () =>
+			hashRecordingFile(resultPath, abortController.signal),
+		);
+		const afterHash = await lstat(resultPath, { bigint: true });
+		if (
+			!afterHash.isFile() ||
+			beforeDecode.dev !== afterHash.dev ||
+			beforeDecode.ino !== afterHash.ino ||
+			beforeDecode.size !== afterHash.size ||
+			beforeDecode.mtimeNs !== afterHash.mtimeNs ||
+			beforeDecode.ctimeNs !== afterHash.ctimeNs
+		) {
+			throw new Error("Local recording changed during verification");
+		}
+		await rm(combinedVideoPath, { force: true });
+		if (combinedAudioPath) {
+			await rm(combinedAudioPath, { force: true });
+		}
+		logVideoEvent("video_mux_output_ready", {
+			jobId,
+			videoId,
+			outputSize: file(resultPath).size,
+			durationMs: Date.now() - startedAt,
+			resources: getSystemResources(),
+		});
+
+		let metadata = await probeVideoFile(resultPath);
+		if (
+			!Number.isFinite(metadata.duration) ||
+			metadata.duration <= 0 ||
+			metadata.fileSize !== file(resultPath).size ||
+			metadata.fileSize <= 0 ||
+			metadata.width <= 0 ||
+			metadata.height <= 0 ||
+			!metadata.videoCodec ||
+			(audioInput && !metadata.audioCodec)
+		) {
+			throw new Error(
+				"Muxed recording is incomplete or missing a required track",
 			);
 		}
+		metadata = { ...metadata, duration: localVerified.video.duration };
 
 		updateJob(jobId, { phase: "uploading", progress: 80 });
 		sendCurrentJobWebhook(jobId);
 
 		outputUploadStarted = true;
-		await uploadFileToStorage(resultPath, outputUpload, "video/mp4");
-
-		let metadata: VideoMetadata | undefined;
-		try {
-			const probeResult = await probeVideoFile(resultPath);
-			metadata = probeResult;
-		} catch {}
+		errorCode = "processing-unavailable";
+		const uploadReceipt = await withJobHeartbeat(jobId, () =>
+			uploadFileToStorage(
+				resultPath,
+				outputUpload,
+				"video/mp4",
+				abortController.signal,
+			),
+		);
+		if (outputVerificationUrl) {
+			errorCode = "output-invalid";
+			const uploadObjectIdentity = uploadReceipt.objectIdentity;
+			if (!uploadObjectIdentity)
+				throw new Error("Recording upload did not return an object identity");
+			if (
+				!beginRecordingVerification(
+					jobId,
+					PROCESS_TIMEOUT_MS + POST_VERIFICATION_ASSET_BUDGET_MS,
+				)
+			)
+				throw new Error("Recording verification job is no longer active");
+			const remoteBytes = await withJobHeartbeat(jobId, () =>
+				verifyRemoteRecordingBytes(outputVerificationUrl, {
+					expectedSha256: outputSha256,
+					expectedFileSize: metadata.fileSize,
+					expectedObjectIdentity: uploadObjectIdentity,
+					abortSignal: abortController.signal,
+				}),
+			);
+			const verified = { ...localVerified, ...remoteBytes };
+			if (!verified.sourcePreserved || verified.remoteSha256 !== outputSha256)
+				throw new Error(
+					"Uploaded recording source preservation was not verified",
+				);
+			if (verified.fileSize !== metadata.fileSize)
+				throw new Error(
+					"Uploaded recording size does not match the muxed file",
+				);
+			metadata = {
+				...metadata,
+				duration: verified.video.duration,
+				audioCodec: verified.audio ? (metadata.audioCodec ?? "unknown") : null,
+				fileSize: verified.fileSize,
+			};
+			const manifestSha256 = getJob(jobId)?.manifestSha256;
+			if (manifestSha256) {
+				updateJob(jobId, {
+					recordingVerification: {
+						request: {
+							version: 1,
+							artifact: { kind: "segments", manifestSha256 },
+							requiredAudio,
+						},
+						fullDecode: true,
+						objectIdentity: verified.objectIdentity,
+						...(context.outputKey && context.inventorySha256
+							? {
+									outputKey: context.outputKey,
+									outputSha256: verified.remoteSha256,
+									sourceProof: {
+										version: 1 as const,
+										manifestSha256,
+										inventorySha256: context.inventorySha256,
+										sourcePreserved: true as const,
+										videoDuration: sourceEvidence.video.duration,
+										hasAudio: Boolean(sourceEvidence.audio),
+										audioVerified: Boolean(sourceEvidence.audio),
+									},
+								}
+							: {}),
+					},
+				});
+			}
+		}
 
 		if (thumbnailPresignedUrl || previewGifPresignedUrl) {
 			updateJob(jobId, {
@@ -1894,15 +2669,28 @@ async function muxSegmentsAsync(
 			"mux-segments",
 		);
 
+		abortController.signal.throwIfAborted();
 		updateJob(jobId, {
 			phase: "complete",
 			progress: 100,
 			metadata,
 		});
 		sendCurrentJobWebhook(jobId);
-
-		setTimeout(() => deleteJob(jobId), 5 * 60 * 1000);
+		logVideoEvent("video_mux_succeeded", {
+			jobId,
+			videoId,
+			durationMs: Date.now() - startedAt,
+			metadata,
+			resources: getSystemResources(),
+		});
 	} catch (error: unknown) {
+		logVideoEvent("video_mux_failed", {
+			jobId,
+			videoId,
+			durationMs: Date.now() - startedAt,
+			error: error instanceof Error ? error.message : String(error),
+			resources: getSystemResources(),
+		});
 		if (!outputUploadStarted) {
 			await abortStorageUploadTarget(outputUpload).catch((abortError) => {
 				console.warn(
@@ -1913,12 +2701,27 @@ async function muxSegmentsAsync(
 		}
 		console.error(`Mux-segments job ${jobId} failed:`, error);
 		updateJob(jobId, {
-			phase: "error",
-			error: error instanceof Error ? error.message : "Unknown error",
+			phase:
+				abortController.signal.aborted && !isBusyError(error)
+					? "cancelled"
+					: "error",
+			errorCode:
+				error instanceof MediaDownloadError
+					? error.errorCode
+					: isRetryableRecordingVerificationError(error) ||
+							isBusyError(error) ||
+							isTimeoutError(error)
+						? "processing-unavailable"
+						: errorCode,
+			error: isRetryableRecordingVerificationError(error)
+				? "Recording verification temporarily unavailable (503)"
+				: error instanceof Error
+					? error.message
+					: "Unknown error",
 		});
 		sendCurrentJobWebhook(jobId);
 	} finally {
-		const { rm } = await import("node:fs/promises");
+		if (processingTimeout) clearTimeout(processingTimeout);
 		await rm(workDir, { recursive: true, force: true }).catch(() => {});
 	}
 }

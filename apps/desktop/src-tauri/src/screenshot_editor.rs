@@ -8,7 +8,7 @@ use cap_project::{
 };
 use cap_rendering::{
     DecodedFrame, DecodedSegmentFrames, FrameRenderer, ProjectUniforms, RenderVideoConstants,
-    RendererLayers, ZoomFocusInterpolator,
+    RendererLayers, ZoomTransformTimeline,
 };
 use image::{
     GenericImageView, ImageEncoder, RgbImage, buffer::ConvertBuffer, codecs::png::PngEncoder,
@@ -105,14 +105,9 @@ impl ScreenshotEditorInstances {
     async fn create_standalone_instance(
         app_handle: &AppHandle,
         path: PathBuf,
+        start_preview: bool,
     ) -> Result<Arc<ScreenshotEditorInstance>, String> {
         let create_started = Instant::now();
-        let (frame_tx, frame_rx) = watch::channel(None);
-        let (ws_port, ws_shutdown_token) =
-            create_watch_frame_ws(frame_rx, Default::default()).await;
-        if ws_port == 0 {
-            return Err("Failed to start screenshot editor frame websocket".to_string());
-        }
 
         let (data, width, height) = {
             let key = path
@@ -221,6 +216,35 @@ impl ScreenshotEditorInstances {
         } else {
             (None, None)
         };
+
+        if !start_preview {
+            let pretty_name = recording_meta
+                .as_ref()
+                .map(|meta| meta.pretty_name.clone())
+                .unwrap_or_else(|| "Screenshot".to_string());
+            let (config_tx, _) = watch::channel(ScreenshotConfigUpdate {
+                revision: 0,
+                config: loaded_config.unwrap_or_default(),
+            });
+
+            return Ok(Arc::new(ScreenshotEditorInstance {
+                ws_port: 0,
+                ws_shutdown_token: CancellationToken::new(),
+                config_tx,
+                path,
+                pretty_name,
+                image_width: width,
+                image_height: height,
+                source_rgba: Arc::new(data),
+            }));
+        }
+
+        let (frame_tx, frame_rx) = watch::channel(None);
+        let (ws_port, ws_shutdown_token) =
+            create_watch_frame_ws(frame_rx, Default::default()).await;
+        if ws_port == 0 {
+            return Err("Failed to start screenshot editor frame websocket".to_string());
+        }
 
         let recording_meta = if let Some(meta) = recording_meta {
             meta
@@ -383,6 +407,10 @@ impl ScreenshotEditorInstances {
                     break;
                 }
                 let segment_frames = DecodedSegmentFrames {
+                    screen_size: cap_project::XY::new(
+                        decoded_frame.width(),
+                        decoded_frame.height(),
+                    ),
                     screen_frame: Some(DecodedFrame::new(
                         decoded_frame.data().to_vec(),
                         decoded_frame.width(),
@@ -398,18 +426,13 @@ impl ScreenshotEditorInstances {
                     ProjectUniforms::get_base_size(&constants.options, &current_config);
 
                 let cursor_events = cap_project::CursorEvents::default();
-                let zoom_focus_interpolator = ZoomFocusInterpolator::new(
+                let mut zoom_timeline = ZoomTransformTimeline::from_project(
+                    &current_config,
                     &cursor_events,
-                    None,
-                    current_config.cursor.click_spring_config(),
-                    current_config.screen_movement_spring,
                     0.0,
-                    current_config
-                        .timeline
-                        .as_ref()
-                        .map(|t| t.zoom_segments.as_slice())
-                        .unwrap_or(&[]),
+                    constants.options.screen_size,
                 );
+                zoom_timeline.ensure_precomputed_until(1.0 / 30.0);
 
                 let uniforms = ProjectUniforms::new(
                     &constants,
@@ -420,7 +443,7 @@ impl ScreenshotEditorInstances {
                     &cursor_events,
                     &segment_frames,
                     0.0,
-                    &zoom_focus_interpolator,
+                    &zoom_timeline,
                 );
 
                 let render_started = Instant::now();
@@ -517,7 +540,8 @@ impl ScreenshotEditorInstances {
                     }
                 }
 
-                let instance = Self::create_standalone_instance(window.app_handle(), path).await?;
+                let instance =
+                    Self::create_standalone_instance(window.app_handle(), path, true).await?;
                 entry.insert(instance.clone());
                 Ok(instance)
             }
@@ -597,7 +621,8 @@ impl PendingScreenshotEditorInstances {
         }
 
         tokio::spawn(async move {
-            let result = ScreenshotEditorInstances::create_standalone_instance(&app, path).await;
+            let result =
+                ScreenshotEditorInstances::create_standalone_instance(&app, path, true).await;
             tx.send(Some(result)).ok();
         });
     }
@@ -855,6 +880,7 @@ pub async fn prewarm_screenshot_renderer() {
     );
 
     let segment_frames = DecodedSegmentFrames {
+        screen_size: cap_project::XY::new(width, height),
         screen_frame: Some(DecodedFrame::new(
             vec![255u8; (width * height * 4) as usize],
             width,
@@ -868,14 +894,15 @@ pub async fn prewarm_screenshot_renderer() {
 
     let (base_w, base_h) = ProjectUniforms::get_base_size(&constants.options, &config);
     let cursor_events = cap_project::CursorEvents::default();
-    let zoom_focus_interpolator = ZoomFocusInterpolator::new(
-        &cursor_events,
+    let mut zoom_timeline = ZoomTransformTimeline::new(
+        &[],
         None,
-        config.cursor.click_spring_config(),
+        &cursor_events,
         config.screen_movement_spring,
         0.0,
-        &[],
+        None,
     );
+    zoom_timeline.ensure_precomputed_until(1.0 / 30.0);
     let uniforms = ProjectUniforms::new(
         &constants,
         &config,
@@ -885,7 +912,7 @@ pub async fn prewarm_screenshot_renderer() {
         &cursor_events,
         &segment_frames,
         0.0,
-        &zoom_focus_interpolator,
+        &zoom_timeline,
     );
 
     match frame_renderer
@@ -1146,7 +1173,11 @@ async fn recognize_screenshot_ocr_image(
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 async fn recognize_screenshot_ocr_image(
-    _image: ScreenshotOcrImage,
+    ScreenshotOcrImage {
+        bgra: _bgra,
+        width: _width,
+        height: _height,
+    }: ScreenshotOcrImage,
 ) -> Result<ScreenshotOcrResult, String> {
     Err("OCR is only available on macOS and Windows".to_string())
 }
@@ -1468,7 +1499,7 @@ pub async fn render_screenshot_project_for_export(
     app: AppHandle,
     path: PathBuf,
 ) -> Result<ScreenshotProjectExport, String> {
-    let instance = ScreenshotEditorInstances::create_standalone_instance(&app, path).await?;
+    let instance = ScreenshotEditorInstances::create_standalone_instance(&app, path, false).await?;
     let config = instance.config_tx.borrow().config.clone();
     let image_width = instance.image_width;
     let image_height = instance.image_height;
@@ -1655,6 +1686,7 @@ pub async fn render_screenshot_png(instance: &ScreenshotEditorInstance) -> Resul
     );
     let decoded_frame = DecodedFrame::new(data, width, height);
     let segment_frames = DecodedSegmentFrames {
+        screen_size: cap_project::XY::new(width, height),
         screen_frame: Some(DecodedFrame::new(
             decoded_frame.data().to_vec(),
             decoded_frame.width(),
@@ -1666,18 +1698,13 @@ pub async fn render_screenshot_png(instance: &ScreenshotEditorInstance) -> Resul
         segment_has_camera: false,
     };
     let cursor_events = cap_project::CursorEvents::default();
-    let zoom_focus_interpolator = ZoomFocusInterpolator::new(
+    let mut zoom_timeline = ZoomTransformTimeline::from_project(
+        &config,
         &cursor_events,
-        None,
-        config.cursor.click_spring_config(),
-        config.screen_movement_spring,
         0.0,
-        config
-            .timeline
-            .as_ref()
-            .map(|timeline| timeline.zoom_segments.as_slice())
-            .unwrap_or(&[]),
+        constants.options.screen_size,
     );
+    zoom_timeline.ensure_precomputed_until(1.0 / 30.0);
     let uniforms = ProjectUniforms::new(
         &constants,
         &config,
@@ -1687,7 +1714,7 @@ pub async fn render_screenshot_png(instance: &ScreenshotEditorInstance) -> Resul
         &cursor_events,
         &segment_frames,
         0.0,
-        &zoom_focus_interpolator,
+        &zoom_timeline,
     );
     let rendered_frame = frame_renderer
         .render_immediate(

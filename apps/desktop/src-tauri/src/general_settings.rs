@@ -1,3 +1,4 @@
+use crate::updates::UpdateChannel;
 use crate::window_exclusion::WindowExclusion;
 use scap_targets::DisplayId;
 use serde::{Deserialize, Serialize};
@@ -91,7 +92,10 @@ impl MainWindowRecordingStartBehaviour {
                 #[cfg(windows)]
                 return window.minimize();
                 #[cfg(not(windows))]
-                window.hide()
+                {
+                    crate::hide_main_window(window.app_handle());
+                    Ok(())
+                }
             }
             Self::Minimise => window.minimize(),
         }
@@ -109,6 +113,7 @@ const DEFAULT_EXCLUDED_WINDOW_TITLES: &[&str] = &[
     "Cap Capture Area",
     "Cap Mode Selection",
     "Cap Recordings Overlay",
+    "Cap Teleprompter",
 ];
 
 pub fn default_excluded_windows() -> Vec<WindowExclusion> {
@@ -192,6 +197,13 @@ pub struct GeneralSettingsStore {
     pub enable_native_camera_preview: bool,
     #[serde(default = "default_true")]
     pub auto_zoom_on_clicks: bool,
+    #[serde(default)]
+    pub default_zoom_amount: Option<f64>,
+    /// `None` until [`init`] seeds it from whether this machine has a notched
+    /// display. From then on it is the user's preference and nothing re-reads
+    /// the hardware, so moving between machines can't silently flip it.
+    #[serde(default)]
+    pub macbook_notch_overlay: Option<bool>,
     #[serde(default = "default_capture_keyboard_events")]
     pub capture_keyboard_events: bool,
     #[serde(default)]
@@ -228,6 +240,23 @@ pub struct GeneralSettingsStore {
     pub out_of_process_muxer: bool,
     #[serde(default)]
     pub recordings_path: Option<String>,
+    /// Custom recordings folders that were used before; recordings left in
+    /// them stay visible in the library. Most recent last.
+    #[serde(default)]
+    pub previous_recordings_paths: Vec<String>,
+    /// App version at which camera background blur was disabled after a crash
+    /// was attributed to the blur pipeline; `None` means blur is allowed.
+    /// Cleared automatically when the app version changes (one retry per
+    /// update, since a new ort/wgpu/driver stack may have fixed the crash).
+    #[serde(default)]
+    pub camera_blur_disabled_by_crash: Option<String>,
+    #[serde(default)]
+    pub update_channel: UpdateChannel,
+    /// Run the experimental gpui-native app (`cap-gpui`) *instead of* this one:
+    /// while enabled, startup hands off to it and exits, and the native app's
+    /// own Experimental page hands back. See `gpui_app.rs`.
+    #[serde(default)]
+    pub enable_gpui_app: bool,
 }
 
 fn default_enable_native_camera_preview() -> bool {
@@ -306,7 +335,11 @@ impl Default for GeneralSettingsStore {
             server_url: default_server_url(),
             recording_countdown: Some(3),
             enable_native_camera_preview: default_enable_native_camera_preview(),
-            auto_zoom_on_clicks: false,
+            // Keep aligned with the field's serde `default_true`: auto zooms
+            // are on by default, matching configs that never stored the key.
+            auto_zoom_on_clicks: true,
+            default_zoom_amount: None,
+            macbook_notch_overlay: None,
             capture_keyboard_events: cap_recording::DEFAULT_CAPTURE_KEYBOARD_EVENTS,
             post_deletion_behaviour: PostDeletionBehaviour::DoNothing,
             excluded_windows: default_excluded_windows(),
@@ -325,6 +358,10 @@ impl Default for GeneralSettingsStore {
             enable_telemetry: true,
             out_of_process_muxer: cap_recording::DEFAULT_OUT_OF_PROCESS_MUXER,
             recordings_path: None,
+            previous_recordings_paths: Vec::new(),
+            camera_blur_disabled_by_crash: None,
+            update_channel: UpdateChannel::Stable,
+            enable_gpui_app: false,
         }
     }
 }
@@ -350,7 +387,23 @@ impl GeneralSettingsStore {
                 if path.is_absolute() { Some(path) } else { None }
             });
 
-        let path = custom.unwrap_or_else(|| app.path().app_data_dir().unwrap().join("recordings"));
+        // A custom folder can become unavailable (unplugged drive, deleted
+        // path). Recording must keep working, so fall back to the default
+        // location instead of failing; the library lists recordings from
+        // every known folder, so nothing goes missing when this happens.
+        if let Some(path) = custom {
+            match std::fs::create_dir_all(&path) {
+                Ok(()) => return path,
+                Err(e) => {
+                    tracing::warn!(
+                        ?path, %e,
+                        "Custom recordings directory unavailable; falling back to default"
+                    );
+                }
+            }
+        }
+
+        let path = app.path().app_data_dir().unwrap().join("recordings");
         if let Err(e) = std::fs::create_dir_all(&path) {
             tracing::warn!(?path, %e, "Failed to create recordings directory");
         }
@@ -395,7 +448,7 @@ impl GeneralSettingsStore {
         store.set("general_settings", json!(settings));
         store.save().map_err(|e| e.to_string())?;
 
-        crate::posthog::set_telemetry_enabled(settings.enable_telemetry);
+        crate::telemetry::set_telemetry_enabled(settings.enable_telemetry);
 
         #[cfg(target_os = "macos")]
         crate::permissions::sync_macos_dock_visibility(app);
@@ -433,6 +486,13 @@ fn sync_dock_visibility_on_general_settings_change(app: &AppHandle) {
     });
 }
 
+/// Always false off macOS, so the overlay starts off and waits to be asked for.
+fn machine_has_notched_display() -> bool {
+    scap_targets::Display::list()
+        .iter()
+        .any(|display| display.notch().is_some())
+}
+
 pub fn init(app: &AppHandle) {
     println!("Initializing GeneralSettingsStore");
 
@@ -447,6 +507,10 @@ pub fn init(app: &AppHandle) {
 
     append_missing_default_excluded_windows(&mut store.excluded_windows);
 
+    if store.macbook_notch_overlay.is_none() {
+        store.macbook_notch_overlay = Some(machine_has_notched_display());
+    }
+
     const REMOVE_TARGET_SELECT_MIGRATION_KEY: &str = "remove_cap_target_select_exclusion_v1";
     if let Ok(raw_store) = app.store("store")
         && raw_store.get(REMOVE_TARGET_SELECT_MIGRATION_KEY).is_none()
@@ -457,7 +521,7 @@ pub fn init(app: &AppHandle) {
         raw_store.set(REMOVE_TARGET_SELECT_MIGRATION_KEY, json!(true));
     }
 
-    crate::posthog::set_telemetry_enabled(store.enable_telemetry);
+    crate::telemetry::set_telemetry_enabled(store.enable_telemetry);
     register_bundled_muxer_binary(app);
 
     #[cfg(target_os = "macos")]

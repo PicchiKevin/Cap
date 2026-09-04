@@ -9,6 +9,7 @@ lerna-debug.log*
 .deepsec
 
 node_modules
+apps/cli/skill/cap-demo/node_modules/
 dist
 dist-ssr
 *.local
@@ -35,6 +36,7 @@ outputs
 *.sln
 *.sw?
 .turbo
+bun.lock
 pnpm-lock.yaml
 .zed
 .output

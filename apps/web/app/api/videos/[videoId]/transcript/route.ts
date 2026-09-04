@@ -1,19 +1,15 @@
 import type { Video } from "@cap/web-domain";
+import { Option } from "effect";
 import {
-	getRequestUser,
-	getTranscriptVtt,
-	getViewableVideo,
-} from "@/lib/agent-api";
+	getAgentTranscriptVtt,
+	getAgentVideoRequestAuthentication,
+	getAgentViewableVideo,
+	isAgentTranscriptDisabled,
+} from "@/lib/agent-video-api";
 import { parseVttCues, vttToPlainText } from "@/lib/vtt";
 
 export const dynamic = "force-dynamic";
 
-/**
- * GET /api/videos/[videoId]/transcript?format=vtt|text|json
- *
- * Machine-friendly transcript access. Auth via session cookie or
- * `Authorization: Bearer <api-key>`; public videos need no auth.
- */
 export async function GET(
 	request: Request,
 	props: { params: Promise<{ videoId: string }> },
@@ -21,7 +17,6 @@ export async function GET(
 	try {
 		const { videoId } = (await props.params) as { videoId: Video.VideoId };
 		const format = new URL(request.url).searchParams.get("format") ?? "vtt";
-
 		if (!["vtt", "text", "json"].includes(format)) {
 			return Response.json(
 				{ error: "Invalid format. Use vtt, text, or json" },
@@ -29,37 +24,44 @@ export async function GET(
 			);
 		}
 
-		const user = await getRequestUser(request);
-		const video = await getViewableVideo(videoId, user);
+		const authentication = await getAgentVideoRequestAuthentication(request);
+		if (authentication.type === "invalid") {
+			return Response.json({ error: "Invalid credential" }, { status: 401 });
+		}
 
+		const video = await getAgentViewableVideo(videoId, authentication);
 		if (!video) {
 			return Response.json({ error: "Video not found" }, { status: 404 });
 		}
-
-		if (video.transcriptionStatus !== "COMPLETE") {
+		if (await isAgentTranscriptDisabled(video.id)) {
+			return Response.json(
+				{ error: "Transcript unavailable" },
+				{ status: 404 },
+			);
+		}
+		const transcriptionStatus = Option.getOrNull(video.transcriptionStatus);
+		if (transcriptionStatus !== "COMPLETE") {
 			return Response.json(
 				{
 					error: "Transcript not ready",
-					transcriptionStatus: video.transcriptionStatus,
+					transcriptionStatus,
 				},
 				{ status: 409 },
 			);
 		}
 
-		const vtt = await getTranscriptVtt(video);
+		const vtt = await getAgentTranscriptVtt(video);
 		if (!vtt) {
 			return Response.json(
 				{ error: "Transcript file not found" },
 				{ status: 404 },
 			);
 		}
-
 		if (format === "text") {
 			return new Response(vttToPlainText(vtt), {
 				headers: { "content-type": "text/plain; charset=utf-8" },
 			});
 		}
-
 		if (format === "json") {
 			return Response.json({
 				videoId: video.id,

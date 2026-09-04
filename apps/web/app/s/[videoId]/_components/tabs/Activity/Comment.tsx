@@ -10,7 +10,7 @@ import {
 } from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import clsx from "clsx";
-import { AnimatePresence, motion } from "framer-motion";
+import { motion } from "motion/react";
 import { useSearchParams } from "next/navigation";
 import type React from "react";
 import { useEffect, useState } from "react";
@@ -19,29 +19,29 @@ import { LinkifiedText } from "@/components/LinkifiedText";
 import { SignedImageUrl } from "@/components/SignedImageUrl";
 import { Tooltip } from "@/components/Tooltip";
 import type { CommentType } from "../../../Share";
+import { MediaCommentBody } from "../../media-comment/MediaCommentBody";
+import { isMediaComment } from "../../media-comment/media-comment-types";
 import CommentInput from "./CommentInput";
-import { isDoneMessage } from "./threadState";
+import { isResolution } from "./threadState";
 import { formatTimeAgo, formatTimestamp } from "./utils";
 
 const formatVideoTimestamp = (timestamp: number) =>
-	new Date(timestamp * 1000).toISOString().substr(11, 8);
+	new Date(timestamp * 1000).toISOString().slice(11, 19);
 
 const ActionButton: React.FC<{
 	tooltip: string;
 	icon: typeof faReply;
 	onClick: () => void;
 	danger?: boolean;
-	success?: boolean;
-}> = ({ tooltip, icon, onClick, danger, success }) => (
+}> = ({ tooltip, icon, onClick, danger = false }) => (
 	<Tooltip content={tooltip}>
 		<button
 			type="button"
 			onClick={onClick}
+			aria-label={tooltip}
 			className={clsx(
-				"flex justify-center items-center rounded-md size-6 text-gray-8 transition-colors hover:bg-gray-3",
-				danger && "hover:text-red-500",
-				success && "hover:text-green-600",
-				!danger && !success && "hover:text-gray-12",
+				"flex size-6 items-center justify-center rounded-md text-gray-8 transition-colors hover:bg-gray-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-9",
+				danger ? "hover:text-red-500" : "hover:text-gray-12",
 			)}
 		>
 			<FontAwesomeIcon className="size-[10px]" icon={icon} />
@@ -56,7 +56,7 @@ const CommentRow: React.FC<{
 	onReopen?: () => void;
 	onSeek?: (time: number) => void;
 	badge?: React.ReactNode;
-}> = ({ comment, isReply, onDelete, onReopen, onSeek, badge }) => {
+}> = ({ comment, isReply = false, onDelete, onReopen, onSeek, badge }) => {
 	const user = useCurrentUser();
 	const isOwnComment = user?.id === comment.authorId;
 	const commentDate = new Date(comment.createdAt);
@@ -64,9 +64,13 @@ const CommentRow: React.FC<{
 	return (
 		<div
 			id={`comment-${comment.id}`}
-			className={clsx("group relative", comment.sending && "opacity-40")}
+			tabIndex={-1}
+			className={clsx(
+				"group relative focus:outline-none",
+				comment.sending && !isMediaComment(comment) && "opacity-40",
+			)}
 		>
-			<div className="flex gap-1.5 items-center">
+			<div className="flex items-center gap-1.5">
 				{comment.authorName && (
 					<SignedImageUrl
 						image={comment.authorImage}
@@ -75,35 +79,51 @@ const CommentRow: React.FC<{
 						letterClass={isReply ? "text-[9px]" : "text-[10px]"}
 					/>
 				)}
-				<span className="text-xs font-medium truncate text-gray-12">
+				<span className="truncate text-xs font-medium text-gray-12">
 					{comment.authorName || "Anonymous"}
 				</span>
 				{badge}
 				<Tooltip content={formatTimestamp(commentDate)}>
-					<span className="text-[11px] text-gray-8 shrink-0">
+					<span className="shrink-0 text-[11px] text-gray-8">
 						{formatTimeAgo(commentDate)}
 					</span>
 				</Tooltip>
-				{!isReply && comment.timestamp !== null && (
+				{comment.timestamp !== null && (
 					<button
 						type="button"
 						onClick={() => onSeek?.(Number(comment.timestamp))}
-						className="text-[11px] tabular-nums text-blue-500 shrink-0 cursor-pointer hover:text-blue-700"
+						className="shrink-0 cursor-pointer text-[11px] tabular-nums text-blue-500 hover:text-blue-700"
 					>
 						{formatVideoTimestamp(comment.timestamp)}
 					</button>
 				)}
 			</div>
-			<p
-				className={clsx(
-					"mt-0.5 text-[13px] leading-snug text-gray-11 break-words",
-					isReply ? "pl-[22px]" : "pl-[26px]",
-				)}
-			>
-				<LinkifiedText text={comment.content} />
-			</p>
+			{isMediaComment(comment) ? (
+				<div className="mt-2 space-y-2">
+					<MediaCommentBody comment={comment} compact />
+					{comment.content && (
+						<p
+							className={clsx(
+								"text-[13px] leading-snug text-gray-11 break-words",
+								isReply ? "pl-[22px]" : "pl-[26px]",
+							)}
+						>
+							<LinkifiedText text={comment.content} />
+						</p>
+					)}
+				</div>
+			) : (
+				<p
+					className={clsx(
+						"mt-0.5 text-[13px] leading-snug text-gray-11 break-words",
+						isReply ? "pl-[22px]" : "pl-[26px]",
+					)}
+				>
+					<LinkifiedText text={comment.content} />
+				</p>
+			)}
 			{(onReopen || (isOwnComment && onDelete)) && (
-				<div className="hidden absolute -top-1 right-0 gap-0.5 items-center p-0.5 rounded-lg border shadow-sm group-hover:flex bg-gray-1 border-gray-4">
+				<div className="absolute -top-1 right-0 hidden items-center gap-0.5 rounded-lg group-focus-within:flex [@media(pointer:coarse)]:flex border border-gray-4 bg-gray-1 p-0.5 shadow-sm group-hover:flex">
 					{onReopen && (
 						<ActionButton
 							tooltip="Reopen thread"
@@ -113,7 +133,7 @@ const CommentRow: React.FC<{
 					)}
 					{isOwnComment && onDelete && (
 						<ActionButton
-							tooltip="Delete"
+							tooltip="Delete comment"
 							icon={faTrash}
 							onClick={onDelete}
 							danger
@@ -128,12 +148,13 @@ const CommentRow: React.FC<{
 const ResolutionLine: React.FC<{ comment: CommentType }> = ({ comment }) => (
 	<div
 		id={`comment-${comment.id}`}
+		tabIndex={-1}
 		className={clsx(
-			"flex gap-1.5 items-center text-[11px] text-gray-9",
+			"flex items-center gap-1.5 text-[11px] text-gray-9 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-9",
 			comment.sending && "opacity-40",
 		)}
 	>
-		<span className="flex justify-center items-center rounded-full bg-green-100 text-green-700 size-3.5 shrink-0">
+		<span className="flex size-3.5 shrink-0 items-center justify-center rounded-full bg-green-100 text-green-700">
 			<FontAwesomeIcon className="size-[7px]" icon={faCheck} />
 		</span>
 		<span className="truncate">
@@ -165,6 +186,7 @@ const CommentThread: React.FC<{
 	onResolve: (threadId: Comment.CommentId) => void;
 	onReopen: (threadId: Comment.CommentId) => void;
 	onSeek?: (time: number) => void;
+	forceShowReplies?: boolean;
 }> = ({
 	comment,
 	replies,
@@ -177,9 +199,10 @@ const CommentThread: React.FC<{
 	onResolve,
 	onReopen,
 	onSeek,
+	forceShowReplies = false,
 }) => {
 	const isReplying = replyingToId === comment.id;
-	const [showReplies, setShowReplies] = useState(!isDone);
+	const [showReplies, setShowReplies] = useState(!isDone || forceShowReplies);
 	const commentParams = useSearchParams().get("comment");
 	const replyParams = useSearchParams().get("reply");
 	const highlightedId = commentParams || replyParams;
@@ -188,8 +211,8 @@ const CommentThread: React.FC<{
 		replies.some((reply) => reply.id === highlightedId);
 
 	useEffect(() => {
-		if (isDone) setShowReplies(false);
-	}, [isDone]);
+		setShowReplies(!isDone || forceShowReplies);
+	}, [isDone, forceShowReplies]);
 
 	const handleDelete = (target: CommentType) => {
 		if (window.confirm("Are you sure you want to delete this comment?")) {
@@ -206,7 +229,7 @@ const CommentThread: React.FC<{
 			}}
 			transition={{ duration: 0.75, ease: "easeInOut", delay: 0.15 }}
 			className={clsx(
-				"p-2.5 rounded-lg border border-gray-3 bg-white",
+				"rounded-lg border border-gray-3 bg-white p-2.5",
 				isDone && "opacity-75",
 			)}
 		>
@@ -215,7 +238,7 @@ const CommentThread: React.FC<{
 				onSeek={onSeek}
 				badge={
 					isDone ? (
-						<span className="flex gap-1 items-center px-1.5 py-px text-[10px] font-medium text-green-700 bg-green-100 rounded-full shrink-0">
+						<span className="flex shrink-0 items-center gap-1 rounded-full bg-green-100 px-1.5 py-px text-[10px] font-medium text-green-700">
 							<FontAwesomeIcon className="size-[8px]" icon={faCheck} />
 							Done
 						</span>
@@ -228,8 +251,8 @@ const CommentThread: React.FC<{
 			{replies.length > 0 && (
 				<button
 					type="button"
-					onClick={() => setShowReplies((v) => !v)}
-					className="flex gap-1 items-center mt-1.5 ml-[26px] text-[11px] font-medium text-gray-9 transition-colors hover:text-gray-12"
+					onClick={() => setShowReplies((visible) => !visible)}
+					className="mt-1.5 flex items-center gap-1 ml-[26px] text-[11px] font-medium text-gray-9 transition-colors hover:text-gray-12"
 				>
 					<FontAwesomeIcon
 						className="size-[8px]"
@@ -241,40 +264,33 @@ const CommentThread: React.FC<{
 				</button>
 			)}
 
-			<AnimatePresence initial={false}>
-				{showReplies && replies.length > 0 && (
-					<motion.div
-						initial={{ height: 0, opacity: 0 }}
-						animate={{ height: "auto", opacity: 1 }}
-						exit={{ height: 0, opacity: 0 }}
-						transition={{ duration: 0.2, ease: "easeInOut" }}
-						className="overflow-hidden"
-					>
-						<div className="mt-2 ml-[9px] pl-3.5 space-y-2 border-l border-gray-4">
-							{replies.map((reply) =>
-								isDoneMessage(reply) ? (
-									<ResolutionLine key={reply.id} comment={reply} />
-								) : (
-									<CommentRow
-										key={reply.id}
-										comment={reply}
-										isReply
-										onSeek={onSeek}
-										onDelete={() => handleDelete(reply)}
-									/>
-								),
-							)}
-						</div>
-					</motion.div>
-				)}
-			</AnimatePresence>
+			{showReplies && replies.length > 0 && (
+				<div className="mt-2 ml-[9px] space-y-2 border-l border-gray-4 pl-3.5">
+					{replies.map((reply) =>
+						isResolution(reply) ? (
+							<ResolutionLine
+								key={reply.clientKey ?? reply.id}
+								comment={reply}
+							/>
+						) : (
+							<CommentRow
+								key={reply.clientKey ?? reply.id}
+								comment={reply}
+								isReply
+								onSeek={onSeek}
+								onDelete={() => handleDelete(reply)}
+							/>
+						),
+					)}
+				</div>
+			)}
 
-			{!isDone && !isReplying && (
-				<div className="flex gap-1.5 mt-2 ml-[26px]">
+			{!isDone && !comment.sending && !isReplying && (
+				<div className="mt-2 flex gap-1.5 ml-[26px]">
 					<button
 						type="button"
 						onClick={() => onReply(comment.id)}
-						className="flex gap-1.5 items-center px-2 py-1 text-[11px] font-medium rounded-md border transition-colors border-gray-4 bg-gray-1 text-gray-10 hover:bg-gray-3 hover:text-gray-12"
+						className="flex items-center gap-1.5 rounded-md border border-gray-4 bg-gray-1 px-2 py-1 text-[11px] font-medium text-gray-10 transition-colors hover:bg-gray-3 hover:text-gray-12"
 					>
 						<FontAwesomeIcon className="size-[9px]" icon={faReply} />
 						Reply
@@ -282,7 +298,7 @@ const CommentThread: React.FC<{
 					<button
 						type="button"
 						onClick={() => onResolve(comment.id)}
-						className="flex gap-1.5 items-center px-2 py-1 text-[11px] font-medium rounded-md border transition-colors border-gray-4 bg-gray-1 text-gray-10 hover:bg-green-50 hover:border-green-300 hover:text-green-700"
+						className="flex items-center gap-1.5 rounded-md border border-gray-4 bg-gray-1 px-2 py-1 text-[11px] font-medium text-gray-10 transition-colors hover:border-green-300 hover:bg-green-50 hover:text-green-700"
 					>
 						<FontAwesomeIcon className="size-[9px]" icon={faCheck} />
 						Mark done
@@ -291,19 +307,19 @@ const CommentThread: React.FC<{
 			)}
 
 			{isReplying && (
-				<div className="flex gap-1.5 items-start mt-2 ml-[26px]">
-					<div className="flex-1 min-w-0">
+				<div className="mt-2 flex items-start gap-1.5 ml-[26px]">
+					<div className="min-w-0 flex-1">
 						<CommentInput
 							onSubmit={handleReply}
 							placeholder="Write a reply..."
-							autoFocus={true}
+							autoFocus
 						/>
 					</div>
 					<Tooltip content="Close">
 						<button
 							type="button"
 							onClick={onCancelReply}
-							className="flex justify-center items-center mt-1 rounded-md size-6 shrink-0 text-gray-8 transition-colors hover:bg-gray-3 hover:text-gray-12"
+							className="mt-1 flex size-6 shrink-0 items-center justify-center rounded-md text-gray-8 transition-colors hover:bg-gray-3 hover:text-gray-12"
 						>
 							<FontAwesomeIcon className="size-[11px]" icon={faXmark} />
 						</button>

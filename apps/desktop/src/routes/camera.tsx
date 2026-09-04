@@ -38,8 +38,13 @@ import {
 	normalizeBackgroundBlurMode,
 } from "~/components/CameraPreviewChrome";
 import { generalSettingsStore } from "~/store";
+import { cameraPresentationInput } from "~/utils/camera-presentation";
 import { createTauriEventListener } from "~/utils/createEventListener";
-import { createCameraMutation } from "~/utils/queries";
+import {
+	createCameraMutation,
+	createCurrentRecordingQuery,
+	revealRecordingWindow,
+} from "~/utils/queries";
 import {
 	type CanvasControls,
 	createImageDataWS,
@@ -69,6 +74,7 @@ const getNativeCameraPreviewInitialState = () => {
 };
 
 let ignoreMoveUntil = 0;
+let performanceHarnessCameraOpen = false;
 
 const ignoreMoveFor = (durationMs: number) => {
 	ignoreMoveUntil = Date.now() + durationMs;
@@ -125,7 +131,7 @@ export default function () {
 
 	const generalSettings = generalSettingsStore.createQuery();
 	const isNativePreviewEnabled = () => {
-		if (type() === "windows") return false;
+		if (type() === "windows" || type() === "linux") return false;
 		if (generalSettings.isPending) return getNativeCameraPreviewInitialState();
 		return (
 			generalSettings.data?.enableNativeCameraPreview ??
@@ -357,6 +363,8 @@ function LegacyCameraPreviewPage(props: {
 	issue: Accessor<CameraPreviewIssue | null>;
 }) {
 	const isCameraOnlyMode = () => getCameraOnlyMode();
+	const currentRecording = createCurrentRecordingQuery();
+	const isInstantRecording = () => currentRecording.data?.mode === "instant";
 
 	const [state, setState] = makePersisted(
 		createStore<CameraWindowState>(getDefaultCameraWindowState()),
@@ -399,13 +407,19 @@ function LegacyCameraPreviewPage(props: {
 		}
 	});
 
+	let layoutRevision = 0;
+	let previewStateSync: Promise<unknown> = Promise.resolve();
 	createEffect(() => {
-		commands.setCameraPreviewState({
+		layoutRevision = (layoutRevision + 1) >>> 0;
+		previewStateSync = commands.setCameraPreviewState({
 			size: state.size,
 			shape: state.shape,
 			mirrored: state.mirrored,
 			background_blur: normalizeBackgroundBlurMode(state.backgroundBlur),
 		});
+		void previewStateSync.catch((error) =>
+			console.error("Camera preview state sync failed", error),
+		);
 	});
 
 	const [hasPositioned, setHasPositioned] = createSignal(isCameraOnlyMode());
@@ -435,6 +449,7 @@ function LegacyCameraPreviewPage(props: {
 				Math.abs(currentSize.width - rect.width) > 1 ||
 				Math.abs(currentSize.height - rect.height) > 1
 			) {
+				layoutRevision = (layoutRevision + 1) >>> 0;
 				setExternalContainerSize({ width: rect.width, height: rect.height });
 			}
 		};
@@ -452,7 +467,9 @@ function LegacyCameraPreviewPage(props: {
 	const WS_MAX_RETRIES = 10;
 
 	const { cameraWsPort } = window.__CAP__;
-	const [isWindowVisible, setIsWindowVisible] = createSignal(!document.hidden);
+	const [isWindowVisible, setIsWindowVisible] = createSignal(
+		performanceHarnessCameraOpen || !document.hidden,
+	);
 	let ws: Omit<WebSocket, "onmessage"> | undefined;
 	let canvasControls: CanvasControls | undefined;
 	let reconnectTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -500,22 +517,34 @@ function LegacyCameraPreviewPage(props: {
 	};
 
 	onMount(() => {
+		const unlistenHarnessCameraOpened = listen(
+			"instant-mode-harness-camera-opened",
+			() => {
+				performanceHarnessCameraOpen = true;
+				setIsWindowVisible(true);
+				lastFrameTime = Date.now();
+			},
+		);
+
 		const handleVisibilityChange = () => {
-			setIsWindowVisible(!document.hidden);
-			if (!document.hidden) {
+			const visible = performanceHarnessCameraOpen || !document.hidden;
+			setIsWindowVisible(visible);
+			if (visible) {
 				lastFrameTime = Date.now();
 				commands.refreshCameraFeed().catch(() => {});
 			}
 		};
 		document.addEventListener("visibilitychange", handleVisibilityChange);
-		onCleanup(() =>
-			document.removeEventListener("visibilitychange", handleVisibilityChange),
-		);
+		onCleanup(() => {
+			document.removeEventListener("visibilitychange", handleVisibilityChange);
+			void unlistenHarnessCameraOpened.then((unlisten) => unlisten());
+		});
 	});
 
 	const createSocket = () => {
+		const instantQuery = isInstantRecording() ? "?instant=true" : "";
 		const [socket, _isConnected, _isWorkerReady, controls] = createImageDataWS(
-			`ws://localhost:${cameraWsPort}`,
+			`ws://localhost:${cameraWsPort}${instantQuery}`,
 			updateFrameState,
 			() => commands.refreshCameraFeed().catch(() => {}),
 			{ powerPreference: "low-power" },
@@ -592,6 +621,7 @@ function LegacyCameraPreviewPage(props: {
 
 		stallCheckInterval = setInterval(() => {
 			if (
+				!performanceHarnessCameraOpen &&
 				ws?.readyState === WebSocket.OPEN &&
 				isWindowVisible() &&
 				lastFrameTime > 0 &&
@@ -611,6 +641,18 @@ function LegacyCameraPreviewPage(props: {
 			stopSocket();
 		}
 	});
+
+	createEffect(
+		on(
+			isInstantRecording,
+			() => {
+				if (!isWindowVisible()) return;
+				stopSocket();
+				startSocket();
+			},
+			{ defer: true },
+		),
+	);
 
 	onCleanup(() => {
 		isCleanedUp = true;
@@ -674,9 +716,11 @@ function LegacyCameraPreviewPage(props: {
 						);
 					});
 					if (onMonitor) {
-						currentWindow.setPosition(new LogicalPosition(saved.x, saved.y));
+						await currentWindow.setPosition(
+							new LogicalPosition(saved.x, saved.y),
+						);
 					} else {
-						currentWindow.setPosition(
+						await currentWindow.setPosition(
 							new LogicalPosition(
 								width + activeMonitor.position.toLogical(scalingFactor).x,
 								height + activeMonitor.position.toLogical(scalingFactor).y,
@@ -684,7 +728,7 @@ function LegacyCameraPreviewPage(props: {
 						);
 					}
 				} else {
-					currentWindow.setPosition(
+					await currentWindow.setPosition(
 						new LogicalPosition(
 							width + activeMonitor.position.toLogical(scalingFactor).x,
 							height + activeMonitor.position.toLogical(scalingFactor).y,
@@ -738,7 +782,112 @@ function LegacyCameraPreviewPage(props: {
 		},
 	);
 
-	onMount(() => getCurrentWindow().show());
+	onMount(() => {
+		let disposed = false;
+		let requestRevision = 0;
+		const unlisten = events.cameraPresentationRequested.listen(
+			async ({ payload }) => {
+				const request = ++requestRevision;
+				try {
+					if (
+						type() !== "linux" ||
+						isCameraOnlyMode() ||
+						!containerRef ||
+						!hasFrame()
+					) {
+						throw new Error(
+							"Wait for the selected camera preview before recording",
+						);
+					}
+					const sync = previewStateSync;
+					await sync;
+					const deadline = performance.now() + 900;
+					while (_windowSize.loading) {
+						if (performance.now() >= deadline)
+							throw new Error("Camera layout did not settle");
+						await new Promise<void>((resolve) => setTimeout(resolve, 16));
+					}
+					const measuredRevision = layoutRevision;
+					await Promise.race([
+						new Promise<void>((resolve) =>
+							requestAnimationFrame(() =>
+								requestAnimationFrame(() => resolve()),
+							),
+						),
+						new Promise<never>((_, reject) =>
+							setTimeout(
+								() =>
+									reject(new Error("Camera window did not render its layout")),
+								500,
+							),
+						),
+					]);
+					if (disposed || request !== requestRevision) return;
+					if (
+						sync !== previewStateSync ||
+						measuredRevision !== layoutRevision ||
+						_windowSize.loading
+					) {
+						throw new Error(
+							"Camera appearance changed while measuring; start again",
+						);
+					}
+					const rect = containerRef.getBoundingClientRect();
+					const clip = getComputedStyle(containerRef);
+					const input = cameraPresentationInput(
+						{
+							viewportWidth: window.innerWidth,
+							viewportHeight: window.innerHeight,
+							left: rect.left,
+							top: rect.top,
+							width: rect.width,
+							height: rect.height,
+							cornerRadii: [
+								clip.borderTopLeftRadius,
+								clip.borderTopRightRadius,
+								clip.borderBottomRightRadius,
+								clip.borderBottomLeftRadius,
+							],
+						},
+						{
+							size: state.size,
+							shape: state.shape,
+							mirrored: state.mirrored,
+							background_blur: normalizeBackgroundBlurMode(
+								state.backgroundBlur,
+							),
+						},
+						measuredRevision,
+					);
+					await commands.submitCameraPresentation(payload.nonce, input, null);
+				} catch (error) {
+					if (!disposed && request === requestRevision) {
+						await commands
+							.submitCameraPresentation(payload.nonce, null, String(error))
+							.catch(() => {});
+					}
+				}
+			},
+		);
+		onCleanup(() => {
+			disposed = true;
+			requestRevision += 1;
+			void unlisten.then((remove) => remove());
+		});
+	});
+
+	const initialGeneration = (
+		window.__CAP__ as { cleanCaptureGeneration?: number } | undefined
+	)?.cleanCaptureGeneration;
+	const revealGeneration =
+		initialGeneration === undefined
+			? commands.getCleanCaptureState().then((state) => state.generation)
+			: Promise.resolve(initialGeneration);
+	onMount(() => {
+		void revealGeneration.then((generation) =>
+			revealRecordingWindow(generation),
+		);
+	});
 
 	return (
 		<div

@@ -20,8 +20,6 @@ RUN pnpm run build:web
 FROM base AS runner
 WORKDIR /app
 
-RUN apk add --no-cache ffmpeg
-
 RUN addgroup -g 1001 -S nodejs
 RUN adduser -S nextjs -u 1001
 

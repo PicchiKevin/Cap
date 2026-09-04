@@ -47,9 +47,8 @@ export class Organisations extends Effect.Service<Organisations>()(
 					)
 					.pipe(
 						Effect.flatMap(EffectArray.get(0)),
-						Effect.catchTag(
-							"NoSuchElementException",
-							() => new Organisation.NotFoundError(),
+						Effect.catchTag("NoSuchElementException", () =>
+							Effect.fail(new Organisation.NotFoundError()),
 						),
 						Policy.withPolicy(policy.isAdminOrOwner(payload.id)),
 					);
@@ -87,9 +86,8 @@ export class Organisations extends Effect.Service<Organisations>()(
 					)
 					.pipe(
 						Effect.flatMap(EffectArray.get(0)),
-						Effect.catchTag(
-							"NoSuchElementException",
-							() => new Organisation.NotFoundError(),
+						Effect.catchTag("NoSuchElementException", () =>
+							Effect.fail(new Organisation.NotFoundError()),
 						),
 					);
 
@@ -251,6 +249,9 @@ export class Organisations extends Effect.Service<Organisations>()(
 						await tx
 							.delete(Db.organizationInvites)
 							.where(Dz.eq(Db.organizationInvites.organizationId, id));
+						await tx
+							.delete(Db.integrationInstallations)
+							.where(Dz.eq(Db.integrationInstallations.organizationId, id));
 						await tx
 							.delete(Db.organizationMembers)
 							.where(Dz.eq(Db.organizationMembers.organizationId, id));

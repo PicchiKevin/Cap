@@ -1,5 +1,9 @@
 import { Route, Router, useCurrentMatches } from "@solidjs/router";
-import { QueryClient, QueryClientProvider } from "@tanstack/solid-query";
+import {
+	focusManager,
+	QueryClient,
+	QueryClientProvider,
+} from "@tanstack/solid-query";
 import {
 	getCurrentWebviewWindow,
 	type WebviewWindow,
@@ -22,8 +26,8 @@ import "./styles/theme.css";
 import { CapErrorBoundary } from "./components/CapErrorBoundary";
 import WindowChromeLayout from "./routes/(window-chrome)";
 import SettingsLayout from "./routes/(window-chrome)/settings";
-import { generalSettingsStore } from "./store";
-import { initAnonymousUser } from "./utils/analytics";
+import { authStore, generalSettingsStore } from "./store";
+import { identifyUser, initAnonymousUser } from "./utils/analytics";
 import { type AppTheme, commands } from "./utils/tauri";
 import titlebar from "./utils/titlebar-state";
 
@@ -95,6 +99,7 @@ const TargetSelectOverlayPage = lazy(
 const WindowCaptureOccluderPage = lazy(
 	() => import("./routes/window-capture-occluder"),
 );
+const TeleprompterPage = lazy(() => import("./routes/teleprompter"));
 
 const queryClient = new QueryClient({
 	defaultOptions: {
@@ -123,9 +128,15 @@ export default function App() {
 function Inner() {
 	const currentWindow = getCurrentWebviewWindow();
 	createThemeListener(currentWindow);
+	createHiddenWindowQueryPause(currentWindow);
 
 	onMount(() => {
 		initAnonymousUser();
+		// OpenPanel keeps profileId in memory only (PostHog persisted it), so
+		// sign-in-time identify alone loses attribution after an app restart.
+		void authStore.get().then((auth) => {
+			if (auth?.user_id) identifyUser(auth.user_id);
+		});
 		prewarmFontCaches();
 	});
 
@@ -248,6 +259,11 @@ function Inner() {
 						path="/window-capture-occluder"
 						component={WindowCaptureOccluderPage}
 					/>
+					<Route
+						path="/teleprompter"
+						info={{ AUTO_SHOW_WINDOW: false }}
+						component={TeleprompterPage}
+					/>
 				</Router>
 			</CapErrorBoundary>
 		</>
@@ -275,6 +291,35 @@ function prewarmFontCaches() {
 
 	if ("requestIdleCallback" in window) requestIdleCallback(warm);
 	else setTimeout(warm, 250);
+}
+
+function createHiddenWindowQueryPause(currentWindow: WebviewWindow) {
+	if (currentWindow.label !== "main") return;
+
+	let focusGeneration = 0;
+
+	const unlisteners = [
+		currentWindow.listen("main-window-hidden", () => {
+			focusManager.setFocused(false);
+		}),
+		currentWindow.onFocusChanged((event) => {
+			focusGeneration += 1;
+			if (event.payload) {
+				focusManager.setFocused(undefined);
+				return;
+			}
+
+			const generation = focusGeneration;
+			void currentWindow.isVisible().then((visible) => {
+				if (visible || generation !== focusGeneration) return;
+				focusManager.setFocused(false);
+			});
+		}),
+	];
+
+	onCleanup(() => {
+		for (const unlisten of unlisteners) void unlisten.then((fn) => fn());
+	});
 }
 
 function createThemeListener(currentWindow: WebviewWindow) {
