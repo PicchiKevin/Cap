@@ -18,12 +18,10 @@ jobs:
         run: |
           JOURNAL_PATH="packages/database/migrations/meta/_journal.json"
 
-          # Get the journal from previous commit
-          git fetch origin
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
 
-          # Check if journal exists in previous commit
-          if git show 34cd664a1215:$JOURNAL_PATH > /dev/null 2>&1; then
-            git show 34cd664a1215:$JOURNAL_PATH > base.json
+          if git show "$BASE_SHA:$JOURNAL_PATH" > /dev/null 2>&1; then
+            git show "$BASE_SHA:$JOURNAL_PATH" > base.json
           else
             echo '{"version":"5","dialect":"mysql","entries":[]}' > base.json
           fi
