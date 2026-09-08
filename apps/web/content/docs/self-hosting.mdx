@@ -115,10 +115,24 @@ transcript translation, and docs Ask AI):
 
 ```bash
 ASSEMBLY_API_KEY=your-key    # Transcription
+DEEPGRAM_API_KEY=your-key
 GROQ_API_KEY=your-key        # AI features
 OPENAI_API_KEY=your-key      # AI features
 ANTHROPIC_API_KEY=your-key   # AI features
 ```
+
+Transcription works with either `ASSEMBLY_API_KEY` or `DEEPGRAM_API_KEY`.
+When both are set, AssemblyAI is used; failed requests do not switch providers.
+Deepgram uses Nova-3 with dominant-language detection for Auto-detect, matching
+previous Deepgram deployments. An explicit language setting is passed directly
+to Deepgram and must be supported by Nova-3. Auto-detect is not multilingual
+code-switching (`language=multi`). Deepgram transcripts are generated after
+recording; incremental live transcription still requires AssemblyAI.
+
+For Coolify, set either key as a runtime environment variable and redeploy the
+web container using an image built with this support. The compose file forwards
+both keys to `cap-web`; build-only variables do not enable transcription.
+Existing failed recordings can be retried from their share page after deployment.
 
 When `AI_PROVIDER` is not set, AI providers are auto-detected from whichever
 keys are present. Generation features (titles, summaries, chapters,

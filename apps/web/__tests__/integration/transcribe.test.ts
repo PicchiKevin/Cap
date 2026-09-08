@@ -85,8 +85,27 @@ describe("transcribeVideo", () => {
 		mockUpdateResult = [{ affectedRows: 1 }];
 	});
 
+	it("starts the workflow with only a Deepgram key", async () => {
+		const { serverEnv } = await import("@cap/env");
+		vi.mocked(serverEnv).mockReturnValueOnce({
+			DEEPGRAM_API_KEY: "deepgram-test",
+		} as ReturnType<typeof serverEnv>);
+		mockQueryResult = [
+			{
+				video: { id: "video-123", transcriptionStatus: null },
+				orgSettings: null,
+			},
+		];
+		const result = await transcribeVideo(
+			"video-123" as Video.VideoId,
+			"user-456",
+		);
+		expect(result.success).toBe(true);
+		expect(mockStart).toHaveBeenCalledOnce();
+	});
+
 	describe("input validation", () => {
-		it("requires ASSEMBLY_API_KEY environment variable", async () => {
+		it("requires a transcription provider API key", async () => {
 			const { serverEnv } = await import("@cap/env");
 			vi.mocked(serverEnv).mockReturnValueOnce({
 				ASSEMBLY_API_KEY: undefined,

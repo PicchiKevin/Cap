@@ -52,12 +52,12 @@ const state = vi.hoisted(() => ({
 	fakeAudioPath: "",
 }));
 
-vi.mock("@cap/env", () => ({
-	serverEnv: () => ({
-		ASSEMBLY_API_KEY: "test-assembly-api-key",
-		NEXTAUTH_SECRET: "test-secret-with-enough-entropy",
-	}),
+const env = vi.hoisted(() => ({
+	ASSEMBLY_API_KEY: "test-assembly-api-key" as string | undefined,
+	DEEPGRAM_API_KEY: undefined as string | undefined,
+	NEXTAUTH_SECRET: "test-secret-with-enough-entropy",
 }));
+vi.mock("@cap/env", () => ({ serverEnv: () => env }));
 
 vi.mock("@cap/database/schema", () => schemaMocks);
 
@@ -191,6 +191,8 @@ const manifest = {
 describe("transcribeVideoWorkflow earlyFromSegments", () => {
 	beforeEach(async () => {
 		mocks.updates.length = 0;
+		env.ASSEMBLY_API_KEY = "test-assembly-api-key";
+		env.DEEPGRAM_API_KEY = undefined;
 		state.editRows = [];
 		videoRow.duration = null;
 		videoRow.source = { type: "desktopSegments" };
@@ -229,6 +231,61 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 				};
 			}),
 		);
+	});
+
+	it("persists both artifacts with only Deepgram configured", async () => {
+		env.ASSEMBLY_API_KEY = undefined;
+		env.DEEPGRAM_API_KEY = "deepgram-test";
+		const audioFetch = vi.mocked(fetch).getMockImplementation();
+		vi.mocked(fetch).mockImplementation(async (...args) => {
+			if (String(args[0]).startsWith("https://api.deepgram.com/")) {
+				return Response.json({
+					metadata: { duration: 4 },
+					results: {
+						channels: [
+							{
+								detected_language: "en",
+								alternatives: [
+									{
+										transcript: "Hello!",
+										words: [
+											{
+												word: "hello",
+												punctuated_word: "Hello!",
+												start: 0.25,
+												end: 1.5,
+												confidence: 0.99,
+											},
+										],
+									},
+								],
+							},
+						],
+					},
+				});
+			}
+			if (!audioFetch) throw new Error("Missing audio fetch mock");
+			return audioFetch(...args);
+		});
+		const { transcribeVideoWorkflow } = await import("@/workflows/transcribe");
+		const result = await transcribeVideoWorkflow({
+			videoId: "video-123",
+			userId: "user-456",
+			aiGenerationEnabled: false,
+			earlyFromSegments: true,
+		});
+		expect(result.success).toBe(true);
+		expect(mocks.transcribe).not.toHaveBeenCalled();
+		const writes = new Map(
+			mocks.putObject.mock.calls.map((call) => [call[0], call[1]]),
+		);
+		expect(writes.get("user-456/video-123/transcription.vtt")).toContain(
+			"Hello!",
+		);
+		expect(writes.has("user-456/video-123/transcription.edit.v3.json")).toBe(
+			true,
+		);
+		expect(mocks.updates).toContainEqual({ transcriptionStatus: "COMPLETE" });
 	});
 
 	it("transcribes straight from segment audio before any mux exists", async () => {

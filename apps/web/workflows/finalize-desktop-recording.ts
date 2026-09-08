@@ -31,6 +31,7 @@ import {
 import type { RecordingVerification } from "@/lib/desktop-recording-verification";
 import { invalidateGoogleDriveStorageQuotaCache } from "@/lib/google-drive-storage-quota-cache";
 import { transcribeVideo } from "@/lib/transcribe";
+import { getTranscriptionProvider } from "@/lib/transcription-config";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
@@ -611,7 +612,7 @@ async function queueFinalizedRecordingTranscription(
 ): Promise<boolean> {
 	"use step";
 
-	if (!serverEnv().ASSEMBLY_API_KEY) return true;
+	if (!getTranscriptionProvider()) return true;
 	try {
 		const [[owner], [video]] = await Promise.all([
 			db()
