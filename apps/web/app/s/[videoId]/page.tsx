@@ -68,6 +68,7 @@ import {
 	SOCIAL_REFERRER_DOMAINS,
 } from "@/lib/social-crawlers";
 import { transcribeVideo } from "@/lib/transcribe";
+import { getTranscriptionProvider } from "@/lib/transcription-config";
 import { canRetryTranscription } from "@/lib/transcription-retry-permission";
 import { canUserDownloadVideo } from "@/lib/video-download-permissions";
 import {
@@ -823,7 +824,7 @@ async function AuthorizedContent({
 	const env = serverEnv();
 	const transcriptionGenerationAvailable =
 		!video.isScreenshot &&
-		Boolean(env.ASSEMBLY_API_KEY) &&
+		Boolean(getTranscriptionProvider(env)) &&
 		!rules.settings.disableTranscript;
 	const canRetryTranscriptionPermission = canRetryTranscription({
 		viewerId: user?.id,

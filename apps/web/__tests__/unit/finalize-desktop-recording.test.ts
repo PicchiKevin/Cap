@@ -255,6 +255,28 @@ beforeEach(() => {
 });
 
 describe("durable post-publication transcription enqueue", () => {
+	it.each(["new", "verified"])(
+		"queues final batch transcription for a %s recording with only Deepgram",
+		async (state) => {
+			withCurrent(
+				state === "verified" ? { state: "verified" } : { leaseExpiresAt: null },
+			);
+			mocks.env.mockReturnValue({
+				...mocks.env(),
+				ASSEMBLY_API_KEY: undefined,
+				DEEPGRAM_API_KEY: "deepgram-test",
+			});
+			await expect(
+				finalizeDesktopRecordingWorkflow({
+					videoId,
+					userId,
+					generation: fixture.generation,
+				}),
+			).resolves.toMatchObject({ success: true });
+			expect(mocks.transcribe).toHaveBeenCalledOnce();
+		},
+	);
+
 	it.each(["returned failure", "thrown failure"])(
 		"retries %s without creating another media attempt",
 		async (failure) => {
