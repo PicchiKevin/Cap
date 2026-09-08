@@ -730,7 +730,7 @@ async function extractAudioFromSegmentsImpl(
 			);
 
 			// The concatenated init + fragments form a valid fragmented MP4 that
-			// AssemblyAI ingests directly — no transcode, and no ffmpeg binary
+			// either provider ingests directly — no transcode, and no ffmpeg binary
 			// (which is not available in the serverless runtime). The temp object
 			// keeps the same key regardless of container so cleanupTempAudio's
 			// contract is untouched.
