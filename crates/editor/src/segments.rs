@@ -61,29 +61,57 @@ pub fn load_music_tracks(
             .or_insert((trim_start, trim_end));
     }
 
+    let mut missing = Vec::new();
     for (path, (source_start, source_end)) in ranges {
         if let Some(data) = cache.get(path)
             && data.covers_source_range(source_start, source_end)
         {
             result.insert(path.to_string(), Arc::clone(data));
-            continue;
+        } else {
+            missing.push((path, source_start, source_end));
         }
+    }
 
-        let resolved = resolve_music_path(project_path, path);
-        match AudioData::from_file_range(&resolved, source_start, source_end) {
-            Ok(data) => {
-                let data = Arc::new(data);
-                cache.insert(path.to_string(), Arc::clone(&data));
-                result.insert(path.to_string(), data);
+    let decode = |ranges: &[(&str, usize, usize)]| {
+        ranges
+            .iter()
+            .filter_map(|&(path, source_start, source_end)| {
+                let resolved = resolve_music_path(project_path, path);
+                match AudioData::from_file_range(&resolved, source_start, source_end) {
+                    Ok(data) => Some((path.to_string(), Arc::new(data))),
+                    Err(error) => {
+                        warn!(
+                            path = %resolved.display(),
+                            error,
+                            "Failed to load timeline audio track; skipping"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let decoded = if missing.len() < 2 {
+        decode(&missing)
+    } else {
+        std::thread::scope(|scope| {
+            let (left, right) = missing.split_at(missing.len().div_ceil(2));
+            match std::thread::Builder::new().spawn_scoped(scope, || decode(left)) {
+                Ok(worker) => {
+                    let mut decoded = decode(right);
+                    match worker.join() {
+                        Ok(other) => decoded.extend(other),
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    }
+                    decoded
+                }
+                Err(_) => decode(&missing),
             }
-            Err(error) => {
-                warn!(
-                    path = %resolved.display(),
-                    error,
-                    "Failed to load timeline audio track; skipping"
-                );
-            }
-        }
+        })
+    };
+    for (path, data) in decoded {
+        cache.insert(path.clone(), Arc::clone(&data));
+        result.insert(path, data);
     }
 
     result
@@ -105,7 +133,7 @@ pub fn load_music_tracks_uncached(
 async fn loaded_track(
     loader: &crate::AudioLoader,
     label: &str,
-) -> Option<Arc<cap_audio::AudioData>> {
+) -> Option<Arc<cap_audio::DecodedAudio>> {
     match loader.get().await {
         Ok(audio) => audio,
         Err(error) => {
@@ -122,36 +150,97 @@ pub async fn get_audio_segments(segments: &[SegmentMedia]) -> Vec<AudioSegment> 
         let audio = loaded_track(&s.audio, "mic audio").await;
         let system_audio = loaded_track(&s.system_audio, "system audio").await;
 
-        out.push(AudioSegment {
-            tracks: [
-                audio.map(|a| {
-                    AudioSegmentTrack::new(
-                        a,
-                        |c| c.mic_volume_db,
-                        |c| match c.mic_stereo_mode {
-                            cap_project::StereoMode::Stereo => cap_audio::StereoMode::Stereo,
-                            cap_project::StereoMode::MonoL => cap_audio::StereoMode::MonoL,
-                            cap_project::StereoMode::MonoR => cap_audio::StereoMode::MonoR,
-                        },
-                        |o| o.mic,
-                    )
-                    .with_timing_offset_secs(s.audio_timing_repair.mic_offset_secs)
-                }),
-                system_audio.map(|a| -> AudioSegmentTrack {
-                    AudioSegmentTrack::new(
-                        a,
-                        |c| c.system_volume_db,
-                        |_| cap_audio::StereoMode::Stereo,
-                        |o| o.system_audio,
-                    )
-                    .with_timing_offset_secs(s.audio_timing_repair.system_audio_offset_secs)
-                }),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>(),
-        });
+        out.push(audio_segment_from_decoded(
+            audio,
+            system_audio,
+            s.audio_timing_repair,
+        ));
     }
 
     out
+}
+
+pub fn audio_segment_from_decoded(
+    audio: Option<Arc<cap_audio::DecodedAudio>>,
+    system_audio: Option<Arc<cap_audio::DecodedAudio>>,
+    repair: crate::editor_instance::SegmentAudioTimingRepair,
+) -> AudioSegment {
+    AudioSegment {
+        tracks: [
+            audio.map(|a| {
+                AudioSegmentTrack::from_decoded(
+                    a,
+                    |c| c.mic_volume_db,
+                    |c| match c.mic_stereo_mode {
+                        cap_project::StereoMode::Stereo => cap_audio::StereoMode::Stereo,
+                        cap_project::StereoMode::MonoL => cap_audio::StereoMode::MonoL,
+                        cap_project::StereoMode::MonoR => cap_audio::StereoMode::MonoR,
+                    },
+                    |o| o.mic,
+                )
+                .with_microphone_enhancement()
+                .with_timing_offset_secs(repair.mic_offset_secs)
+            }),
+            system_audio.map(|a| -> AudioSegmentTrack {
+                AudioSegmentTrack::from_decoded(
+                    a,
+                    |c| c.system_volume_db,
+                    |_| cap_audio::StereoMode::Stereo,
+                    |o| o.system_audio,
+                )
+                .with_timing_offset_secs(repair.system_audio_offset_secs)
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>(),
+    }
+}
+
+#[cfg(test)]
+mod completed_audio_tests {
+    use super::*;
+    use cap_project::{AudioConfiguration, ClipOffsets};
+
+    #[test]
+    fn shared_audio_segment_preserves_arc_gain_stereo_and_timing() {
+        let audio = crate::completed_audio::tests::audio();
+        let repair = crate::SegmentAudioTimingRepair {
+            mic_offset_secs: -0.25,
+            system_audio_offset_secs: 0.125,
+        };
+        let segment = audio_segment_from_decoded(Some(audio.clone()), Some(audio.clone()), repair);
+        assert_eq!(segment.tracks.len(), 2);
+        for track in &segment.tracks {
+            assert!(Arc::ptr_eq(track.data(), &audio));
+        }
+        let config = AudioConfiguration {
+            mic_volume_db: -3.5,
+            system_volume_db: -8.0,
+            mic_stereo_mode: cap_project::StereoMode::MonoR,
+            ..Default::default()
+        };
+        let offsets = ClipOffsets {
+            mic: 0.5,
+            system_audio: -0.5,
+            ..Default::default()
+        };
+        assert_eq!(segment.tracks[0].gain(&config), -3.5);
+        assert_eq!(segment.tracks[1].gain(&config), -8.0);
+        assert!(matches!(
+            segment.tracks[0].stereo_mode(&config),
+            cap_audio::StereoMode::MonoR
+        ));
+        assert!(matches!(
+            segment.tracks[1].stereo_mode(&config),
+            cap_audio::StereoMode::Stereo
+        ));
+        assert_eq!(segment.tracks[0].offset(&offsets), 0.25);
+        assert_eq!(segment.tracks[1].offset(&offsets), -0.375);
+        assert!(
+            audio_segment_from_decoded(None, None, repair)
+                .tracks
+                .is_empty()
+        );
+    }
 }

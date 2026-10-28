@@ -6,13 +6,27 @@ import {
 } from "@cap/database/schema";
 import { Storage } from "@cap/web-backend";
 import { type User, Video } from "@cap/web-domain";
-import { and, asc, eq, inArray, isNull, lte, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	gte,
+	inArray,
+	isNull,
+	lte,
+	notLike,
+	or,
+	sql,
+} from "drizzle-orm";
 import { Effect, Option, Schema } from "effect";
 import {
+	DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED,
 	DesktopRecordingSourceBlockedError,
 	listRecoverableSegmentJobs,
 	SourceCommitPendingError,
 } from "@/lib/desktop-recording-jobs";
+import { readCompletedRecordingManifest } from "@/lib/desktop-recording-verification";
 import {
 	type DesktopSegmentsFinalizationStatus,
 	queueDesktopSegmentsFinalization,
@@ -23,6 +37,9 @@ import { decodeStorageVideo } from "@/lib/video-storage";
 
 export const DESKTOP_SEGMENTS_RECOVERY_MIN_AGE_MS = 60 * 60 * 1_000;
 export const DESKTOP_SEGMENTS_RECOVERY_BATCH_SIZE = 20;
+export const DESKTOP_SEGMENTS_LEGACY_RECOVERY_MAX_AGE_MS =
+	7 * 24 * 60 * 60 * 1_000;
+export const DESKTOP_SEGMENTS_LEGACY_NEWEST_BATCH_SIZE = 5;
 
 const RECOVERABLE_UPLOAD_PHASES = [
 	"uploading",
@@ -66,6 +83,7 @@ type LoadedDesktopSegmentsManifest =
 			status: "loaded";
 			video: typeof videos.$inferSelect;
 			manifest: Video.SegmentManifestType;
+			manifestJson: string;
 	  }
 	| { status: "already-finalized" }
 	| { status: "not-found" }
@@ -114,7 +132,7 @@ async function loadDesktopSegmentsManifest({
 		)
 			.pipe(Effect.mapError(getErrorMessage))
 			.pipe(runPromise);
-		return { status: "loaded", video, manifest };
+		return { status: "loaded", video, manifest, manifestJson: json };
 	} catch (error) {
 		return { status: "invalid-manifest", error: getErrorMessage(error) };
 	}
@@ -145,6 +163,11 @@ export async function completeDesktopSegmentsManifestAndQueue({
 		return { status: "manifest-changed" };
 	}
 	if (!loaded.manifest.is_complete) return { status: "source-incomplete" };
+	try {
+		readCompletedRecordingManifest(loaded.manifestJson);
+	} catch {
+		return { status: "source-incomplete" };
+	}
 	try {
 		const status = await queueDesktopSegmentsFinalization({
 			videoId,
@@ -232,32 +255,66 @@ export async function recoverStaleDesktopSegments({
 	const staleBefore = new Date(
 		now.getTime() - DESKTOP_SEGMENTS_RECOVERY_MIN_AGE_MS,
 	);
-	const legacy = await db()
-		.select({ videoId: videos.id, ownerId: videos.ownerId })
-		.from(videoUploads)
-		.innerJoin(videos, eq(videoUploads.videoId, videos.id))
-		.leftJoin(
-			videoProcessingJobs,
-			eq(videoUploads.videoId, videoProcessingJobs.videoId),
-		)
-		.where(
-			and(
-				inArray(videoUploads.phase, RECOVERABLE_UPLOAD_PHASES),
-				lte(videoUploads.updatedAt, staleBefore),
-				isNull(videoProcessingJobs.videoId),
-				sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.source}, '$.type')) = 'desktopSegments'`,
-			),
-		)
-		.orderBy(asc(videoUploads.updatedAt), asc(videoUploads.videoId))
-		.limit(remaining);
+	const listLegacy = (order: typeof asc, limit: number) =>
+		db()
+			.select({ videoId: videos.id, ownerId: videos.ownerId })
+			.from(videoUploads)
+			.innerJoin(videos, eq(videoUploads.videoId, videos.id))
+			.leftJoin(
+				videoProcessingJobs,
+				eq(videoUploads.videoId, videoProcessingJobs.videoId),
+			)
+			.where(
+				and(
+					inArray(videoUploads.phase, RECOVERABLE_UPLOAD_PHASES),
+					lte(videoUploads.updatedAt, staleBefore),
+					gte(
+						videoUploads.startedAt,
+						new Date(
+							now.getTime() - DESKTOP_SEGMENTS_LEGACY_RECOVERY_MAX_AGE_MS,
+						),
+					),
+					isNull(videoProcessingJobs.videoId),
+					or(
+						isNull(videoUploads.processingError),
+						notLike(
+							videoUploads.processingError,
+							`${DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED}:%`,
+						),
+					),
+					sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.source}, '$.type')) = 'desktopSegments'`,
+				),
+			)
+			.orderBy(order(videoUploads.updatedAt), order(videoUploads.videoId))
+			.limit(limit);
+	// Legacy rows that never finish keep their oldest `updatedAt`, so the
+	// oldest-first pass checks each recording only shortly before it leaves
+	// the window. That pass keeps every slot it had; a few of the newest
+	// eligible rows are checked on top, so a recording is first checked soon
+	// after it qualifies.
+	const oldest = await listLegacy(asc, remaining);
+	const picked = new Set(oldest.map((candidate) => candidate.videoId));
+	const newest = (
+		await listLegacy(desc, DESKTOP_SEGMENTS_LEGACY_NEWEST_BATCH_SIZE)
+	).filter((candidate) => !picked.has(candidate.videoId));
+	const legacy = [...oldest, ...newest];
 	for (const candidate of legacy) {
-		record(
-			candidate.videoId,
-			await recoverRecording({
+		try {
+			const result = await completeDesktopSegmentsManifestAndQueue({
 				videoId: candidate.videoId,
 				userId: candidate.ownerId,
-			}),
-		);
+			});
+			record(candidate.videoId, result.status);
+		} catch (error) {
+			console.error(
+				"[desktop-segments-recovery] Legacy source inspection failed",
+				{
+					videoId: candidate.videoId,
+					error,
+				},
+			);
+			record(candidate.videoId, "failed");
+		}
 	}
 	return summary;
 }

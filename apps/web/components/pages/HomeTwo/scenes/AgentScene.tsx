@@ -182,7 +182,7 @@ const Tool = ({
 			style={{ opacity: status === "idle" ? 0 : 1 }}
 		>
 			<span className="shrink-0">⎿</span>
-			<div className="min-w-0 flex-1">{children}</div>
+			<div className="min-w-0 flex-1 [overflow-wrap:anywhere]">{children}</div>
 		</div>
 	</div>
 );
@@ -362,8 +362,9 @@ export const AgentScene = (props: SceneProps) => {
 							}
 						>
 							<Json>
-								{"{"} <Key>"url"</Key>: <Str>"https://cap.so/s/x7f2k9"</Str>{" "}
-								{"}"}
+								{"{"} <Key>"type"</Key>: <Str>"uploaded"</Str>, <Key>"id"</Key>:{" "}
+								<Str>"x7f2k9"</Str>, <Key>"link"</Key>:{" "}
+								<Str>"https://cap.so/s/x7f2k9"</Str> {"}"}
 							</Json>
 						</Tool>
 						<Tool
@@ -395,7 +396,7 @@ export const AgentScene = (props: SceneProps) => {
 									Checkout bug repro
 								</span>
 								<span className="block text-[12px] text-[rgba(17,17,17,0.55)]">
-									cap.so/s/x7f2k9 · 0:20 · AI summary ready
+									Cap.so/s/x7f2k9 · 0:20 · AI summary ready
 								</span>
 							</span>
 						</div>
@@ -428,7 +429,7 @@ export const AgentScene = (props: SceneProps) => {
 								commentVisible={ui.comment}
 								videoRef={shareVideoRef}
 								title="Checkout bug repro"
-								url="cap.so/s/x7f2k9"
+								url="Cap.so/s/x7f2k9"
 								duration="0:20"
 							/>
 						</div>

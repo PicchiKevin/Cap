@@ -16,16 +16,22 @@ vi.mock("@cap/database/schema", () => ({
 		videoId: "upload.videoId",
 		phase: "upload.phase",
 		updatedAt: "upload.updatedAt",
+		startedAt: "upload.startedAt",
+		processingError: "upload.processingError",
 	},
 	videoProcessingJobs: { videoId: "job.videoId" },
 }));
 vi.mock("drizzle-orm", () => ({
 	and: (...args: unknown[]) => args,
-	asc: (value: unknown) => value,
+	or: (...args: unknown[]) => ({ or: args }),
+	notLike: (left: unknown, right: unknown) => ({ notLike: [left, right] }),
+	asc: (value: unknown) => ({ asc: value }),
+	desc: (value: unknown) => ({ desc: value }),
 	eq: (left: unknown, right: unknown) => ({ eq: [left, right] }),
 	inArray: (left: unknown, right: unknown) => ({ in: [left, right] }),
 	isNull: (value: unknown) => ({ null: value }),
 	lte: (left: unknown, right: unknown) => ({ lte: [left, right] }),
+	gte: (left: unknown, right: unknown) => ({ gte: [left, right] }),
 	sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({
 		strings: [...strings],
 		values,
@@ -49,6 +55,7 @@ vi.mock("@/lib/desktop-segments-finalization", () => ({
 }));
 vi.mock("@/lib/desktop-recording-jobs", () => ({
 	listRecoverableSegmentJobs: mocks.recoverable,
+	DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED: "source-reupload-required",
 	SourceCommitPendingError: class SourceCommitPendingError extends Error {},
 	DesktopRecordingSourceBlockedError: class DesktopRecordingSourceBlockedError extends Error {
 		constructor(
@@ -114,6 +121,28 @@ beforeEach(() => {
 });
 
 describe("committed source recovery", () => {
+	it.each([
+		{ video_segments: [2, 3] },
+		{ video_segments: [1, 3] },
+		{ audio_init_uploaded: true, audio_segments: [] },
+		{ audio_init_uploaded: false, audio_segments: [1] },
+		{ audio_init_uploaded: true, audio_segments: [1, 3] },
+	])(
+		"does not queue a completed manifest with missing source declarations: %j",
+		async (invalid) => {
+			mocks.get.mockReturnValue(
+				Effect.succeed(
+					Option.some(JSON.stringify({ ...manifest, ...invalid })),
+				),
+			);
+			expect(
+				await completeDesktopSegmentsManifestAndQueue({ videoId, userId }),
+			).toEqual({ status: "source-incomplete" });
+			expect(mocks.queue).not.toHaveBeenCalled();
+			expect(mocks.put).not.toHaveBeenCalled();
+		},
+	);
+
 	it("never marks an inactive but unfinished manifest complete", async () => {
 		const incomplete = { ...manifest, is_complete: false };
 		mocks.get.mockReturnValue(
@@ -159,6 +188,44 @@ describe("committed source recovery", () => {
 });
 
 describe("durable recovery scheduling", () => {
+	it("does not create a durable job for an unfinished legacy upload", async () => {
+		const now = new Date("2026-09-09T20:00:00Z");
+		const legacy = selectChain([{ videoId, ownerId: userId }]);
+		mocks.db
+			.mockReturnValueOnce(legacy)
+			.mockReturnValueOnce(legacy)
+			.mockReturnValue(selectChain([video]));
+		mocks.get.mockReturnValue(
+			Effect.succeed(
+				Option.some(JSON.stringify({ ...manifest, is_complete: false })),
+			),
+		);
+		const result = await recoverStaleDesktopSegments({ now });
+		expect(result.statuses).toEqual({ "source-incomplete": 1 });
+		expect(mocks.queue).not.toHaveBeenCalled();
+		expect(mocks.put).not.toHaveBeenCalled();
+		expect(JSON.stringify(legacy.where.mock.calls)).toContain(
+			"2026-09-02T20:00:00.000Z",
+		);
+	});
+
+	it("continues inspecting legacy uploads after a storage failure", async () => {
+		const legacy = selectChain([
+			{ videoId, ownerId: userId },
+			{ videoId: "second", ownerId: userId },
+		]);
+		mocks.db
+			.mockReturnValueOnce(legacy)
+			.mockReturnValueOnce(legacy)
+			.mockReturnValue(selectChain([video]));
+		mocks.get.mockReturnValueOnce(
+			Effect.fail(new Error("storage unavailable")),
+		);
+		const result = await recoverStaleDesktopSegments();
+		expect(result.statuses).toEqual({ failed: 1, queued: 1 });
+		expect(mocks.queue).toHaveBeenCalledTimes(1);
+	});
+
 	it("recovers old retry and expired processing jobs without a recording-age cutoff", async () => {
 		mocks.db.mockReturnValue(selectChain([]));
 		mocks.recoverable.mockResolvedValue([
@@ -192,14 +259,18 @@ describe("durable recovery scheduling", () => {
 
 	it("adopts stranded legacy processing rows without assuming their inventory is complete", async () => {
 		const chain = selectChain([{ videoId, ownerId: userId }]);
-		mocks.db.mockReturnValue(chain);
+		mocks.db
+			.mockReturnValueOnce(chain)
+			.mockReturnValueOnce(chain)
+			.mockReturnValue(selectChain([video]));
 		mocks.queue.mockRejectedValue(new SourceCommitPendingError());
 		const result = await recoverStaleDesktopSegments();
 		expect(result.statuses).toEqual({ "source-committing": 1 });
 		const query = JSON.stringify(chain.where.mock.calls);
 		expect(query).toContain('"processing"');
 		expect(query).not.toContain("28 HOUR");
-		expect(query).not.toContain("startedAt");
+		expect(query).toContain("startedAt");
+		expect(query).toContain("source-reupload-required:%");
 		expect(mocks.put).not.toHaveBeenCalled();
 	});
 
@@ -231,7 +302,10 @@ describe("durable recovery scheduling", () => {
 				ownerId: userId,
 			})),
 		);
-		mocks.db.mockReturnValue(legacy);
+		mocks.db
+			.mockReturnValueOnce(legacy)
+			.mockReturnValueOnce(legacy)
+			.mockReturnValue(selectChain([video]));
 		const result = await recoverStaleDesktopSegments();
 		expect(mocks.recoverable).toHaveBeenCalledWith(
 			expect.objectContaining({ limit: 15 }),
@@ -241,5 +315,199 @@ describe("durable recovery scheduling", () => {
 		expect(
 			result.results.filter((entry) => entry.videoId.startsWith("legacy-")),
 		).toHaveLength(5);
+	});
+});
+
+describe("legacy recovery order", () => {
+	it("keeps every oldest-first slot and checks the newest eligible rows on top", async () => {
+		const oldest = selectChain([
+			{ videoId: "oldest", ownerId: userId },
+			{ videoId: "both", ownerId: userId },
+		]);
+		const newest = selectChain([
+			{ videoId: "newest", ownerId: userId },
+			{ videoId: "both", ownerId: userId },
+		]);
+		mocks.db
+			.mockReturnValueOnce(oldest)
+			.mockReturnValueOnce(newest)
+			.mockReturnValue(selectChain([video]));
+		mocks.get.mockReturnValue(Effect.succeed(Option.none()));
+		const result = await recoverStaleDesktopSegments();
+		expect(result.results.map((entry) => entry.videoId)).toEqual([
+			"oldest",
+			"both",
+			"newest",
+		]);
+		expect(result.statuses).toEqual({ "missing-manifest": 3 });
+		expect(oldest.orderBy).toHaveBeenCalledWith(
+			{ asc: "upload.updatedAt" },
+			{ asc: "upload.videoId" },
+		);
+		expect(oldest.limit).toHaveBeenCalledWith(20);
+		expect(newest.orderBy).toHaveBeenCalledWith(
+			{ desc: "upload.updatedAt" },
+			{ desc: "upload.videoId" },
+		);
+		expect(newest.limit).toHaveBeenCalledWith(5);
+	});
+
+	type Row = { videoId: string; startedAt: number };
+	const minute = 60_000;
+	const day = 24 * 60 * minute;
+
+	/// Runs the cron every 15 minutes over `rows`, which never change, the way
+	/// an empty cap's upload row never does. Rows whose manifest is finished
+	/// are queued once checked and then leave the legacy pass.
+	async function simulate({
+		rows,
+		finished,
+		from,
+		to,
+		durableJobs,
+	}: {
+		rows: Row[];
+		finished: Set<string>;
+		from: number;
+		to: number;
+		durableJobs: number;
+	}) {
+		const queued = new Set<string>();
+		let now = from;
+		const eligible = () =>
+			rows.filter(
+				(row) =>
+					!queued.has(row.videoId) &&
+					row.startedAt <= now - 60 * minute &&
+					row.startedAt >= now - 7 * day,
+			);
+		mocks.recoverable.mockImplementation(async ({ limit }) =>
+			Array.from({ length: Math.min(limit, durableJobs) }, (_, index) => ({
+				videoId: `durable-${index}`,
+				ownerId: userId,
+				verification: null,
+			})),
+		);
+		mocks.db.mockImplementation(() => {
+			const state: { joined: boolean; order?: unknown; where?: unknown } = {
+				joined: false,
+			};
+			const chain = {
+				select: () => chain,
+				from: () => chain,
+				innerJoin: () => {
+					state.joined = true;
+					return chain;
+				},
+				leftJoin: () => chain,
+				where: (where: unknown) => {
+					state.where = where;
+					return chain;
+				},
+				orderBy: (order: unknown) => {
+					state.order = order;
+					return chain;
+				},
+				limit: async (limit: number) => {
+					if (!state.joined) {
+						const id = (state.where as Array<{ eq?: [string, string] }>).find(
+							(part) => part?.eq?.[0] === "video.id",
+						)?.eq?.[1];
+						return [{ ...video, id }];
+					}
+					const descending = "desc" in (state.order as object);
+					return eligible()
+						.sort((a, b) =>
+							descending
+								? b.startedAt - a.startedAt ||
+									b.videoId.localeCompare(a.videoId)
+								: a.startedAt - b.startedAt ||
+									a.videoId.localeCompare(b.videoId),
+						)
+						.slice(0, limit)
+						.map((row) => ({ videoId: row.videoId, ownerId: userId }));
+				},
+			};
+			return chain;
+		});
+		mocks.get.mockImplementation((key: string) => {
+			const id = key.split("/")[1] ?? "";
+			return Effect.succeed(
+				finished.has(id)
+					? Option.some(JSON.stringify(manifest))
+					: Option.none(),
+			);
+		});
+		mocks.queue.mockImplementation(async ({ videoId: id }) => {
+			if (!id.startsWith("durable-")) queued.add(id);
+			return "queued";
+		});
+		const checkedAt = new Map<string, number>();
+		for (; now <= to; now += 15 * minute) {
+			const result = await recoverStaleDesktopSegments({ now: new Date(now) });
+			for (const entry of result.results) {
+				if (!checkedAt.has(entry.videoId)) checkedAt.set(entry.videoId, now);
+			}
+		}
+		return { queued, checkedAt };
+	}
+
+	function emptyCaps(from: number, to: number) {
+		const rows: Row[] = [];
+		for (let at = from; at < to; at += 15 * minute) {
+			rows.push({ videoId: `empty-${at}`, startedAt: at });
+		}
+		return rows;
+	}
+
+	it("reaches a stuck recording behind a week of empty caps soon after it qualifies, and still checks every row before it ages out", async () => {
+		const start = new Date("2026-10-01T00:00:00Z").getTime();
+		const end = start + day;
+		const rows = emptyCaps(start - 8 * day, end);
+		const stuck = { videoId: "stuck", startedAt: start + 3 * 60 * minute };
+		rows.push(stuck);
+		const { queued, checkedAt } = await simulate({
+			rows,
+			finished: new Set(["stuck"]),
+			from: start,
+			to: end,
+			durableJobs: 0,
+		});
+		expect(queued.has("stuck")).toBe(true);
+		expect(
+			(checkedAt.get("stuck") ?? Number.POSITIVE_INFINITY) -
+				(stuck.startedAt + 60 * minute),
+		).toBeLessThanOrEqual(15 * minute);
+		const agedOut = rows.filter(
+			(row) =>
+				row.startedAt >= start - 7 * day && row.startedAt < end - 7 * day,
+		);
+		expect(agedOut.length).toBeGreaterThan(0);
+		for (const row of agedOut) expect(checkedAt.has(row.videoId)).toBe(true);
+		for (const row of rows) {
+			const qualified = row.startedAt + 60 * minute;
+			if (qualified < start || qualified > end - 15 * minute) continue;
+			expect(
+				(checkedAt.get(row.videoId) ?? Number.POSITIVE_INFINITY) - qualified,
+			).toBeLessThanOrEqual(15 * minute);
+		}
+	});
+
+	it("still reaches a finished recording in a burst while durable retries fill their budget", async () => {
+		const start = new Date("2026-10-01T00:00:00Z").getTime();
+		const burstAt = start - 2 * day;
+		const rows = emptyCaps(start - 8 * day, start + 6 * day);
+		for (let index = 0; index < 4; index++) {
+			rows.push({ videoId: `burst-empty-${index}`, startedAt: burstAt });
+		}
+		rows.push({ videoId: "burst-finished", startedAt: burstAt });
+		const { queued } = await simulate({
+			rows,
+			finished: new Set(["burst-finished"]),
+			from: start,
+			to: start + 6 * day,
+			durableJobs: 100,
+		});
+		expect(queued.has("burst-finished")).toBe(true);
 	});
 });

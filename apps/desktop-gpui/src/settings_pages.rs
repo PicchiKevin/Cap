@@ -20,6 +20,7 @@ use std::{
     time::Duration,
 };
 
+use cap_cli_install as cli_install;
 use gpui::{
     AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement,
     MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
@@ -30,6 +31,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     diagnostics,
+    i18n::tr,
     settings_window::{MenuKind, Page, SettingsWindow},
     store::{
         self, Action, AutomationExportCompression, AutomationRecordingMode, AutomationRule,
@@ -49,6 +51,10 @@ const MONO_FONT: &str = if cfg!(target_os = "macos") {
 } else {
     "monospace"
 };
+
+/// Stands in for an inline element inside a translated sentence, so the
+/// sentence can be split around it without assuming where the language puts it.
+const COMMAND_MARKER: &str = "\u{1}";
 
 // ---------------------------------------------------------------------------
 // State
@@ -189,11 +195,15 @@ struct DriveQuota {
     stale: bool,
 }
 
-/// hotkeys.tsx's `listening` signal: which action is armed, and the binding
-/// to restore when the capture is abandoned.
 struct ListeningHotkey {
-    action: usize,
-    prev: Option<Value>,
+    action: &'static str,
+    modifiers: gpui::Modifiers,
+    error: Option<fn() -> &'static str>,
+}
+
+struct SavedShortcut {
+    action: &'static str,
+    moved_from: Option<&'static str>,
 }
 
 /// The S3 form's five text fields, in render order.
@@ -206,20 +216,23 @@ const S3_REGION: usize = 4;
 /// `DEFAULT_CONFIG` in s3-config.tsx, indexed like the fields above.
 const S3_DEFAULTS: [&str; 5] = ["", "", "https://s3.amazonaws.com", "", "us-east-1"];
 
-const S3_FIELDS: [(&str, &str); 5] = [
-    ("Access Key ID", "PL31OADSQNK"),
-    ("Secret Access Key", "PL31OADSQNK"),
-    ("Endpoint", "https://s3.amazonaws.com"),
-    ("Bucket Name", "my-bucket"),
-    ("Region", "us-east-1"),
+const S3_FIELDS: [(fn() -> &'static str, &str); 5] = [
+    (tr::settings::integrations::s3::access_key, "PL31OADSQNK"),
+    (tr::settings::integrations::s3::secret_key, "PL31OADSQNK"),
+    (
+        tr::settings::integrations::s3::endpoint,
+        "https://s3.amazonaws.com",
+    ),
+    (tr::settings::integrations::s3::bucket, "my-bucket"),
+    (tr::settings::integrations::s3::region, "us-east-1"),
 ];
 
-const S3_PROVIDERS: [(&str, &str); 5] = [
-    ("aws", "AWS S3"),
-    ("cloudflare", "Cloudflare R2"),
-    ("supabase", "Supabase"),
-    ("minio", "MinIO"),
-    ("other", "Other S3-Compatible"),
+const S3_PROVIDERS: [(&str, fn() -> &'static str); 5] = [
+    ("aws", || "AWS S3"),
+    ("cloudflare", || "Cloudflare R2"),
+    ("supabase", || "Supabase"),
+    ("minio", || "MinIO"),
+    ("other", tr::settings::integrations::s3::other_provider),
 ];
 
 struct S3Page {
@@ -285,6 +298,9 @@ pub(crate) struct PagesState {
     // Shortcuts (hotkeys.tsx)
     hotkeys: Map<String, Value>,
     listening: Option<ListeningHotkey>,
+    shortcut_saved: Option<SavedShortcut>,
+    shortcut_saved_reset: Option<gpui::Task<()>>,
+    shortcut_blocked: Option<&'static str>,
 
     // CLI (cli.tsx). `None` while the status fetch is in flight.
     cli_status: Option<Result<cli_install::CliInstallStatus, String>>,
@@ -335,9 +351,6 @@ pub(crate) struct PagesState {
     // License (license.tsx)
     license_input: Entity<ui::TextInputState>,
     license_draft: String,
-    /// `isCommercialAnnual`, default true.
-    license_annual: bool,
-    license_checkout_pending: bool,
     license_activating: bool,
     license_error: Option<String>,
 
@@ -347,7 +360,7 @@ pub(crate) struct PagesState {
     s3: S3Page,
     gdrive: GDrivePage,
 
-    // Experimental (experimental.tsx). The Native app row's hand-back takes the
+    // Experimental (experimental.tsx). The Developer section's hand-back takes the
     // whole settings window over, so its clock and the ticker that repaints the
     // sequence live here and the overlay renders from the window root.
     switch_back: Option<SwitchBack>,
@@ -366,21 +379,9 @@ pub(crate) struct PagesState {
 
 impl PagesState {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<SettingsWindow>) -> Self {
-        let hint_input = cx.new(|cx| {
-            let mut input = ui::TextInputState::single_line(window, cx);
-            input.set_placeholder("Add a term");
-            input
-        });
-        let feedback_input = cx.new(|cx| {
-            let mut input = ui::TextInputState::multi_line(window, cx);
-            input.set_placeholder("Tell us what you think about Cap...");
-            input
-        });
-        let license_input = cx.new(|cx| {
-            let mut input = ui::TextInputState::single_line(window, cx);
-            input.set_placeholder("License key");
-            input
-        });
+        let hint_input = cx.new(|cx| ui::TextInputState::single_line(window, cx));
+        let feedback_input = cx.new(|cx| ui::TextInputState::multi_line(window, cx));
+        let license_input = cx.new(|cx| ui::TextInputState::single_line(window, cx));
         let s3_inputs = std::array::from_fn(|index| {
             cx.new(|cx| {
                 let mut input = ui::TextInputState::single_line(window, cx);
@@ -406,10 +407,20 @@ impl PagesState {
                 this.page_field_event(PageField::S3(index), input, event, cx)
             }));
         }
+        // Keys stop arriving once the window loses focus, so a recording row
+        // would otherwise keep every global shortcut paused.
+        subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.shortcuts_cancel(cx);
+            }
+        }));
 
         Self {
             hotkeys: store::hotkeys_raw(),
             listening: None,
+            shortcut_saved: None,
+            shortcut_saved_reset: None,
+            shortcut_blocked: None,
             cli_status: None,
             cli_installing: false,
             cli_uninstalling: false,
@@ -437,8 +448,6 @@ impl PagesState {
             changelog: None,
             license_input,
             license_draft: String::new(),
-            license_annual: true,
-            license_checkout_pending: false,
             license_activating: false,
             license_error: None,
             integrations_view: IntegrationsView::Index,
@@ -490,7 +499,9 @@ impl SettingsWindow {
         match self.page {
             Page::Shortcuts => {
                 self.pages.hotkeys = store::hotkeys_raw();
-                self.pages.listening = None;
+                self.pages.shortcut_saved = None;
+                self.pages.shortcut_saved_reset = None;
+                self.pages.shortcut_blocked = None;
             }
             Page::Cli => self.cli_refresh(window, cx),
             Page::Transcription => {
@@ -511,8 +522,6 @@ impl SettingsWindow {
             Page::Changelog => self.changelog_fetch(window, cx),
             Page::License => {
                 self.pages.license_draft.clear();
-                self.pages.license_annual = true;
-                self.pages.license_checkout_pending = false;
                 self.pages.license_activating = false;
                 self.pages.license_error = None;
                 let input = self.pages.license_input.clone();
@@ -567,7 +576,7 @@ impl SettingsWindow {
         match kind {
             MenuKind::S3Provider => S3_PROVIDERS
                 .iter()
-                .map(|(value, label)| ui::MenuItem::new(*label, *value == self.pages.s3.provider))
+                .map(|(value, label)| ui::MenuItem::new(label(), *value == self.pages.s3.provider))
                 .collect(),
             MenuKind::AutomationTrigger(rule) => {
                 let current = self.rule_at(rule).map(|rule| rule.trigger);
@@ -580,10 +589,13 @@ impl SettingsWindow {
             }
             MenuKind::AutomationMatchMode(rule) => {
                 let current = self.rule_at(rule).map(|rule| rule.match_mode);
-                [(MatchMode::All, "Match all"), (MatchMode::Any, "Match any")]
-                    .iter()
-                    .map(|(mode, label)| ui::MenuItem::new(*label, Some(*mode) == current))
-                    .collect()
+                [
+                    (MatchMode::All, tr::settings::automations::match_all()),
+                    (MatchMode::Any, tr::settings::automations::match_any()),
+                ]
+                .iter()
+                .map(|(mode, label)| ui::MenuItem::new(*label, Some(*mode) == current))
+                .collect()
             }
             MenuKind::AutomationConditionType(rule, index) => {
                 let current = self
@@ -605,7 +617,7 @@ impl SettingsWindow {
                 };
                 CAPTURE_TARGETS
                     .iter()
-                    .map(|(target, label)| ui::MenuItem::new(*label, Some(*target) == current))
+                    .map(|(target, label)| ui::MenuItem::new(label(), Some(*target) == current))
                     .collect()
             }
             MenuKind::AutomationConditionMode(rule, index) => {
@@ -638,7 +650,7 @@ impl SettingsWindow {
                 };
                 CLIPBOARD_SOURCES
                     .iter()
-                    .map(|(source, label)| ui::MenuItem::new(*label, Some(*source) == current))
+                    .map(|(source, label)| ui::MenuItem::new(label(), Some(*source) == current))
                     .collect()
             }
             MenuKind::AutomationWebhookMethod(rule, index) => {
@@ -686,7 +698,7 @@ impl SettingsWindow {
                     .unwrap_or(AutomationExportCompression::Web);
                 COMPRESSIONS
                     .iter()
-                    .map(|(compression, label)| ui::MenuItem::new(*label, *compression == current))
+                    .map(|(compression, label)| ui::MenuItem::new(label(), *compression == current))
                     .collect()
             }
             MenuKind::AutomationPreset(rule, index) => {
@@ -883,7 +895,13 @@ impl SettingsWindow {
 
     /// `commands.globalMessageDialog(..)`.
     fn info_dialog(&mut self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let answer = window.prompt(gpui::PromptLevel::Info, message, None, &["Ok"], cx);
+        let answer = window.prompt(
+            gpui::PromptLevel::Info,
+            message,
+            None,
+            &[tr::settings::prompt::ok()],
+            cx,
+        );
         cx.spawn(async move |_this, _cx| {
             let _ = answer.await;
         })
@@ -916,23 +934,315 @@ impl SettingsWindow {
 }
 
 // ---------------------------------------------------------------------------
-// Shortcuts (hotkeys.tsx)
+// Shortcuts
 // ---------------------------------------------------------------------------
 
-/// `actions()` in hotkeys.tsx, with `ACTION_TEXT`'s labels, in render order.
-const HOTKEY_ACTIONS: [(&str, &str); 11] = [
-    ("screenshotDisplay", "Screenshot current display"),
-    ("screenshotWindow", "Screenshot current window"),
-    ("screenshotArea", "Screenshot area picker"),
-    ("openRecordingPicker", "Open recording picker"),
-    ("stopRecording", "Stop recording"),
-    ("restartRecording", "Restart recording"),
-    ("togglePauseRecording", "Pause/resume recording"),
-    ("cycleRecordingMode", "Cycle recording mode"),
-    ("openRecordingPickerDisplay", "Record display"),
-    ("openRecordingPickerWindow", "Record window"),
-    ("openRecordingPickerArea", "Record area"),
+const SCREENSHOT_SHORTCUTS: [&str; 3] = ["screenshotArea", "screenshotWindow", "screenshotDisplay"];
+
+const RECORDING_SHORTCUTS: [&str; 7] = [
+    "startStudioRecording",
+    "startInstantRecording",
+    "openRecordingPickerArea",
+    "openRecordingPickerWindow",
+    "openRecordingPickerDisplay",
+    "openRecordingPicker",
+    "cycleRecordingMode",
 ];
+
+const WHILE_RECORDING_SHORTCUTS: [&str; 3] =
+    ["stopRecording", "togglePauseRecording", "restartRecording"];
+
+const SHORTCUT_SAVED_NOTICE: std::time::Duration = std::time::Duration::from_secs(6);
+
+#[derive(Clone, Copy)]
+struct OutcomeOption {
+    icon: &'static str,
+    label: fn() -> &'static str,
+    hint: fn() -> &'static str,
+}
+
+const SCREENSHOT_OUTCOMES: [(store::PostScreenshotBehaviour, OutcomeOption); 4] = [
+    (
+        store::PostScreenshotBehaviour::OpenEditor,
+        OutcomeOption {
+            icon: "icons/edit.svg",
+            label: tr::settings::shortcuts::outcome::screenshot_open_editor,
+            hint: tr::settings::shortcuts::outcome::screenshot_open_editor_hint,
+        },
+    ),
+    (
+        store::PostScreenshotBehaviour::Copy,
+        OutcomeOption {
+            icon: "icons/copy.svg",
+            label: tr::settings::shortcuts::outcome::screenshot_copy,
+            hint: tr::settings::shortcuts::outcome::screenshot_copy_hint,
+        },
+    ),
+    (
+        store::PostScreenshotBehaviour::CopyAndOpenEditor,
+        OutcomeOption {
+            icon: "icons/layers.svg",
+            label: tr::settings::shortcuts::outcome::screenshot_copy_and_edit,
+            hint: tr::settings::shortcuts::outcome::screenshot_copy_and_edit_hint,
+        },
+    ),
+    (
+        store::PostScreenshotBehaviour::Save,
+        OutcomeOption {
+            icon: "icons/folder-down.svg",
+            label: tr::settings::shortcuts::outcome::screenshot_do_nothing,
+            hint: tr::settings::shortcuts::outcome::saved_to_library,
+        },
+    ),
+];
+
+const STUDIO_OUTCOMES: [(store::PostStudioBehaviour, OutcomeOption); 3] = [
+    (
+        store::PostStudioBehaviour::OpenEditor,
+        OutcomeOption {
+            icon: "icons/edit.svg",
+            label: tr::settings::shortcuts::outcome::studio_open_editor,
+            hint: tr::settings::shortcuts::outcome::studio_open_editor_hint,
+        },
+    ),
+    (
+        store::PostStudioBehaviour::ShowOverlay,
+        OutcomeOption {
+            icon: "icons/app-window.svg",
+            label: tr::settings::shortcuts::outcome::studio_show_cap,
+            hint: tr::settings::shortcuts::outcome::studio_show_cap_hint,
+        },
+    ),
+    (
+        store::PostStudioBehaviour::DoNothing,
+        OutcomeOption {
+            icon: "icons/folder-down.svg",
+            label: tr::settings::shortcuts::outcome::studio_do_nothing,
+            hint: tr::settings::shortcuts::outcome::saved_to_library,
+        },
+    ),
+];
+
+/// [`store::PostInstantBehaviour`], phrased as what an Instant recording does.
+const INSTANT_OUTCOMES: [(store::PostInstantBehaviour, OutcomeOption); 3] = [
+    (
+        store::PostInstantBehaviour::OpenLink,
+        OutcomeOption {
+            icon: "icons/globe.svg",
+            label: tr::settings::shortcuts::outcome::instant_open_link,
+            hint: tr::settings::shortcuts::outcome::instant_open_link_hint,
+        },
+    ),
+    (
+        store::PostInstantBehaviour::ShowCap,
+        OutcomeOption {
+            icon: "icons/app-window.svg",
+            label: tr::settings::shortcuts::outcome::instant_show_cap,
+            hint: tr::settings::shortcuts::outcome::instant_show_cap_hint,
+        },
+    ),
+    (
+        store::PostInstantBehaviour::CopyLink,
+        OutcomeOption {
+            icon: "icons/link.svg",
+            label: tr::settings::shortcuts::outcome::instant_copy_link,
+            hint: tr::settings::shortcuts::outcome::instant_copy_link_hint,
+        },
+    ),
+];
+
+fn shortcut_label(action: &str) -> &'static str {
+    match action {
+        "screenshotArea" => tr::settings::shortcuts::label::screenshot_area(),
+        "screenshotWindow" => tr::settings::shortcuts::label::screenshot_window(),
+        "screenshotDisplay" => tr::settings::shortcuts::label::screenshot_display(),
+        "startStudioRecording" => tr::settings::shortcuts::label::start_studio(),
+        "startInstantRecording" => tr::settings::shortcuts::label::start_instant(),
+        "openRecordingPickerArea" => tr::settings::shortcuts::label::record_area(),
+        "openRecordingPickerWindow" => tr::settings::shortcuts::label::record_window(),
+        "openRecordingPickerDisplay" => tr::settings::shortcuts::label::record_display(),
+        "openRecordingPicker" => tr::settings::shortcuts::label::open_picker(),
+        "cycleRecordingMode" => tr::settings::shortcuts::label::cycle_mode(),
+        "stopRecording" => tr::settings::shortcuts::label::stop(),
+        "togglePauseRecording" => tr::settings::shortcuts::label::pause(),
+        "restartRecording" => tr::settings::shortcuts::label::restart(),
+        _ => tr::settings::shortcuts::label::fallback(),
+    }
+}
+
+/// What pressing a shortcut does. Languages word the two uses differently,
+/// so each effect is a pair of whole messages rather than one phrase that is
+/// capitalized for the description.
+#[derive(Clone, Copy)]
+struct ShortcutEffect {
+    /// Completes "Saved. Press ⌘⇧4 in any app to ...".
+    phrase: fn() -> &'static str,
+    /// The row's description.
+    sentence: fn() -> &'static str,
+}
+
+/// What pressing the shortcut does. It follows the after-capture settings
+/// and the current mode, so the row always describes what will actually
+/// happen.
+fn shortcut_effect(
+    action: &str,
+    settings: &store::GeneralSettings,
+    mode: crate::main_window::Mode,
+) -> Option<ShortcutEffect> {
+    use crate::main_window::Mode;
+    use store::{PostScreenshotBehaviour as Shot, PostStudioBehaviour as Studio};
+
+    let shot = settings.post_screenshot_behaviour;
+    let effect = match action {
+        "screenshotArea" => match shot {
+            Shot::OpenEditor => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_area_open_editor,
+                sentence: tr::settings::shortcuts::sentence::screenshot_area_open_editor,
+            },
+            Shot::Copy => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_area_copy,
+                sentence: tr::settings::shortcuts::sentence::screenshot_area_copy,
+            },
+            Shot::CopyAndOpenEditor => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_area_copy_and_open_editor,
+                sentence: tr::settings::shortcuts::sentence::screenshot_area_copy_and_open_editor,
+            },
+            Shot::Save => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_area_save,
+                sentence: tr::settings::shortcuts::sentence::screenshot_area_save,
+            },
+        },
+        "screenshotWindow" => match shot {
+            Shot::OpenEditor => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_window_open_editor,
+                sentence: tr::settings::shortcuts::sentence::screenshot_window_open_editor,
+            },
+            Shot::Copy => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_window_copy,
+                sentence: tr::settings::shortcuts::sentence::screenshot_window_copy,
+            },
+            Shot::CopyAndOpenEditor => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_window_copy_and_open_editor,
+                sentence: tr::settings::shortcuts::sentence::screenshot_window_copy_and_open_editor,
+            },
+            Shot::Save => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_window_save,
+                sentence: tr::settings::shortcuts::sentence::screenshot_window_save,
+            },
+        },
+        "screenshotDisplay" => match shot {
+            Shot::OpenEditor => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_display_open_editor,
+                sentence: tr::settings::shortcuts::sentence::screenshot_display_open_editor,
+            },
+            Shot::Copy => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_display_copy,
+                sentence: tr::settings::shortcuts::sentence::screenshot_display_copy,
+            },
+            Shot::CopyAndOpenEditor => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_display_copy_and_open_editor,
+                sentence:
+                    tr::settings::shortcuts::sentence::screenshot_display_copy_and_open_editor,
+            },
+            Shot::Save => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::screenshot_display_save,
+                sentence: tr::settings::shortcuts::sentence::screenshot_display_save,
+            },
+        },
+        "startStudioRecording" => match settings.post_studio_recording_behaviour {
+            Studio::OpenEditor => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::studio_open_editor,
+                sentence: tr::settings::shortcuts::sentence::studio_open_editor,
+            },
+            Studio::ShowOverlay | Studio::DoNothing => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::studio,
+                sentence: tr::settings::shortcuts::sentence::studio,
+            },
+        },
+        "startInstantRecording" => {
+            if settings.disable_auto_open_links {
+                ShortcutEffect {
+                    phrase: tr::settings::shortcuts::effect::instant_copy,
+                    sentence: tr::settings::shortcuts::sentence::instant_copy,
+                }
+            } else {
+                ShortcutEffect {
+                    phrase: tr::settings::shortcuts::effect::instant_copy_and_open,
+                    sentence: tr::settings::shortcuts::sentence::instant_copy_and_open,
+                }
+            }
+        }
+        "openRecordingPickerArea" => match mode {
+            Mode::Studio => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::picker_area_studio,
+                sentence: tr::settings::shortcuts::sentence::picker_area_studio,
+            },
+            Mode::Instant => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::picker_area_instant,
+                sentence: tr::settings::shortcuts::sentence::picker_area_instant,
+            },
+            Mode::Screenshot => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::picker_area_screenshot,
+                sentence: tr::settings::shortcuts::sentence::picker_area_screenshot,
+            },
+        },
+        "openRecordingPickerWindow" => match mode {
+            Mode::Studio => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::picker_window_studio,
+                sentence: tr::settings::shortcuts::sentence::picker_window_studio,
+            },
+            Mode::Instant => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::picker_window_instant,
+                sentence: tr::settings::shortcuts::sentence::picker_window_instant,
+            },
+            Mode::Screenshot => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::picker_window_screenshot,
+                sentence: tr::settings::shortcuts::sentence::picker_window_screenshot,
+            },
+        },
+        "openRecordingPickerDisplay" => match mode {
+            Mode::Studio => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::picker_display_studio,
+                sentence: tr::settings::shortcuts::sentence::picker_display_studio,
+            },
+            Mode::Instant => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::picker_display_instant,
+                sentence: tr::settings::shortcuts::sentence::picker_display_instant,
+            },
+            Mode::Screenshot => ShortcutEffect {
+                phrase: tr::settings::shortcuts::effect::picker_display_screenshot,
+                sentence: tr::settings::shortcuts::sentence::picker_display_screenshot,
+            },
+        },
+        "openRecordingPicker" => ShortcutEffect {
+            phrase: tr::settings::shortcuts::effect::open_picker,
+            sentence: tr::settings::shortcuts::sentence::open_picker,
+        },
+        "cycleRecordingMode" => ShortcutEffect {
+            phrase: tr::settings::shortcuts::effect::cycle_mode,
+            sentence: tr::settings::shortcuts::sentence::cycle_mode,
+        },
+        "stopRecording" => ShortcutEffect {
+            phrase: tr::settings::shortcuts::effect::stop,
+            sentence: tr::settings::shortcuts::sentence::stop,
+        },
+        "togglePauseRecording" => ShortcutEffect {
+            phrase: tr::settings::shortcuts::effect::pause,
+            sentence: tr::settings::shortcuts::sentence::pause,
+        },
+        "restartRecording" => ShortcutEffect {
+            phrase: tr::settings::shortcuts::effect::restart,
+            sentence: tr::settings::shortcuts::sentence::restart,
+        },
+        _ => return None,
+    };
+    Some(effect)
+}
+
+fn description_follows_outcome(action: &str) -> bool {
+    SCREENSHOT_SHORTCUTS.contains(&action)
+        || matches!(action, "startStudioRecording" | "startInstantRecording")
+}
 
 /// The gpui keystroke name for a key, as the W3C `KeyboardEvent.code` string
 /// the Tauri app stores (`e.code` in hotkeys.tsx, `global_hotkey::Code` in
@@ -984,6 +1294,25 @@ fn hotkey_code_for_key(key: &str) -> Option<String> {
     Some(code.to_string())
 }
 
+fn is_function_key(code: &str) -> bool {
+    code.strip_prefix('F')
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Bare letters, digits and Shift-only combos would fire while typing in any
+/// app, so a shortcut needs ⌘, ⌃ or ⌥ unless it is a function key.
+fn shortcut_needs_modifier(hotkey: &Hotkey) -> bool {
+    !(hotkey.meta || hotkey.ctrl || hotkey.alt) && !is_function_key(&hotkey.code)
+}
+
+const NEEDS_MODIFIER: fn() -> &'static str = if cfg!(target_os = "macos") {
+    tr::settings::shortcuts::needs_modifier_macos
+} else {
+    tr::settings::shortcuts::needs_modifier_other
+};
+
+const UNSUPPORTED_KEY: fn() -> &'static str = tr::settings::shortcuts::unsupported_key;
+
 /// `HotkeyText`'s key list: modifiers in ⌘⌃⌥⇧ order, then the main key.
 /// [`ui::kbd_symbol`] does the per-OS glyph mapping.
 fn hotkey_display_keys(hotkey: &Hotkey) -> Vec<String> {
@@ -1004,305 +1333,729 @@ fn hotkey_display_keys(hotkey: &Hotkey) -> Vec<String> {
     keys
 }
 
+fn held_modifier_keys(modifiers: gpui::Modifiers) -> Vec<String> {
+    let mut keys = Vec::new();
+    if modifiers.platform {
+        keys.push("meta".to_string());
+    }
+    if modifiers.control {
+        keys.push("ctrl".to_string());
+    }
+    if modifiers.alt {
+        keys.push("alt".to_string());
+    }
+    if modifiers.shift {
+        keys.push("shift".to_string());
+    }
+    keys
+}
+
+fn hotkey_inline_text(hotkey: &Hotkey) -> String {
+    let separator = if cfg!(target_os = "macos") { "" } else { "+" };
+    hotkey_display_keys(hotkey)
+        .iter()
+        .map(|key| hotkey_key_text(key))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn hotkey_key_text(key: &str) -> SharedString {
+    if let Some(digit) = key.strip_prefix("Digit") {
+        return SharedString::from(digit.to_string());
+    }
+    let named = match key {
+        "Comma" => ",",
+        "Period" => ".",
+        "Slash" => "/",
+        "Semicolon" => ";",
+        "Quote" => "'",
+        "BracketLeft" => "[",
+        "BracketRight" => "]",
+        "Backslash" => "\\",
+        "Minus" => "-",
+        "Equal" => "=",
+        "Backquote" => "`",
+        "ArrowUp" => "↑",
+        "ArrowDown" => "↓",
+        "ArrowLeft" => "←",
+        "ArrowRight" => "→",
+        "Tab" => "⇥",
+        "Delete" => "⌦",
+        _ => return ui::kbd_symbol(key),
+    };
+    SharedString::from(named)
+}
+
+fn shortcut_key_cap(theme: &Theme, key: &str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .h(px(20.))
+        .min_w(px(20.))
+        .px(px(5.))
+        .rounded(px(5.))
+        .bg(theme.settings_card_bg())
+        .border_1()
+        .border_color(theme.settings_border())
+        .text_size(px(11.))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme.settings_text())
+        .child(hotkey_key_text(key))
+}
+
 impl SettingsWindow {
-    /// The window keydown listener while a binding is armed. Returns whether
+    fn shortcut_binding(&self, action: &str) -> Option<Hotkey> {
+        self.pages
+            .hotkeys
+            .get(action)
+            .and_then(store::hotkey_from_value)
+    }
+
+    fn shortcuts_start_listening(
+        &mut self,
+        action: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pages.shortcut_saved = None;
+        self.pages.shortcut_saved_reset = None;
+        if !crate::hotkeys::pause(cx) {
+            self.pages.shortcut_blocked = Some(action);
+            cx.notify();
+            return;
+        }
+        self.pages.shortcut_blocked = None;
+        self.pages.listening = Some(ListeningHotkey {
+            action,
+            modifiers: window.modifiers(),
+            error: None,
+        });
+        // Keys must reach the root's on_key_down, not a focused field.
+        self.focus_root(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn shortcut_listening(&self) -> bool {
+        self.pages.listening.is_some()
+    }
+
+    pub(crate) fn switch_back_running(&self) -> bool {
+        self.pages.switch_back.is_some()
+    }
+
+    /// Leave recording mode without touching the binding. Safe to call when
+    /// nothing is recording; every exit path (Escape, a click elsewhere,
+    /// another page, the window losing focus or closing) lands here.
+    pub(crate) fn shortcuts_cancel(&mut self, cx: &mut Context<Self>) {
+        if self.pages.listening.take().is_none() {
+            return;
+        }
+        crate::hotkeys::resume(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn shortcuts_modifiers_changed(
+        &mut self,
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(listening) = self.pages.listening.as_mut() {
+            listening.modifiers = modifiers;
+            cx.notify();
+        }
+    }
+
+    /// The window keydown listener while a row is recording. Returns whether
     /// the key was consumed. Modifier-only presses never arrive as
-    /// `KeyDownEvent`s in gpui, so `MODIFIER_KEYS` needs no equivalent.
+    /// `KeyDownEvent`s in gpui; they come through
+    /// [`Self::shortcuts_modifiers_changed`].
     pub(crate) fn shortcuts_capture_key(
         &mut self,
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.page != Page::Shortcuts || self.pages.listening.is_none() {
+        if self.page != Page::Shortcuts {
             return false;
         }
-        // Escape restores the previous binding instead of becoming one --
-        // the one deliberate divergence from the DOM listener, which cannot
-        // bind Escape globally anyway (it is the overlay-cancel key).
+        let Some(listening) = self.pages.listening.as_mut() else {
+            return false;
+        };
+        let action = listening.action;
+        let modifiers = keystroke.modifiers;
+        let bare = !modifiers.platform && !modifiers.control && !modifiers.alt && !modifiers.shift;
+
+        // Escape is the picker's cancel key, so it is never a binding.
         if keystroke.key == "escape" {
-            self.shortcuts_restore_prev(cx);
+            self.shortcuts_cancel(cx);
             return true;
         }
-        let Some(code) = hotkey_code_for_key(&keystroke.key) else {
+        if bare && matches!(keystroke.key.as_str(), "backspace" | "delete") {
+            self.pages.listening = None;
+            self.pages.hotkeys.remove(action);
+            self.shortcuts_commit(cx);
             return true;
-        };
+        }
+
         // A code the Tauri app cannot parse must never reach the store: its
         // `HotkeysStore` deserializes the whole `hotkeys` map strictly
         // (`serde_json::from_value` in `HotkeysStore::get`), so one bad entry
         // would silently drop every binding over there.
-        if global_hotkey::hotkey::Code::from_str(&code).is_err() {
-            return true;
-        }
-        let Some(listening) = self.pages.listening.as_ref() else {
+        let Some(code) = hotkey_code_for_key(&keystroke.key)
+            .filter(|code| global_hotkey::hotkey::Code::from_str(code).is_ok())
+        else {
+            listening.error = Some(UNSUPPORTED_KEY);
+            cx.notify();
             return true;
         };
-        let action = HOTKEY_ACTIONS[listening.action].0;
         let hotkey = Hotkey {
             code,
-            meta: keystroke.modifiers.platform,
-            ctrl: keystroke.modifiers.control,
-            alt: keystroke.modifiers.alt,
-            shift: keystroke.modifiers.shift,
+            meta: modifiers.platform,
+            ctrl: modifiers.control,
+            alt: modifiers.alt,
+            shift: modifiers.shift,
         };
+        if shortcut_needs_modifier(&hotkey) {
+            listening.error = Some(NEEDS_MODIFIER);
+            cx.notify();
+            return true;
+        }
+
+        let mut moved_from = None;
+        for other in SCREENSHOT_SHORTCUTS
+            .iter()
+            .chain(RECORDING_SHORTCUTS.iter())
+            .chain(WHILE_RECORDING_SHORTCUTS.iter())
+        {
+            if *other != action && self.shortcut_binding(other).as_ref() == Some(&hotkey) {
+                self.pages.hotkeys.remove(*other);
+                moved_from.get_or_insert(*other);
+            }
+        }
+
         let value = serde_json::to_value(&hotkey).unwrap_or(Value::Null);
         self.pages.hotkeys.insert(action.to_string(), value);
-        // `createEffect` persists on every store change, captures included --
-        // but the OS registration waits for the confirm, exactly as
-        // `commands.setHotkey` only runs from the buttons over there. Pressing
-        // the candidate combo again keeps re-capturing it instead of firing
-        // the action.
-        self.shortcuts_save();
-        cx.notify();
+        self.pages.listening = None;
+        self.shortcuts_commit(cx);
+        self.pages.shortcut_saved = Some(SavedShortcut { action, moved_from });
+        self.pages.shortcut_saved_reset = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SHORTCUT_SAVED_NOTICE).await;
+            this.update(cx, |this, cx| {
+                if this
+                    .pages
+                    .shortcut_saved
+                    .as_ref()
+                    .is_some_and(|saved| saved.action == action)
+                {
+                    this.pages.shortcut_saved = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
         true
     }
 
-    /// The `createEffect` half: write the map to the shared store, touch
-    /// nothing at the OS.
-    fn shortcuts_save(&self) {
+    /// Persist the map and swap the OS registrations. Deferred because the
+    /// registry swap reads the store this just wrote; resuming re-registers
+    /// from the store, and so does a reload when nothing was paused.
+    fn shortcuts_commit(&mut self, cx: &mut Context<Self>) {
         if !store::set_hotkeys_raw(&self.pages.hotkeys) {
             tracing::warn!("saving the hotkeys store failed");
         }
-    }
-
-    /// The `commands.setHotkey` half: persist and swap the OS registrations.
-    /// Deferred because the registry swap reads the store this just wrote.
-    fn shortcuts_commit(&self, cx: &mut Context<Self>) {
-        self.shortcuts_save();
-        cx.defer(crate::hotkeys::reload);
-    }
-
-    /// The window click listener: an abandoned capture puts the previous
-    /// binding back. Store only -- the capture never touched the OS
-    /// registration, so there is nothing to swap back (the TSX cancel path
-    /// never calls `setHotkey` either).
-    fn shortcuts_restore_prev(&mut self, cx: &mut Context<Self>) {
-        let Some(listening) = self.pages.listening.take() else {
-            return;
-        };
-        let action = HOTKEY_ACTIONS[listening.action].0;
-        match listening.prev {
-            Some(prev) => {
-                self.pages.hotkeys.insert(action.to_string(), prev);
+        cx.defer(|cx| {
+            if !crate::hotkeys::resume(cx) {
+                crate::hotkeys::reload(cx);
             }
-            None => {
-                self.pages.hotkeys.remove(action);
-            }
-        }
-        self.shortcuts_save();
+            cx.refresh_windows();
+        });
         cx.notify();
     }
 
     pub(crate) fn render_shortcuts(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let theme = self.theme;
+        let unavailable = crate::hotkeys::unavailable_actions(cx);
+        let mode = crate::main_window::Mode::from_store();
+        let rows_for = |actions: &[&'static str], cx: &mut Context<Self>| {
+            actions
+                .iter()
+                .map(|action| {
+                    self.render_shortcut_row(action, mode, unavailable.contains(action), cx)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut screenshots = rows_for(&SCREENSHOT_SHORTCUTS, cx);
+        screenshots.push(
+            self.render_outcome_panel(
+                "outcome-screenshot",
+                tr::settings::shortcuts::after_screenshot::title(),
+                tr::settings::shortcuts::after_screenshot::hint(),
+                &SCREENSHOT_OUTCOMES
+                    .iter()
+                    .map(|(value, option)| {
+                        (*option, *value == self.settings.post_screenshot_behaviour)
+                    })
+                    .collect::<Vec<_>>(),
+                |this, index, cx| {
+                    if let Some((value, _)) = SCREENSHOT_OUTCOMES.get(index) {
+                        this.settings.post_screenshot_behaviour = *value;
+                        this.write_enum("postScreenshotBehaviour", *value, cx);
+                    }
+                },
+                cx,
+            ),
+        );
+
+        let mut recording = rows_for(&RECORDING_SHORTCUTS, cx);
+        recording.push(
+            self.render_outcome_panel(
+                "outcome-studio",
+                tr::settings::shortcuts::after_studio::title(),
+                tr::settings::shortcuts::after_studio::hint(),
+                &STUDIO_OUTCOMES
+                    .iter()
+                    .map(|(value, option)| {
+                        (
+                            *option,
+                            *value == self.settings.post_studio_recording_behaviour,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                |this, index, cx| {
+                    if let Some((value, _)) = STUDIO_OUTCOMES.get(index) {
+                        this.settings.post_studio_recording_behaviour = *value;
+                        this.write_enum("postStudioRecordingBehaviour", *value, cx);
+                    }
+                },
+                cx,
+            ),
+        );
+        recording.push(
+            self.render_outcome_panel(
+                "outcome-instant",
+                tr::settings::shortcuts::after_instant::title(),
+                tr::settings::shortcuts::after_instant::hint(),
+                &INSTANT_OUTCOMES
+                    .iter()
+                    .map(|(value, option)| {
+                        (*option, *value == self.settings.post_instant_behaviour())
+                    })
+                    .collect::<Vec<_>>(),
+                |this, index, cx| {
+                    if let Some((value, _)) = INSTANT_OUTCOMES.get(index) {
+                        let (disable_open, show_main) = value.store_values();
+                        this.settings.disable_auto_open_links = disable_open;
+                        this.settings.show_main_window_after_instant = Some(show_main);
+                        this.write_bool("disableAutoOpenLinks", disable_open, cx);
+                        this.write_bool(store::SHOW_MAIN_WINDOW_AFTER_INSTANT_KEY, show_main, cx);
+                    }
+                },
+                cx,
+            ),
+        );
+
+        let while_recording = rows_for(&WHILE_RECORDING_SHORTCUTS, cx);
+
         let listening_any = self.pages.listening.is_some();
-
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for (index, (action, label)) in HOTKEY_ACTIONS.iter().enumerate() {
-            let binding = self
-                .pages
-                .hotkeys
-                .get(*action)
-                .and_then(store::hotkey_from_value);
-            let listening = self
-                .pages
-                .listening
-                .as_ref()
-                .is_some_and(|listening| listening.action == index);
-
-            let right: gpui::AnyElement = if listening {
-                self.render_shortcut_listening(index, binding.as_ref(), cx)
-                    .into_any_element()
-            } else {
-                self.render_shortcut_idle(index, binding.as_ref(), cx)
-                    .into_any_element()
-            };
-
-            rows.push(
-                // `flex flex-row justify-between items-center w-full h-8`.
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .items_center()
-                    .w_full()
-                    .h(px(32.))
-                    .child(div().text_size(px(13.)).child(*label))
-                    .child(right)
-                    .into_any_element(),
-            );
-            if index + 1 != HOTKEY_ACTIONS.len() {
-                // `w-full h-px bg-gray-3`.
-                rows.push(
-                    div()
-                        .w_full()
-                        .h(px(1.))
-                        .bg(theme.settings_border())
-                        .into_any_element(),
-                );
-            }
-        }
-
-        let card = self
-            .card(false)
-            .id("shortcuts-card")
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .p(px(16.))
-            // The window click listener: any press that reaches the card while
-            // a capture is armed abandons it and restores the old binding.
-            .when(listening_any, |this| {
-                this.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _window, cx| this.shortcuts_restore_prev(cx)),
-                )
-            })
-            .children(rows);
+        let card = |id: &'static str, rows: Vec<gpui::AnyElement>, cx: &mut Context<Self>| {
+            self.rows(rows)
+                .id(id)
+                .when(listening_any, |this| {
+                    this.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _window, cx| this.shortcuts_cancel(cx)),
+                    )
+                })
+                .into_any_element()
+        };
 
         vec![
             self.section(
-                "Shortcuts",
-                Some("Configure system-wide keyboard shortcuts to control Cap."),
+                tr::settings::shortcuts::screenshots_title(),
+                Some(tr::settings::shortcuts::screenshots_description()),
                 None,
-                vec![card.into_any_element()],
+                vec![card("shortcuts-screenshots", screenshots, cx)],
+            )
+            .into_any_element(),
+            self.section(
+                tr::settings::shortcuts::recording_title(),
+                Some(tr::settings::shortcuts::recording_description()),
+                None,
+                vec![card("shortcuts-recording", recording, cx)],
+            )
+            .into_any_element(),
+            self.section(
+                tr::settings::shortcuts::while_recording_title(),
+                None,
+                None,
+                vec![card("shortcuts-while-recording", while_recording, cx)],
             )
             .into_any_element(),
         ]
     }
 
-    /// The resting state: the binding as keycap chips, or the `None` pill.
-    fn render_shortcut_idle(
+    fn render_outcome_panel(
         &self,
-        index: usize,
-        binding: Option<&Hotkey>,
+        id: &'static str,
+        title: &'static str,
+        hint: &'static str,
+        options: &[(OutcomeOption, bool)],
+        on_select: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         let theme = self.theme;
-        let content: gpui::AnyElement = match binding {
-            Some(hotkey) => div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(4.))
-                .children(
-                    hotkey_display_keys(hotkey)
-                        .into_iter()
-                        .map(|key| ui::KbdChip::row(&theme, key)),
-                )
-                .into_any_element(),
-            // `text-[11px] uppercase py-3 px-2.5 h-5 bg-gray-4 border
-            //  border-gray-5 rounded-lg text-gray-11`.
-            None => div()
-                .flex()
-                .items_center()
-                .h(px(20.))
-                .px(px(10.))
-                .rounded(px(8.))
-                .bg(theme.settings_fill())
-                .border_1()
-                .border_color(theme.settings_border())
-                .text_size(px(11.))
-                .text_color(theme.settings_muted())
-                .child("NONE")
-                .into_any_element(),
+        let ink = theme.settings_text();
+        // The card tokens are translucent, so on this tinted panel they read
+        // as gray; the chosen option needs a solid, lighter surface.
+        let raised = if theme.is_dark() {
+            gpui::hsla(0., 0., 1., 0.1)
+        } else {
+            gpui::white()
         };
+        let on_select = std::rc::Rc::new(on_select);
 
-        div()
-            .id(("hotkey", index))
-            .cursor_pointer()
-            .child(content)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                let prev = this.pages.hotkeys.get(HOTKEY_ACTIONS[index].0).cloned();
-                this.pages.listening = Some(ListeningHotkey {
-                    action: index,
-                    prev,
+        let cards =
+            options
+                .iter()
+                .enumerate()
+                .map(|(index, (option, selected))| {
+                    let selected = *selected;
+                    let on_select = on_select.clone();
+                    div()
+                        .id((id, index))
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .flex_1()
+                        .min_w_0()
+                        .p(px(10.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .when(selected, |this| this.border_color(ink).bg(raised))
+                        .when(!selected, |this| {
+                            this.border_color(theme.settings_border())
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme.settings_hover()))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(28.))
+                                .rounded(px(7.))
+                                .bg(theme.settings_fill())
+                                .child(svg().path(option.icon).size(px(16.)).text_color(
+                                    if selected {
+                                        ink
+                                    } else {
+                                        theme.settings_muted()
+                                    },
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(ink)
+                                        .child((option.label)()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .line_height(px(14.))
+                                        .text_color(theme.settings_muted())
+                                        .child((option.hint)()),
+                                ),
+                        )
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.shortcuts_cancel(cx);
+                            on_select(this, index, cx);
+                            cx.notify();
+                        }))
                 });
-                // Keys must reach the root's on_key_down, not a focused field.
-                this.focus_root(window, cx);
-                cx.notify();
-            }))
-    }
-
-    /// The armed state: confirm/clear buttons on the left, the live capture
-    /// (or "Set hotkeys...") on the right -- `flex-row-reverse` in the TSX.
-    fn render_shortcut_listening(
-        &self,
-        index: usize,
-        binding: Option<&Hotkey>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = self.theme;
-        let has_binding = binding.is_some();
-
-        let mut buttons = div().flex().flex_row().items_center().gap(px(2.));
-        if has_binding {
-            // IconCapCircleCheck: commit and stop listening.
-            buttons = buttons.child(
-                div()
-                    .id(("hotkey-confirm", index))
-                    .cursor_pointer()
-                    .child(
-                        svg()
-                            .path("icons/circle-check.svg")
-                            .size(px(20.))
-                            .text_color(theme.settings_text()),
-                    )
-                    .hover(|style| style.opacity(0.7))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.pages.listening = None;
-                        this.shortcuts_commit(cx);
-                        cx.notify();
-                    })),
-            );
-        }
-        // IconCapCircleX: clear the binding entirely.
-        buttons = buttons.child(
-            div()
-                .id(("hotkey-clear", index))
-                .cursor_pointer()
-                .child(
-                    svg()
-                        .path("icons/circle-x.svg")
-                        .size(px(20.))
-                        .text_color(Hsla::from(rgb(0xef4444))),
-                )
-                .hover(|style| style.opacity(0.7))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.pages.listening = None;
-                    this.pages.hotkeys.remove(HOTKEY_ACTIONS[index].0);
-                    this.shortcuts_commit(cx);
-                    cx.notify();
-                })),
-        );
-
-        let capture: gpui::AnyElement = match binding {
-            Some(hotkey) => div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(4.))
-                .children(
-                    hotkey_display_keys(hotkey)
-                        .into_iter()
-                        .map(|key| ui::KbdChip::row(&theme, key)),
-                )
-                .into_any_element(),
-            None => div()
-                .text_size(px(13.))
-                .text_color(theme.settings_muted())
-                .child("Set hotkeys...")
-                .into_any_element(),
-        };
 
         div()
             .flex()
+            .flex_col()
+            .gap(px(10.))
+            .p(px(12.))
+            .bg(theme.settings_fill())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.settings_muted())
+                            .child(hint),
+                    ),
+            )
+            .child(div().flex().flex_row().gap(px(8.)).children(cards))
+            .into_any_element()
+    }
+
+    fn render_shortcut_row(
+        &self,
+        action: &'static str,
+        mode: crate::main_window::Mode,
+        unavailable: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = self.theme;
+        let binding = self.shortcut_binding(action);
+        let listening = self
+            .pages
+            .listening
+            .as_ref()
+            .filter(|listening| listening.action == action);
+        let saved = self
+            .pages
+            .shortcut_saved
+            .as_ref()
+            .filter(|saved| saved.action == action);
+        let effect = shortcut_effect(action, &self.settings, mode);
+        let red: Hsla = theme.red_11.into();
+        let amber: Hsla = theme.amber_11.into();
+
+        let blocked =
+            self.pages.shortcut_blocked == Some(action) && crate::hotkeys::editing_blocked(cx);
+        let (detail, detail_color, detail_icon): (String, Hsla, Option<(&str, Hsla)>) = if blocked {
+            (
+                tr::settings::shortcuts::blocked_while_recording().into(),
+                red,
+                None,
+            )
+        } else if let Some(listening) = listening {
+            match listening.error {
+                Some(error) => (error().into(), red, None),
+                None => (
+                    tr::settings::shortcuts::recording_hint().into(),
+                    theme.settings_muted(),
+                    None,
+                ),
+            }
+        } else if unavailable && binding.is_some() {
+            (tr::settings::shortcuts::unavailable().into(), amber, None)
+        } else if let (Some(saved), Some(binding)) = (saved, binding.as_ref()) {
+            let keys = hotkey_inline_text(binding);
+            let phrase = effect.map_or("", |effect| (effect.phrase)());
+            let text = match saved.moved_from {
+                Some(from) => {
+                    tr::settings::shortcuts::saved_moved(keys, phrase, shortcut_label(from))
+                }
+                None => tr::settings::shortcuts::saved(keys, phrase),
+            };
+            (
+                text,
+                theme.settings_text(),
+                Some(("icons/circle-check.svg", theme.settings_text())),
+            )
+        } else {
+            (
+                effect.map_or_else(String::new, |effect| (effect.sentence)().to_string()),
+                theme.settings_muted(),
+                None,
+            )
+        };
+
+        let group: SharedString = format!("shortcut-row-{action}").into();
+
+        let field = self.render_shortcut_field(action, binding.as_ref(), listening, cx);
+        let clear = div()
+            .id(SharedString::from(format!("shortcut-clear-{action}")))
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .invisible()
+            .when(binding.is_some() && listening.is_none(), |this| {
+                this.group_hover(group.clone(), |style| style.visible())
+            })
+            .hover(|style| style.bg(theme.settings_hover()))
+            .child(
+                svg()
+                    .path("icons/x.svg")
+                    .size(px(12.))
+                    .text_color(theme.settings_muted()),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.shortcuts_cancel(cx);
+                this.pages.hotkeys.remove(action);
+                if this
+                    .pages
+                    .shortcut_saved
+                    .as_ref()
+                    .is_some_and(|saved| saved.action == action)
+                {
+                    this.pages.shortcut_saved = None;
+                }
+                this.shortcuts_commit(cx);
+            }));
+
+        div()
+            .id(SharedString::from(format!("shortcut-{action}")))
+            .group(group)
+            .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.))
-            .child(buttons)
-            .child(capture)
+            .justify_between()
+            .gap(px(16.))
+            .min_h(px(56.))
+            .p(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(div().text_size(px(13.)).child(shortcut_label(action)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .gap(px(5.))
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .text_color(detail_color)
+                            // Picking an "After ..." option rewrites this text,
+                            // and a one-line/two-line swap moved the panel out
+                            // from under the pointer. Two lines are reserved
+                            // for every description that can change that way.
+                            .when(description_follows_outcome(action), |this| {
+                                this.min_h(px(32.))
+                            })
+                            .when_some(detail_icon, |this, (path, color)| {
+                                this.child(
+                                    svg()
+                                        .path(path)
+                                        .flex_shrink_0()
+                                        .mt(px(2.))
+                                        .size(px(12.))
+                                        .text_color(color),
+                                )
+                            })
+                            .child(div().min_w_0().child(detail)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(4.))
+                    .flex_shrink_0()
+                    .child(clear)
+                    .child(field),
+            )
+            .into_any_element()
+    }
+
+    fn render_shortcut_field(
+        &self,
+        action: &'static str,
+        binding: Option<&Hotkey>,
+        listening: Option<&ListeningHotkey>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = self.theme;
+
+        let base = div()
+            .id(SharedString::from(format!("shortcut-field-{action}")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap(px(3.))
+            .h(px(30.))
+            .min_w(px(132.))
+            .px(px(5.))
+            .rounded(px(8.))
+            .border_1()
+            .cursor_pointer();
+
+        let field = match (listening, binding) {
+            (Some(listening), _) => {
+                let held = held_modifier_keys(listening.modifiers);
+                let mut field = base
+                    .border_color(theme.settings_text())
+                    .bg(theme.settings_card_bg())
+                    .children(held.iter().map(|key| shortcut_key_cap(&theme, key)));
+                if held.is_empty() {
+                    field = field.child(
+                        div()
+                            .px(px(4.))
+                            .text_size(px(12.))
+                            .text_color(theme.settings_muted())
+                            .child(tr::settings::shortcuts::type_shortcut()),
+                    );
+                } else {
+                    field = field.child(
+                        div()
+                            .px(px(2.))
+                            .text_size(px(12.))
+                            .text_color(theme.settings_muted())
+                            .child("…"),
+                    );
+                }
+                field.into_any_element()
+            }
+            (None, Some(hotkey)) => base
+                .border_color(theme.settings_border())
+                .bg(theme.settings_fill())
+                .hover(|style| style.bg(theme.settings_hover()))
+                .children(
+                    hotkey_display_keys(hotkey)
+                        .iter()
+                        .map(|key| shortcut_key_cap(&theme, key)),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.shortcuts_start_listening(action, window, cx);
+                }))
+                .into_any_element(),
+            (None, None) => base
+                .border_color(theme.settings_border())
+                .border_dashed()
+                .hover(|style| style.bg(theme.settings_hover()))
+                .child(
+                    div()
+                        .px(px(4.))
+                        .text_size(px(12.))
+                        .text_color(theme.settings_muted())
+                        .child(tr::settings::shortcuts::record_shortcut()),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.shortcuts_start_listening(action, window, cx);
+                }))
+                .into_any_element(),
+        };
+        div().child(field).into_any_element()
     }
 }
 
@@ -1386,12 +2139,12 @@ impl SettingsWindow {
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .text_color(Hsla::from(theme.red_9))
-                        .child(format!("Couldn't load CLI status: {error}")),
+                        .child(tr::settings::cli::load_failed(error)),
                 )
                 .child(div().child(self.button(
                     "cli-retry",
                     (ui::ButtonVariant::Gray, None),
-                    "Retry",
+                    tr::settings::cli::retry(),
                     false,
                     cx,
                     |this, window, cx| this.cli_refresh(window, cx),
@@ -1404,10 +2157,8 @@ impl SettingsWindow {
 
         vec![
             self.section(
-                "Command Line",
-                Some(
-                    "Install the Cap command for terminals, agents, scripts, and local automation.",
-                ),
+                tr::settings::cli::title(),
+                Some(tr::settings::cli::description()),
                 None,
                 vec![self.card(true).child(body).into_any_element()],
             )
@@ -1426,15 +2177,19 @@ impl SettingsWindow {
 
         let install_label = if installing {
             if status.installed {
-                "Repairing..."
+                tr::settings::cli::repairing()
             } else {
-                "Installing..."
+                tr::settings::cli::installing()
             }
         } else if status.installed {
-            "Repair"
+            tr::settings::cli::repair()
         } else {
-            "Install CLI"
+            tr::settings::cli::install()
         };
+        let installs_command = tr::settings::cli::installs_command(COMMAND_MARKER);
+        let (before_command, after_command) = installs_command
+            .split_once(COMMAND_MARKER)
+            .unwrap_or((installs_command.as_str(), ""));
 
         // `<code class="font-mono text-gray-12">`.
         let code_span = |text: String| {
@@ -1457,9 +2212,9 @@ impl SettingsWindow {
                     .gap(px(4.))
                     .min_w_0()
                     .child(div().text_size(px(13.)).child(if status.installed {
-                        "Installed"
+                        tr::settings::cli::installed()
                     } else {
-                        "Not installed"
+                        tr::settings::cli::not_installed()
                     }))
                     .child(
                         div()
@@ -1470,9 +2225,9 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .line_height(px(16.))
                             .text_color(theme.settings_muted())
-                            .child("The desktop app installs a local\u{a0}")
+                            .child(before_command.to_string())
                             .child(code_span("cap".into()).text_size(px(12.)))
-                            .child("\u{a0}command that points back to the bundled CLI."),
+                            .child(after_command.to_string()),
                     ),
             )
             .child(
@@ -1486,9 +2241,9 @@ impl SettingsWindow {
                             "cli-remove",
                             (ui::ButtonVariant::Gray, None),
                             if uninstalling {
-                                "Removing..."
+                                tr::settings::cli::removing()
                             } else {
-                                "Remove"
+                                tr::settings::cli::remove()
                             },
                             uninstalling,
                             cx,
@@ -1515,7 +2270,7 @@ impl SettingsWindow {
                 .min_w_0()
                 .child(
                     div()
-                        .w(px(64.))
+                        .min_w(px(64.))
                         .flex_shrink_0()
                         .text_size(px(12.))
                         .text_color(theme.settings_muted())
@@ -1548,8 +2303,14 @@ impl SettingsWindow {
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .child(path_row("Command", status.shim_path.clone()))
-                    .child(path_row("Target", status.target_path.clone())),
+                    .child(path_row(
+                        tr::settings::cli::command(),
+                        status.shim_path.clone(),
+                    ))
+                    .child(path_row(
+                        tr::settings::cli::target(),
+                        status.target_path.clone(),
+                    )),
             )
             .when_some(status.conflict.clone(), |this, conflict| {
                 // `rounded-lg border border-red-300/40 bg-red-500/10 px-3 py-2
@@ -1584,20 +2345,14 @@ impl SettingsWindow {
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .text_color(theme.settings_muted())
-                        .child(
-                            "Added cap to your PATH. Restart your terminal to use it, or run \
-                             this now:",
-                        )
+                        .child(tr::settings::cli::path_configured())
                         .into_any_element()
                 } else {
                     div()
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .text_color(theme.settings_muted())
-                        .child(format!(
-                            "Add {} to your PATH to use cap from a new terminal.",
-                            status.path_entry
-                        ))
+                        .child(tr::settings::cli::path_missing(&status.path_entry))
                         .into_any_element()
                 };
                 this.child(
@@ -1636,9 +2391,9 @@ impl SettingsWindow {
                                     "cli-copy-path",
                                     (ui::ButtonVariant::Gray, None),
                                     if self.pages.cli_copied {
-                                        "Copied"
+                                        tr::common::copied()
                                     } else {
-                                        "Copy"
+                                        tr::settings::cli::copy()
                                     },
                                     false,
                                     cx,
@@ -1743,10 +2498,13 @@ impl SettingsWindow {
         let theme = self.theme;
         let hints = self.pages.hints.clone();
         let save_label = match self.pages.hint_save {
-            HintSave::Saving => "Saving...",
-            HintSave::Saved => "Saved",
+            HintSave::Saving => tr::settings::transcription::saving(),
+            HintSave::Saved => tr::settings::transcription::saved(),
             HintSave::Idle => "",
         };
+        self.pages.hint_input.update(cx, |input, _| {
+            input.set_placeholder(tr::settings::transcription::placeholder())
+        });
 
         let header = div()
             .flex()
@@ -1760,15 +2518,17 @@ impl SettingsWindow {
                     .flex_col()
                     .gap(px(2.))
                     .min_w_0()
-                    .child(div().text_size(px(13.)).child("Remembered terms"))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .child(tr::settings::transcription::terms_title()),
+                    )
                     .child(
                         div()
                             .text_size(px(12.))
                             .line_height(px(16.))
                             .text_color(theme.settings_muted())
-                            .child(
-                                "Add one term at a time to reduce typos and formatting mistakes.",
-                            ),
+                            .child(tr::settings::transcription::terms_description()),
                     ),
             )
             .child(
@@ -1781,7 +2541,7 @@ impl SettingsWindow {
                         this.child(self.button(
                             "hints-clear",
                             (ui::ButtonVariant::Gray, None),
-                            "Clear",
+                            tr::settings::transcription::clear(),
                             false,
                             cx,
                             |this, _window, cx| {
@@ -1815,7 +2575,7 @@ impl SettingsWindow {
             .child(self.button(
                 "hints-add",
                 (ui::ButtonVariant::Primary, Some("icons/plus.svg")),
-                "Add",
+                tr::common::add(),
                 add_disabled,
                 cx,
                 |this, _window, cx| this.transcription_add_hint(cx),
@@ -1833,16 +2593,13 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .line_height(px(18.))
                     .text_color(theme.settings_muted())
-                    .child("These hints are applied when you generate captions in the editor."),
+                    .child(tr::settings::transcription::applied_note()),
             );
 
         let mut sections = vec![
             self.section(
-                "Transcription",
-                Some(
-                    "Add names, spellings, domains, and capitalization preferences that caption \
-                     generation should keep in mind.",
-                ),
+                tr::settings::transcription::title(),
+                Some(tr::settings::transcription::description()),
                 None,
                 vec![card.into_any_element()],
             )
@@ -1853,11 +2610,7 @@ impl SettingsWindow {
             let count = div()
                 .text_size(px(12.))
                 .text_color(theme.settings_muted())
-                .child(format!(
-                    "{} {}",
-                    hints.len(),
-                    if hints.len() == 1 { "item" } else { "items" }
-                ))
+                .child(tr::settings::transcription::count(hints.len()))
                 .into_any_element();
             let chips = div().flex().flex_row().flex_wrap().gap(px(8.)).children(
                 hints.into_iter().enumerate().map(|(index, hint)| {
@@ -1894,7 +2647,7 @@ impl SettingsWindow {
 
             sections.push(
                 self.section(
-                    "Active hints",
+                    tr::settings::transcription::active_title(),
                     None,
                     Some(count),
                     vec![self.card(true).child(chips).into_any_element()],
@@ -1911,19 +2664,9 @@ impl SettingsWindow {
 // Experimental (experimental.tsx)
 // ---------------------------------------------------------------------------
 
-/// The hand-back takeover, mirroring `experimental.tsx`'s overlay: the toggle
-/// is the confirmation, and the sequence is what the user reads while Cancel is
-/// on screen.
 pub(crate) enum SwitchBack {
-    /// The sequence, timed from its start. One clock drives the sentence, its
-    /// fade and the countdown, so nothing can drift apart.
     Running(std::time::Instant),
-    /// Dev only: the switch is committed and the supervisor is rebuilding the
-    /// classic app; this app stays up until the classic one deletes the
-    /// pending file to say it is on screen (`store::classic_pending_path`).
     WaitingForClassic,
-    /// The switch was refused; the overlay stays up with the reason and the
-    /// toggle goes back to on, because nothing was switched.
     Failed(String),
 }
 
@@ -1931,11 +2674,9 @@ pub(crate) enum SwitchBack {
 /// failed and hand the user back their app with a pointer at the terminal.
 const CLASSIC_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// One line at a time, fading between them, underneath the countdown rather
-/// than ahead of it: the numeral is on screen from the first frame.
-const SWITCH_SENTENCES: &[&str] = &[
-    "Switching back to the classic Cap app.",
-    "Your recordings and settings stay exactly where they are.",
+const SWITCH_SENTENCES: &[fn() -> &'static str] = &[
+    tr::settings::experimental::switch::switching,
+    tr::settings::experimental::switch::data_stays,
 ];
 const SWITCH_SENTENCE_MS: u64 = 2000;
 const SWITCH_FADE_MS: f32 = 400.;
@@ -1965,182 +2706,23 @@ fn takeover_frame(elapsed_ms: f32) -> (usize, f32, u32) {
     (index, alpha, remaining)
 }
 
-/// Where the classic app lives when this build was not started from inside its
-/// bundle and is not a dev build either.
-const CLASSIC_APP_FALLBACK: &str = "/Applications/Cap.app";
-
-#[cfg(windows)]
-const CLASSIC_EXECUTABLE_NAME: &str = "Cap.exe";
-#[cfg(not(windows))]
-const CLASSIC_EXECUTABLE_NAME: &str = "Cap";
-
-/// What "the classic app" means for this process -- decided from where its
-/// binary lives, so dev sessions reopen the dev app and installed ones the
-/// installed app.
-#[derive(Debug, PartialEq)]
-enum ClassicTarget {
-    /// `open` this bundle: the shipped layout is
-    /// `.../Cap.app/Contents/MacOS/cap-gpui`, so the nearest `.app`
-    /// ancestor is the classic app this binary shipped inside.
-    Bundle(std::path::PathBuf),
-    /// Windows and Linux install Tauri sidecars beside the main executable.
-    Executable(std::path::PathBuf),
-    /// A cargo-built binary (an ancestor directory literally named `target`):
-    /// the classic app here is the `tauri dev` harness, which cannot be
-    /// `open`ed -- ask the dev-session supervisor to restart it instead
-    /// (`store::request_classic_reopen`).
-    DevSupervisor,
-}
-
-fn classic_target_for_exe(exe: &std::path::Path) -> Option<ClassicTarget> {
-    if let Some(bundle) = exe
-        .ancestors()
-        .find(|path| path.extension().is_some_and(|extension| extension == "app"))
-    {
-        return Some(ClassicTarget::Bundle(bundle.to_path_buf()));
-    }
-    if exe
-        .components()
-        .any(|component| component.as_os_str() == "target")
-    {
-        return Some(ClassicTarget::DevSupervisor);
-    }
-
-    if let Some(parent) = exe.parent() {
-        let executable = parent.join(CLASSIC_EXECUTABLE_NAME);
-        if executable.is_file() && executable != exe {
-            return Some(ClassicTarget::Executable(executable));
-        }
-    }
-
-    let fallback = std::path::PathBuf::from(CLASSIC_APP_FALLBACK);
-    fallback.is_dir().then_some(ClassicTarget::Bundle(fallback))
-}
-
-fn classic_target() -> Option<ClassicTarget> {
-    std::env::current_exe()
-        .ok()
-        .as_deref()
-        .and_then(classic_target_for_exe)
-}
-
-pub(crate) fn start_update_handoff(cx: &mut gpui::App) {
-    begin_update_handoff(cx, store::request_update_handoff);
-}
-
-fn quit_after_flushing_editors(cx: &mut gpui::App) {
-    crate::menus::quit(cx);
-}
-
-#[cfg(debug_assertions)]
-pub(crate) fn simulate_update_handoff(cx: &mut gpui::App) {
-    cx.spawn(async move |cx| {
-        crate::platform::activate_app();
-        if crate::platform::confirm_dialog(
-            "Update Cap",
-            "Version 99.0.0 of Cap is available. Would you like to install it?",
-            "Update",
-            "Ignore",
-            false,
-        ) {
-            cx.update(|cx| begin_update_handoff(cx, store::request_simulated_update_handoff));
-        }
-    })
-    .detach();
-}
-
-fn begin_update_handoff(cx: &mut gpui::App, request_handoff: fn() -> std::io::Result<()>) {
-    if update_handoff_blocked(cx) {
-        return;
-    }
-
-    let Some(target) = classic_target() else {
-        cx.open_url("https://cap.so/download");
-        return;
-    };
-
-    if matches!(target, ClassicTarget::DevSupervisor) && !cfg!(debug_assertions) {
-        cx.open_url("https://cap.so/download");
-        return;
-    }
-
-    if update_handoff_blocked(cx) {
-        return;
-    }
-    if let Err(error) = crate::app_windows::flush_pending_editor_saves(cx) {
-        cx.spawn(async move |_| {
-            crate::platform::alert_dialog("Cap is still open", &error);
+/// Cap ships as this app alone, so the classic Tauri app only exists inside
+/// the `tauri dev` harness: a debug cargo build can hand the session back to
+/// it through the dev-session supervisor (`store::request_classic_reopen`),
+/// and nothing else has a classic app to switch to.
+fn dev_supervisor_available_for(exe: Option<&std::path::Path>, debug_build: bool) -> bool {
+    debug_build
+        && exe.is_some_and(|exe| {
+            exe.components()
+                .any(|component| component.as_os_str() == "target")
         })
-        .detach();
-        return;
-    }
-
-    if let Err(error) = request_handoff() {
-        tracing::error!("couldn't request the Tauri updater: {error}");
-        cx.open_url("https://cap.so/download");
-        return;
-    }
-
-    let started = match &target {
-        ClassicTarget::Bundle(_) | ClassicTarget::Executable(_) => launch_classic(&target),
-        ClassicTarget::DevSupervisor => {
-            store::mark_classic_pending().and_then(|()| store::request_classic_reopen())
-        }
-    };
-
-    match (started, target) {
-        (Ok(()), ClassicTarget::Bundle(_) | ClassicTarget::Executable(_)) => {
-            tracing::info!("handing off to the Tauri updater");
-            quit_after_flushing_editors(cx);
-        }
-        (Ok(()), ClassicTarget::DevSupervisor) => {
-            tracing::info!("handing off to the Tauri updater; waiting for the dev app");
-            cx.spawn(async move |cx| {
-                let started = std::time::Instant::now();
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(250))
-                        .await;
-
-                    if !store::classic_pending_path().exists() {
-                        tracing::info!("the Tauri updater is ready; quitting Cap GPUI");
-                        cx.update(quit_after_flushing_editors);
-                        return;
-                    }
-
-                    if started.elapsed() > CLASSIC_WAIT_TIMEOUT {
-                        store::clear_update_handoff();
-                        tracing::error!("the dev app did not start for the update hand-off");
-                        return;
-                    }
-                }
-            })
-            .detach();
-        }
-        (Err(error), _) => {
-            store::clear_update_handoff();
-            tracing::error!("couldn't open the Tauri updater: {error}");
-            cx.open_url("https://cap.so/download");
-        }
-    }
 }
 
-fn update_handoff_blocked(cx: &mut gpui::App) -> bool {
-    if !crate::updates::work_in_flight(cx) {
-        return false;
-    }
-
-    tracing::info!(
-        "deferring update hand-off while recording, exporting, uploading, importing, or transcribing"
-    );
-    cx.spawn(async move |_| {
-        crate::platform::alert_dialog(
-            "Cap is busy",
-            "Finish your recording, export, upload, import, or transcription task before checking for updates.",
-        );
-    })
-    .detach();
-    true
+fn dev_supervisor_available() -> bool {
+    dev_supervisor_available_for(
+        std::env::current_exe().ok().as_deref(),
+        cfg!(debug_assertions),
+    )
 }
 
 impl SettingsWindow {
@@ -2150,22 +2732,19 @@ impl SettingsWindow {
         // experimental switch has nothing to switch. The store key
         // (`enableNativeCameraPreview`) stays readable in `store.rs` and is
         // left untouched in the shared store -- the Tauri app still uses it.
-        let sections = vec![
+        let mut sections = vec![
             self.section(
-                "Reliability",
+                tr::settings::experimental::reliability(),
                 None,
                 None,
                 vec![
                     self.rows(vec![
                         self.setting_row(
-                            "Out-of-process muxer",
-                            Some(
-                                "Run the fragmented-MP4 muxer in an isolated subprocess so muxer \
-                             crashes can't take down your recording. Requires the bundled \
-                             cap-muxer binary.",
-                            ),
+                            tr::settings::experimental::muxer(),
+                            Some(tr::settings::experimental::muxer_description()),
                             self.toggle(
                                 "out-of-process-muxer",
+                                tr::settings::experimental::muxer(),
                                 self.settings.out_of_process_muxer,
                                 cx,
                                 |this, cx| {
@@ -2182,75 +2761,43 @@ impl SettingsWindow {
                 ],
             )
             .into_any_element(),
-            self.section(
-                "Native app",
-                None,
-                None,
-                vec![self.rows(vec![self.native_app_row(cx)]).into_any_element()],
-            )
-            .into_any_element(),
         ];
-
-        #[cfg(debug_assertions)]
-        let sections = {
-            let mut sections = sections;
+        if dev_supervisor_available() {
             sections.push(
                 self.section(
-                    "Updates",
+                    tr::settings::experimental::developer(),
+                    Some(tr::settings::experimental::developer_description()),
                     None,
-                    None,
-                    vec![
-                        self.rows(vec![
-                            self.setting_row(
-                                "Simulate an update",
-                                Some(
-                                    "Preview the complete update flow without downloading or \
-                                     installing anything.",
-                                ),
-                                self.button(
-                                    "simulate-update",
-                                    (ui::ButtonVariant::Dark, None),
-                                    "Simulate update",
-                                    false,
-                                    cx,
-                                    |_, _, cx| simulate_update_handoff(cx),
-                                )
-                                .into_any_element(),
-                            ),
-                        ])
-                        .into_any_element(),
-                    ],
+                    vec![self.rows(vec![self.classic_app_row(cx)]).into_any_element()],
                 )
                 .into_any_element(),
             );
-            sections
-        };
-
+        }
         sections
     }
 
-    /// The mirror of the Tauri page's Native app row: it hands the session over
-    /// to this app, this one hands it back.
-    fn native_app_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        // Being in this app is what the toggle means, so it reads on even when
-        // the stored flag does not -- a `cargo run` or `dev.sh` launch never
-        // went through the hand-off. The flag only routes the Tauri app's
-        // startup.
+    /// The dev harness's way back to the classic app: being in this app is what
+    /// the toggle means, and turning it off reopens the classic app under
+    /// `tauri dev`.
+    fn classic_app_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let checked = !matches!(self.pages.switch_back, Some(SwitchBack::Running(_)));
         self.setting_row(
-            "Cap GPUI",
-            Some(
-                "You are using the native version of Cap. Turning this off closes it and reopens \
-                 the classic app. Your recordings and settings are shared.",
-            ),
-            self.toggle("enable-gpui-app", checked, cx, |this, cx| {
-                match this.pages.switch_back {
-                    Some(SwitchBack::Running(_)) => this.cancel_switch_back(cx),
-                    // Committed: the classic app is already being brought up.
-                    Some(SwitchBack::WaitingForClassic) => {}
-                    _ => this.start_switch_back(cx),
-                }
-            })
+            tr::settings::experimental::native_app(),
+            Some(tr::settings::experimental::native_app_description()),
+            self.toggle(
+                "enable-gpui-app",
+                tr::settings::experimental::native_app(),
+                checked,
+                cx,
+                |this, cx| {
+                    match this.pages.switch_back {
+                        Some(SwitchBack::Running(_)) => this.cancel_switch_back(cx),
+                        // Committed: the classic app is already being brought up.
+                        Some(SwitchBack::WaitingForClassic) => {}
+                        _ => this.start_switch_back(cx),
+                    }
+                },
+            )
             .into_any_element(),
         )
     }
@@ -2295,7 +2842,7 @@ impl SettingsWindow {
                             .text_size(px(15.))
                             .text_center()
                             .text_color(gpui::hsla(0., 0., 1., alpha))
-                            .child(SWITCH_SENTENCES[index]),
+                            .child(SWITCH_SENTENCES[index]()),
                     );
             }
             SwitchBack::WaitingForClassic => {
@@ -2307,7 +2854,7 @@ impl SettingsWindow {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_center()
                             .text_color(white)
-                            .child("Opening the classic Cap app"),
+                            .child(tr::settings::experimental::switch::opening()),
                     )
                     .child(
                         div()
@@ -2315,11 +2862,7 @@ impl SettingsWindow {
                             .text_size(px(14.))
                             .text_center()
                             .text_color(gpui::hsla(0., 0., 1., 0.7))
-                            .child(
-                                "The dev build is compiling. This window closes by itself when \
-                                 the classic app is on screen; a cold build can take a few \
-                                 minutes.",
-                            ),
+                            .child(tr::settings::experimental::switch::opening_detail()),
                     );
             }
             SwitchBack::Failed(error) => {
@@ -2356,7 +2899,11 @@ impl SettingsWindow {
                         .cursor_pointer()
                         .hover(|style| style.bg(gpui::hsla(0., 0., 1., 0.12)))
                         .on_click(cx.listener(|this, _, _window, cx| this.cancel_switch_back(cx)))
-                        .child("Cancel"),
+                        .child(if matches!(switch, SwitchBack::Failed(_)) {
+                            tr::common::close()
+                        } else {
+                            tr::common::cancel()
+                        }),
                 )
                 .into_any_element(),
         )
@@ -2411,31 +2958,23 @@ impl SettingsWindow {
         }
 
         self.pages.switch_back = Some(SwitchBack::Failed(
-            "Finish your recording, export, upload, import, or transcription task before switching to the classic app."
-                .to_string(),
+            tr::settings::experimental::switch::busy().to_string(),
         ));
         cx.notify();
         true
     }
 
-    /// Write the flag, start the classic app, then quit -- in that order, so
-    /// the app that comes up already owns the session. Nothing is written when
-    /// there is no way to start one: the flag would strand the user in an app
-    /// that redirects to one that is not installed.
+    /// Hand the session (`enableGpuiApp`) to the classic dev app, ask the dev
+    /// supervisor to start it, then quit once it is visible.
     fn finish_switch_back(&mut self, cx: &mut Context<Self>) {
         if self.switch_back_blocked(cx) {
             return;
         }
-
-        let Some(target) = classic_target() else {
+        if !dev_supervisor_available() {
             self.pages.switch_back = Some(SwitchBack::Failed(
-                "Couldn't find the Cap app to switch back to.".to_string(),
+                tr::settings::experimental::switch::not_found().to_string(),
             ));
             cx.notify();
-            return;
-        };
-
-        if self.switch_back_blocked(cx) {
             return;
         }
         if let Err(error) = crate::app_windows::flush_pending_editor_saves(cx) {
@@ -2444,86 +2983,72 @@ impl SettingsWindow {
             return;
         }
 
-        self.settings.enable_gpui_app = false;
-        self.write_bool("enableGpuiApp", false, cx);
+        if !store::set_store_setting(GENERAL_SETTINGS, "enableGpuiApp", Value::Bool(false)) {
+            self.pages.switch_back = Some(SwitchBack::Failed(
+                tr::settings::experimental::switch::save_failed().to_string(),
+            ));
+            cx.notify();
+            return;
+        }
+        let pending = store::mark_classic_pending();
+        self.pages.switch_back = Some(SwitchBack::WaitingForClassic);
+        self.pages.switch_back_ticker = None;
+        cx.notify();
 
-        let started = match &target {
-            ClassicTarget::Bundle(_) | ClassicTarget::Executable(_) => launch_classic(&target)
-                .map_err(|error| format!("Couldn't open the Cap app: {error}")),
-            ClassicTarget::DevSupervisor => store::mark_classic_pending()
-                .and_then(|()| store::request_classic_reopen())
-                .map_err(|error| format!("Couldn't request the dev app restart: {error}")),
-        };
-
-        match (started, target) {
-            // An installed bundle opens in a moment; quit right away.
-            (Ok(()), ClassicTarget::Bundle(_) | ClassicTarget::Executable(_)) => {
-                tracing::info!("handing back to the classic app");
-                quit_after_flushing_editors(cx);
-            }
-            // The dev harness has to rebuild first, which can take minutes.
-            // Stay up until the classic app deletes the pending file to say
-            // it is on screen, so the user is never staring at no app at all.
-            (Ok(()), ClassicTarget::DevSupervisor) => {
-                tracing::info!("handing back to the classic app; waiting for the dev build");
-                self.pages.switch_back = Some(SwitchBack::WaitingForClassic);
-                self.pages.switch_back_ticker = None;
-                cx.notify();
-                // A committed handoff must finish even if its settings window closes.
-                cx.spawn(async move |this, cx| {
-                    let started = std::time::Instant::now();
-                    loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(500))
-                            .await;
-                        if !store::classic_pending_path().exists() {
-                            tracing::info!("classic app is up; quitting");
-                            cx.update(quit_after_flushing_editors);
-                            break;
-                        }
-                        if started.elapsed() > CLASSIC_WAIT_TIMEOUT {
-                            this.update(cx, |this, cx| {
-                                this.pages.switch_back = Some(SwitchBack::Failed(
-                                    "The classic app hasn't come up. Check the dev terminal for \
-                                     build errors, then toggle again."
-                                        .to_string(),
-                                ));
-                                cx.notify();
-                            })
-                            .ok();
-                            break;
-                        }
+        // The handoff must finish even if its settings window closes.
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { pending.and_then(|()| store::request_classic_reopen()) })
+                .await;
+            let mut failure = result
+                .err()
+                .map(tr::settings::experimental::switch::open_failed);
+            let started = std::time::Instant::now();
+            while failure.is_none() {
+                match store::classic_pending_path().try_exists() {
+                    Ok(false) => {
+                        tracing::info!("classic app is visible; quitting GPUI");
+                        cx.update(crate::menus::quit);
+                        return;
                     }
-                })
-                .detach();
+                    Ok(true) => {}
+                    Err(error) => {
+                        failure = Some(tr::settings::experimental::switch::check_failed(error));
+                        break;
+                    }
+                }
+                if started.elapsed() >= CLASSIC_WAIT_TIMEOUT {
+                    failure = Some(tr::settings::experimental::switch::timed_out().to_string());
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
             }
-            (Err(message), _) => {
-                tracing::error!("{message}");
-                self.settings.enable_gpui_app = true;
-                self.write_bool("enableGpuiApp", true, cx);
-                self.pages.switch_back = Some(SwitchBack::Failed(message));
+            let message =
+                failure.unwrap_or_else(|| tr::settings::experimental::switch::failed().to_string());
+            tracing::error!("{message}");
+            store::clear_classic_pending();
+            store::set_store_setting(GENERAL_SETTINGS, "enableGpuiApp", Value::Bool(true));
+            this.update(cx, |this, cx| {
+                this.pages.switch_back = Some(SwitchBack::Failed(message));
                 cx.notify();
-            }
-        }
-    }
-}
-
-fn launch_classic(target: &ClassicTarget) -> std::io::Result<()> {
-    match target {
-        ClassicTarget::Bundle(bundle) => std::process::Command::new("/usr/bin/open")
-            .arg(bundle)
-            .spawn()
-            .map(drop),
-        ClassicTarget::Executable(executable) => {
-            std::process::Command::new(executable).spawn().map(drop)
-        }
-        ClassicTarget::DevSupervisor => Ok(()),
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
 // ---------------------------------------------------------------------------
 // Feedback (feedback.tsx)
 // ---------------------------------------------------------------------------
+
+/// Written into the diagnostic report, which stays English; the page shows
+/// `settings.feedback.diagnostic.no_cli_sync` in its place.
+const NO_SELFTEST_BINARY: &str =
+    "The Cap command-line tool was not found next to this build, so the sync test could not run.";
 
 impl SettingsWindow {
     /// The page's two one-shot probes: the OS string and whether there is a
@@ -2559,11 +3084,8 @@ impl SettingsWindow {
         let auth = store::auth_snapshot();
         let Some(token) = auth.token else {
             // `protectedHeaders()`'s throw.
-            self.pages.feedback = FeedbackStatus::Error(
-                "Please sign in to continue. Alternatively, email hello@cap.so or join our \
-                 Discord at cap.link/discord"
-                    .to_string(),
-            );
+            self.pages.feedback =
+                FeedbackStatus::Error(tr::settings::sign_in_required::body().to_string());
             cx.notify();
             return;
         };
@@ -2606,7 +3128,9 @@ impl SettingsWindow {
                 input.update(cx, |input, cx| input.set_disabled(false, cx));
                 this.pages.feedback = match result {
                     Ok((200, _)) => FeedbackStatus::Success,
-                    Ok(_) => FeedbackStatus::Error("Failed to submit feedback".to_string()),
+                    Ok(_) => {
+                        FeedbackStatus::Error(tr::settings::feedback::submit_failed().to_string())
+                    }
                     Err(error) => FeedbackStatus::Error(error.text()),
                 };
             },
@@ -2630,7 +3154,7 @@ impl SettingsWindow {
         // would land in whatever the user is currently recording.
         if crate::session::RecordingSession::recording_in_flight(cx) {
             self.pages.diagnostic = DiagnosticStatus::Error(
-                "Stop the current recording before running a diagnostic.".to_string(),
+                tr::settings::feedback::diagnostic::stop_recording_first().to_string(),
             );
             cx.notify();
             return;
@@ -2638,18 +3162,14 @@ impl SettingsWindow {
 
         // A stray click costs a couple of minutes of hijacked screen and loud
         // beeps, so it is confirmed the way the Tauri app confirms it.
-        let message = format!(
-            "Cap will take over your screen with a flashing pattern and play loud beeps for \
-             about {} seconds per pipeline. Take your headphones off, leave the volume \
-             audible, and leave the machine alone until it finishes.",
-            diagnostics::DEFAULT_DURATION_SECS
-        );
+        let message =
+            tr::settings::feedback::diagnostic::confirm_body(diagnostics::DEFAULT_DURATION_SECS);
         cx.spawn_in(window, async move |this, cx| {
             if !crate::platform::confirm_dialog(
-                "Run diagnostic?",
+                tr::settings::feedback::diagnostic::confirm_title(),
                 &message,
-                "Run Diagnostic",
-                "Cancel",
+                tr::settings::feedback::diagnostic::run(),
+                tr::common::cancel(),
                 true,
             ) {
                 return;
@@ -2711,14 +3231,7 @@ impl SettingsWindow {
                         }
                         // No sidecar: the environment half of the report is
                         // still worth having, with the reason recorded in it.
-                        None => (
-                            None,
-                            Some(
-                                "The Cap command-line tool was not found next to this build, so \
-                                 the sync test could not run."
-                                    .to_string(),
-                            ),
-                        ),
+                        None => (None, Some(NO_SELFTEST_BINARY.to_string())),
                     };
                     if cancel.load(Ordering::Relaxed) {
                         return Err(diagnostics::CANCELLED.to_string());
@@ -2900,7 +3413,7 @@ impl SettingsWindow {
             };
             let result = task
                 .await
-                .unwrap_or_else(|_| Err("The upload was interrupted".to_string()));
+                .unwrap_or_else(|_| Err(tr::settings::feedback::upload_interrupted().to_string()));
 
             this.update_in(cx, |this, window, cx| {
                 *this.upload_status_mut(target) = match result {
@@ -2920,9 +3433,12 @@ impl SettingsWindow {
         let theme = self.theme;
         let (text, color): (String, Hsla) = match self.upload_status(target) {
             UploadStatus::Idle => return None,
-            UploadStatus::Pending => ("Uploading...".to_string(), theme.settings_muted()),
+            UploadStatus::Pending => (
+                tr::settings::feedback::uploading().to_string(),
+                theme.settings_muted(),
+            ),
             UploadStatus::Success => (
-                "Sent. Thank you -- this helps us find the problem.".to_string(),
+                tr::settings::feedback::upload_sent().to_string(),
                 theme.settings_muted(),
             ),
             UploadStatus::Error(error) => (error.clone(), Hsla::from(theme.red_9)),
@@ -2950,19 +3466,14 @@ impl SettingsWindow {
                     .line_height(px(18.))
                     .text_color(theme.settings_text())
                     .font_weight(FontWeight::MEDIUM)
-                    .child("The test takes over your screen and makes noise."),
+                    .child(tr::settings::feedback::diagnostic::warning_title()),
             )
             .child(
                 div()
                     .text_size(px(12.))
                     .line_height(px(18.))
                     .text_color(theme.settings_muted())
-                    .child(
-                        "A fullscreen window flashes black and white while 1kHz beeps play \
-                         through your speakers, and Cap records it and measures how far the \
-                         picture and the sound have drifted apart. Leave the machine alone \
-                         while it runs. Both modes together take a couple of minutes.",
-                    ),
+                    .child(tr::settings::feedback::diagnostic::warning_body()),
             );
 
         let mode = self.pages.diagnostic_mode;
@@ -2985,18 +3496,16 @@ impl SettingsWindow {
 
         let options = self.rows(vec![
             self.setting_row(
-                "Recording mode",
-                Some("Which pipeline to test. Both runs the studio leg and then the instant one."),
+                tr::settings::feedback::diagnostic::mode_label(),
+                Some(tr::settings::feedback::diagnostic::mode_description()),
                 mode_control.into_any_element(),
             ),
             self.setting_row(
-                "Test microphone",
-                Some(
-                    "Also record your microphone and check that it hears the beeps in time. \
-                     Needs speakers the mic can actually hear.",
-                ),
+                tr::settings::feedback::diagnostic::mic_label(),
+                Some(tr::settings::feedback::diagnostic::mic_description()),
                 self.toggle(
                     "diagnostic-mic",
+                    tr::settings::feedback::diagnostic::mic_label(),
                     self.pages.diagnostic_mic,
                     cx,
                     |this, cx| {
@@ -3019,7 +3528,7 @@ impl SettingsWindow {
                             ui::ButtonVariant::Dark,
                             ui::ButtonSize::Md,
                         )
-                        .label("Run Diagnostic")
+                        .label(tr::settings::feedback::diagnostic::run())
                         .on_click(
                             cx.listener(|this, _, window, cx| this.diagnostic_run(window, cx)),
                         ),
@@ -3032,10 +3541,7 @@ impl SettingsWindow {
                         div()
                             .text_size(px(11.))
                             .text_color(theme.settings_muted())
-                            .child(
-                                "The Cap command-line tool was not found next to this build, so \
-                                 the report will cover your environment only.",
-                            ),
+                            .child(tr::settings::feedback::diagnostic::no_cli()),
                     );
                 }
             }
@@ -3055,7 +3561,7 @@ impl SettingsWindow {
                                 ui::ButtonVariant::Gray,
                                 ui::ButtonSize::Md,
                             )
-                            .label("Cancel")
+                            .label(tr::common::cancel())
                             .disabled_settings(
                                 &theme,
                                 self.pages.diagnostic_cancel.is_none()
@@ -3082,12 +3588,17 @@ impl SettingsWindow {
                     );
                 }
                 if let Some(error) = sync_test_error {
+                    let error = if error == NO_SELFTEST_BINARY {
+                        tr::settings::feedback::diagnostic::no_cli_sync().to_string()
+                    } else {
+                        error.clone()
+                    };
                     body = body.child(
                         div()
                             .text_size(px(12.))
                             .line_height(px(18.))
                             .text_color(Hsla::from(theme.red_9))
-                            .child(error.clone()),
+                            .child(error),
                     );
                 }
 
@@ -3099,9 +3610,9 @@ impl SettingsWindow {
                         ui::ButtonSize::Md,
                     )
                     .label(if self.pages.diagnostic_upload == UploadStatus::Pending {
-                        "Sending..."
+                        tr::settings::feedback::diagnostic::sending()
                     } else {
-                        "Send to Cap"
+                        tr::settings::feedback::diagnostic::send()
                     })
                     .disabled_settings(
                         &theme,
@@ -3121,8 +3632,8 @@ impl SettingsWindow {
                             ui::ButtonVariant::Gray,
                             ui::ButtonSize::Md,
                         )
-                        .label("Show File")
-                        .on_click(move |_, _, _| crate::library::reveal_in_folder(&path)),
+                        .label(tr::settings::feedback::diagnostic::show_file())
+                        .on_click(move |_, _, cx| crate::library::reveal_path(&path, cx)),
                     );
                 }
                 buttons = buttons.child(
@@ -3132,7 +3643,7 @@ impl SettingsWindow {
                         ui::ButtonVariant::Gray,
                         ui::ButtonSize::Md,
                     )
-                    .label("Run Again")
+                    .label(tr::settings::feedback::diagnostic::run_again())
                     .on_click(cx.listener(|this, _, window, cx| this.diagnostic_run(window, cx))),
                 );
                 body = body
@@ -3156,7 +3667,7 @@ impl SettingsWindow {
                                 ui::ButtonVariant::Gray,
                                 ui::ButtonSize::Md,
                             )
-                            .label("Try Again")
+                            .label(tr::settings::feedback::diagnostic::try_again())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.diagnostic_run(window, cx)),
                             ),
@@ -3184,24 +3695,28 @@ impl SettingsWindow {
         // failures, so they stay in the muted grey.
         let (label, fill, text): (&str, Hsla, Hsla) = match verdict {
             Some("pass") => (
-                "PASS",
+                tr::settings::feedback::diagnostic::verdict::pass(),
                 gpui::rgb(0x22c55e).into(),
                 gpui::rgb(0x4ade80).into(),
             ),
             Some("warn") => (
-                "WARN",
+                tr::settings::feedback::diagnostic::verdict::warn(),
                 gpui::rgb(0xf59e0b).into(),
                 gpui::rgb(0xfbbf24).into(),
             ),
-            Some("fail") => ("FAIL", theme.red_9.into(), theme.red_9.into()),
+            Some("fail") => (
+                tr::settings::feedback::diagnostic::verdict::fail(),
+                theme.red_9.into(),
+                theme.red_9.into(),
+            ),
             Some("inconclusive") => (
-                "INCONCLUSIVE",
+                tr::settings::feedback::diagnostic::verdict::inconclusive(),
                 theme.settings_muted(),
                 theme.settings_muted(),
             ),
             // No sync test in the report: the environment half still ran.
             _ => (
-                "ENVIRONMENT ONLY",
+                tr::settings::feedback::diagnostic::verdict::environment_only(),
                 theme.settings_muted(),
                 theme.settings_muted(),
             ),
@@ -3230,6 +3745,9 @@ impl SettingsWindow {
         let pending = self.pages.feedback == FeedbackStatus::Pending;
         // `disabled={feedback().trim().length < 4}`.
         let submit_disabled = pending || self.pages.feedback_draft.trim().chars().count() < 4;
+        self.pages.feedback_input.update(cx, |input, _| {
+            input.set_placeholder(tr::settings::feedback::placeholder())
+        });
 
         // The `<textarea>`: `p-2 w-full h-32 text-[13px] rounded-md border
         // bg-gray-2 border-gray-3`. The chrome lives on the container; the
@@ -3264,7 +3782,7 @@ impl SettingsWindow {
             form = form.child(
                 div()
                     .text_size(px(13.))
-                    .child("Thank you for your feedback!"),
+                    .child(tr::settings::feedback::thanks()),
             );
         }
         form = form.child(
@@ -3276,9 +3794,9 @@ impl SettingsWindow {
                     ui::ButtonSize::Md,
                 )
                 .label(if pending {
-                    "Submitting..."
+                    tr::settings::feedback::submitting()
                 } else {
-                    "Submit Feedback"
+                    tr::settings::feedback::submit()
                 })
                 .disabled_settings(&theme, submit_disabled)
                 .on_click(cx.listener(|this, _, window, cx| this.feedback_submit(window, cx))),
@@ -3292,7 +3810,7 @@ impl SettingsWindow {
                 ui::ButtonVariant::Gray,
                 ui::ButtonSize::Md,
             )
-            .label("Join Discord")
+            .label(tr::settings::feedback::join_discord())
             .on_click(|_, _, cx| cx.open_url("https://cap.link/discord")),
         );
 
@@ -3314,9 +3832,9 @@ impl SettingsWindow {
                         ui::ButtonSize::Md,
                     )
                     .label(if logs_pending {
-                        "Uploading..."
+                        tr::settings::feedback::uploading()
                     } else {
-                        "Upload Logs"
+                        tr::settings::feedback::upload_logs()
                     })
                     .disabled_settings(&theme, logs_pending)
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3331,7 +3849,7 @@ impl SettingsWindow {
                 .text_size(px(12.))
                 .line_height(px(18.))
                 .text_color(theme.settings_muted())
-                .child("Loading system information...")
+                .child(tr::settings::feedback::system_loading())
                 .into_any_element(),
             Some(version) => {
                 let info_block = |label: &'static str, value: String| {
@@ -3365,11 +3883,9 @@ impl SettingsWindow {
                     .flex()
                     .flex_col()
                     .gap(px(12.))
-                    .children(
-                        version
-                            .clone()
-                            .map(|version| info_block("Operating System", version)),
-                    )
+                    .children(version.clone().map(|version| {
+                        info_block(tr::settings::feedback::operating_system(), version)
+                    }))
                     .child(
                         div()
                             .flex()
@@ -3380,7 +3896,7 @@ impl SettingsWindow {
                                     .text_size(px(13.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme.settings_muted())
-                                    .child("Capture Support"),
+                                    .child(tr::settings::feedback::capture_support()),
                             )
                             .child(
                                 div().flex().flex_row().child(
@@ -3402,19 +3918,16 @@ impl SettingsWindow {
                                         } else {
                                             theme.red_9
                                         }))
-                                        .child(format!(
-                                            "Screen Capture: {}",
-                                            if capture_supported {
-                                                "Supported"
-                                            } else {
-                                                "Not Supported"
-                                            }
-                                        )),
+                                        .child(if capture_supported {
+                                            tr::settings::feedback::capture_supported()
+                                        } else {
+                                            tr::settings::feedback::capture_unsupported()
+                                        }),
                                 ),
                             ),
                     )
                     .child(info_block(
-                        "App Version",
+                        tr::settings::feedback::app_version(),
                         format!("v{}", env!("CARGO_PKG_VERSION")),
                     ))
                     .into_any_element()
@@ -3423,49 +3936,40 @@ impl SettingsWindow {
 
         vec![
             self.section(
-                "Feedback",
-                Some(
-                    "Help us improve Cap by submitting feedback or reporting bugs. We'll get \
-                     right on it.",
-                ),
+                tr::settings::feedback::title(),
+                Some(tr::settings::feedback::description()),
                 None,
                 vec![form.into_any_element()],
             )
             .into_any_element(),
             self.section(
-                "Join the Community",
-                Some(
-                    "Have questions, want to share ideas, or just hang out? Join the Cap \
-                     Discord community.",
-                ),
+                tr::settings::feedback::community_title(),
+                Some(tr::settings::feedback::community_description()),
                 None,
                 vec![discord.into_any_element()],
             )
             .into_any_element(),
             self.section(
-                "Diagnostic Report",
-                Some(
-                    "Records a short flashing/beeping test pattern, measures how far the \
-                     picture and sound drift apart, and snapshots your displays, cameras, \
-                     microphones, disk space and recording settings. Nothing is sent \
-                     anywhere until you choose to send it.",
-                ),
+                tr::settings::feedback::diagnostic::title(),
+                Some(tr::settings::feedback::diagnostic::description()),
                 None,
                 vec![self.render_diagnostic(cx)],
             )
             .into_any_element(),
             self.section(
-                "Debug Information",
-                Some(
-                    "Upload your logs to help us diagnose issues with Cap. No personal \
-                     information is included.",
-                ),
+                tr::settings::feedback::debug_title(),
+                Some(tr::settings::feedback::debug_description()),
                 None,
                 vec![upload_logs.into_any_element()],
             )
             .into_any_element(),
-            self.section("System Information", None, None, vec![system_info])
-                .into_any_element(),
+            self.section(
+                tr::settings::feedback::system_title(),
+                None,
+                None,
+                vec![system_info],
+            )
+            .into_any_element(),
         ]
     }
 }
@@ -3533,7 +4037,7 @@ impl SettingsWindow {
                 this.pages.changelog = Some(match result {
                     Ok((200, body)) => serde_json::from_value::<Vec<ChangelogEntry>>(body)
                         .map_err(|error| error.to_string()),
-                    Ok(_) => Err("Failed to fetch changelog".to_string()),
+                    Ok(_) => Err(tr::settings::changelog::fetch_failed().to_string()),
                     Err(error) => Err(error.text()),
                 });
             },
@@ -3552,7 +4056,7 @@ impl SettingsWindow {
                     .items_center()
                     .justify_center()
                     .text_color(theme.settings_muted())
-                    .child("Loading changelog...")
+                    .child(tr::settings::changelog::loading())
                     .into_any_element(),
             ],
             Some(Err(error)) => vec![
@@ -3590,7 +4094,7 @@ impl SettingsWindow {
                                                 .text_size(px(12.))
                                                 .font_weight(FontWeight::BOLD)
                                                 .text_color(gpui::white())
-                                                .child("NEW"),
+                                                .child(tr::settings::changelog::new()),
                                         ),
                                     )
                                 })
@@ -3607,10 +4111,9 @@ impl SettingsWindow {
                                         .line_height(px(18.))
                                         .text_color(theme.settings_muted())
                                         .mb(px(16.))
-                                        .child(format!(
-                                            "Version {} - {}",
-                                            entry.version,
-                                            changelog_date(&entry.published_at)
+                                        .child(tr::settings::changelog::version(
+                                            &entry.version,
+                                            changelog_date(&entry.published_at),
                                         )),
                                 )
                                 .child(div().flex().flex_col().gap(px(10.)).children(
@@ -3697,44 +4200,6 @@ fn markdown_paragraphs(content: &str) -> Vec<MarkdownParagraph> {
 const LICENSE_API_BASE: &str = "https://l.cap.so/api";
 
 impl SettingsWindow {
-    /// `createCommercialCheckoutUrl`, opened externally.
-    fn license_checkout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pages.license_checkout_pending {
-            return;
-        }
-        self.pages.license_checkout_pending = true;
-        let kind = if self.pages.license_annual {
-            "yearly"
-        } else {
-            "lifetime"
-        };
-        let url = format!("{LICENSE_API_BASE}/commercial/checkout");
-        self.spawn_tokio(
-            window,
-            cx,
-            async move {
-                http_json(
-                    reqwest::Method::POST,
-                    url,
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                    HttpBody::Json(json!({ "type": kind })),
-                    None,
-                )
-                .await
-            },
-            |this, result, _window, cx| {
-                this.pages.license_checkout_pending = false;
-                if let Ok((200, body)) = result
-                    && let Some(url) = body.get("url").and_then(Value::as_str)
-                {
-                    cx.open_url(url);
-                }
-            },
-        );
-    }
-
     /// `activateCommercialLicense`: key and instance id go as headers, and a
     /// 200 writes `general_settings.commercialLicense` in the exact shape
     /// license.tsx's `onActivated` writes.
@@ -3743,7 +4208,7 @@ impl SettingsWindow {
             return;
         }
         let Some(instance_id) = store::instance_id_or_create() else {
-            self.pages.license_error = Some("No instance ID found".to_string());
+            self.pages.license_error = Some(tr::settings::license::no_instance().to_string());
             cx.notify();
             return;
         };
@@ -3781,7 +4246,7 @@ impl SettingsWindow {
                         };
                         if !store::set_commercial_license(Some(&license)) {
                             this.pages.license_error =
-                                Some("Failed to save the license".to_string());
+                                Some(tr::settings::license::save_failed().to_string());
                             return;
                         }
                         this.pages.license_draft.clear();
@@ -3805,66 +4270,149 @@ impl SettingsWindow {
     pub(crate) fn render_license(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let theme = self.theme;
         let auth = store::auth_snapshot();
-
-        // `createLicenseQuery`: pro from the auth plan, else commercial from
-        // the store, else the purchase/activate pair.
-        if auth.plan_upgraded {
-            return vec![
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .w_full()
-                    .pt(px(96.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap(px(12.))
-                            .w_full()
-                            .max_w(px(448.))
-                            .p(px(24.))
-                            .rounded(px(24.))
-                            .border_1()
-                            .border_color(theme.settings_border())
-                            .bg(theme.settings_card_bg())
-                            .child(
-                                div()
-                                    .text_size(px(24.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child("Cap Pro License"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .line_height(px(20.))
-                                    .text_color(theme.settings_muted())
-                                    .child(
-                                        "Your account is upgraded to Cap Pro and already \
-                                         includes a commercial license.",
-                                    ),
-                            ),
-                    )
-                    .into_any_element(),
-            ];
+        let pro = auth.is_upgraded();
+        let license = store::commercial_license();
+        let (name, description) = if pro {
+            ("Cap Pro", tr::settings::license::pro_description())
+        } else if license.is_some() {
+            (
+                tr::settings::license::desktop_name(),
+                tr::settings::license::desktop_description(),
+            )
+        } else {
+            ("Cap Free", tr::settings::license::free_description())
+        };
+        let mut content = vec![
+            self.section(
+                tr::settings::license::title(),
+                Some(tr::settings::license::description()),
+                None,
+                vec![],
+            )
+            .into_any_element(),
+            self.section(
+                tr::settings::license::plan_title(),
+                None,
+                None,
+                vec![
+                    self.card(true)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .text_size(px(18.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .line_height(px(18.))
+                                        .text_color(theme.settings_muted())
+                                        .child(description),
+                                )
+                                .when(auth.signed_in(), |this| {
+                                    this.child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .items_start()
+                                            .gap(px(8.))
+                                            .child(self.button(
+                                                "refresh-plan",
+                                                (ui::ButtonVariant::Gray, None),
+                                                if self.plan_refresh_pending {
+                                                    tr::settings::license::checking()
+                                                } else {
+                                                    tr::settings::license::refresh()
+                                                },
+                                                self.plan_refresh_pending,
+                                                cx,
+                                                |this, window, cx| this.refresh_plan(window, cx),
+                                            ))
+                                            .when(self.plan_refresh_failed, |this| {
+                                                this.child(
+                                                    div()
+                                                        .text_size(px(12.))
+                                                        .text_color(theme.settings_muted())
+                                                        .child(
+                                                            tr::settings::license::refresh_failed(),
+                                                        ),
+                                                )
+                                            }),
+                                    )
+                                })
+                                .when(!auth.signed_in(), |this| {
+                                    this.child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .line_height(px(18.))
+                                            .text_color(theme.settings_muted())
+                                            .child(tr::settings::license::sign_in_hint()),
+                                    )
+                                }),
+                        )
+                        .into_any_element(),
+                ],
+            )
+            .into_any_element(),
+            self.section(
+                tr::settings::license::explore_title(),
+                Some(tr::settings::license::explore_description()),
+                None,
+                vec![
+                    self.card(true)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .gap(px(12.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .line_height(px(18.))
+                                        .child(tr::settings::license::explore_desktop()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .line_height(px(18.))
+                                        .child(tr::settings::license::explore_pro()),
+                                )
+                                .child(
+                                    ui::Button::settings(
+                                        &theme,
+                                        "license-pricing",
+                                        ui::ButtonVariant::Dark,
+                                        ui::ButtonSize::Sm,
+                                    )
+                                    .label(tr::settings::license::view_pricing())
+                                    .on_click(|_, _, cx| cx.open_url(crate::auth::PRICING_URL)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme.settings_muted())
+                                        .child(tr::settings::license::opens_pricing()),
+                                ),
+                        )
+                        .into_any_element(),
+                ],
+            )
+            .into_any_element(),
+        ];
+        if !pro {
+            content.push(if let Some(license) = license {
+                self.render_license_active(license, cx)
+            } else {
+                self.render_license_activate(cx).into_any_element()
+            });
         }
-
-        if let Some(license) = store::commercial_license() {
-            return vec![self.render_license_active(license, cx)];
-        }
-
-        vec![
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(12.))
-                .w_full()
-                .child(self.render_license_purchase(cx))
-                .child(self.render_license_activate(cx))
-                .into_any_element(),
-        ]
+        content
     }
 
     /// The activated-commercial card.
@@ -3903,7 +4451,7 @@ impl SettingsWindow {
                             div()
                                 .text_size(px(24.))
                                 .font_weight(FontWeight::MEDIUM)
-                                .child("Commercial License"),
+                                .child(tr::settings::license::active_title()),
                         ),
                     )
                     .child(
@@ -3911,7 +4459,7 @@ impl SettingsWindow {
                             .flex()
                             .flex_col()
                             .gap(px(8.))
-                            .child(div().text_size(px(13.)).child("License Key"))
+                            .child(div().text_size(px(13.)).child(tr::settings::license::key()))
                             .child(
                                 div()
                                     .p(px(12.))
@@ -3931,7 +4479,11 @@ impl SettingsWindow {
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.))
-                                .child(div().text_size(px(13.)).child("Expires"))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .child(tr::settings::license::expires()),
+                                )
                                 .child(
                                     div()
                                         .text_size(px(13.))
@@ -3944,7 +4496,7 @@ impl SettingsWindow {
                     .child(div().flex().flex_col().items_center().child(self.button(
                         "license-deactivate",
                         (ui::ButtonVariant::Destructive, None),
-                        "Deactivate License",
+                        tr::settings::license::deactivate(),
                         false,
                         cx,
                         |this, _window, cx| {
@@ -3959,173 +4511,14 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    /// `CommercialLicensePurchase`'s pricing card. The Rive card-stack
-    /// animation has no gpui equivalent and is omitted.
-    fn render_license_purchase(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let annual = self.pages.license_annual;
-        let pending = self.pages.license_checkout_pending;
-
-        let left = div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(16.))
-            .p(px(20.))
-            .flex_1()
-            .min_w_0()
-            .rounded_l(px(12.))
-            .border_1()
-            .border_color(theme.settings_border())
-            .bg(theme.settings_fill())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .text_size(px(24.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Commercial License"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(theme.settings_muted())
-                            .child("For commercial use"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .mt(px(20.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_end()
-                            .child(div().text_size(px(36.)).child(if annual {
-                                "$29"
-                            } else {
-                                "$58"
-                            }))
-                            .child(
-                                div()
-                                    .text_size(px(16.))
-                                    .text_color(theme.settings_muted())
-                                    .child(".00 /"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(16.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.settings_muted())
-                            .child(if annual {
-                                "billed annually"
-                            } else {
-                                "one-time payment"
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .id("license-billing-toggle")
-                    .px(px(12.))
-                    .py(px(8.))
-                    .rounded_full()
-                    .bg(theme.settings_selection())
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.settings_fill()))
-                    .child(div().text_size(px(12.)).child(format!(
-                        "Switch to {}: {}",
-                        if annual { "lifetime" } else { "yearly" },
-                        if annual { "$58" } else { "$29" }
-                    )))
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.pages.license_annual = !this.pages.license_annual;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div().w_full().mt(px(40.)).child(
-                    ui::Button::settings(
-                        &theme,
-                        "license-purchase",
-                        ui::ButtonVariant::Dark,
-                        ui::ButtonSize::Lg,
-                    )
-                    .label(if pending {
-                        "Loading..."
-                    } else {
-                        "Purchase License"
-                    })
-                    .radius(px(24.))
-                    .height(px(48.))
-                    .full_width()
-                    .font_weight(FontWeight::MEDIUM)
-                    .disabled_settings(&theme, pending)
-                    .on_click(cx.listener(|this, _, window, cx| this.license_checkout(window, cx))),
-                ),
-            );
-
-        let features = [
-            "Commercial Use of Cap Recorder + Editor",
-            "Community Support",
-            "Local-only features",
-            "Perpetual license option",
-        ];
-        let right = div()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .items_center()
-            .gap(px(16.))
-            .p(px(20.))
-            .flex_1()
-            .min_w_0()
-            .rounded_r(px(12.))
-            .border_1()
-            .border_color(theme.settings_border())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .children(features.into_iter().map(|feature| {
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(4.))
-                            .child(
-                                svg()
-                                    .path("icons/check.svg")
-                                    .size(px(16.))
-                                    .flex_shrink_0()
-                                    .text_color(theme.settings_text()),
-                            )
-                            .child(div().text_size(px(14.)).child(feature))
-                    })),
-            );
-
-        div()
-            .w_full()
-            .max_w(px(700.))
-            .rounded(px(12.))
-            .bg(theme.settings_card_bg())
-            .child(div().flex().flex_row().child(left).child(right))
-    }
-
     /// `LicenseKeyActivate`.
     fn render_license_activate(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let activating = self.pages.license_activating;
         let disabled = activating || self.pages.license_draft.trim().is_empty();
+        self.pages.license_input.update(cx, |input, _| {
+            input.set_placeholder(tr::settings::license::placeholder())
+        });
 
         div()
             .flex()
@@ -4143,7 +4536,7 @@ impl SettingsWindow {
                     .text_size(px(20.))
                     .text_center()
                     .mb(px(8.))
-                    .child("Have a license key?"),
+                    .child(tr::settings::license::have_key()),
             )
             .child(self.pages_input("license-key-input", &self.pages.license_input))
             .child(
@@ -4156,9 +4549,9 @@ impl SettingsWindow {
                         "license-activate",
                         (ui::ButtonVariant::Primary, None),
                         if activating {
-                            "Activating..."
+                            tr::settings::license::activating()
                         } else {
-                            "Activate License"
+                            tr::settings::license::activate()
                         },
                         disabled,
                         cx,
@@ -4269,7 +4662,8 @@ impl SettingsWindow {
             |this, result, _window, cx| {
                 this.pages.s3.loading = false;
                 let Ok((200, body)) = result else {
-                    this.pages.s3.error = Some("Failed to fetch S3 config".to_string());
+                    this.pages.s3.error =
+                        Some(tr::settings::integrations::s3::fetch_failed().to_string());
                     return;
                 };
                 let source = body
@@ -4359,9 +4753,12 @@ impl SettingsWindow {
                 match result {
                     Ok((200, _)) => {
                         this.s3_fetch(window, cx);
-                        this.info_dialog("S3 configuration saved successfully", window, cx);
+                        this.info_dialog(tr::settings::integrations::s3::saved(), window, cx);
                     }
-                    _ => this.pages.s3.error = Some("Failed to save S3 config".to_string()),
+                    _ => {
+                        this.pages.s3.error =
+                            Some(tr::settings::integrations::s3::save_failed().to_string())
+                    }
                 }
             },
         );
@@ -4395,9 +4792,12 @@ impl SettingsWindow {
                 match result {
                     Ok((200, _)) => {
                         this.s3_fetch(window, cx);
-                        this.info_dialog("S3 configuration deleted successfully", window, cx);
+                        this.info_dialog(tr::settings::integrations::s3::deleted(), window, cx);
                     }
-                    _ => this.pages.s3.error = Some("Failed to delete S3 config".to_string()),
+                    _ => {
+                        this.pages.s3.error =
+                            Some(tr::settings::integrations::s3::delete_failed().to_string())
+                    }
                 }
             },
         );
@@ -4431,23 +4831,16 @@ impl SettingsWindow {
             |this, result, window, cx| {
                 this.pages.s3.testing = false;
                 match result {
-                    Ok((200, _)) => this.info_dialog(
-                        "S3 configuration test successful! Connection is working.",
-                        window,
-                        cx,
-                    ),
+                    Ok((200, _)) => {
+                        this.info_dialog(tr::settings::integrations::s3::test_ok(), window, cx)
+                    }
                     Ok(_) => {
-                        this.pages.s3.error = Some(
-                            "S3 connection test failed. Check your config and network connection."
-                                .to_string(),
-                        )
+                        this.pages.s3.error =
+                            Some(tr::settings::integrations::s3::test_failed().to_string())
                     }
                     Err(HttpError::Timeout) => {
-                        this.pages.s3.error = Some(
-                            "Connection test timed out after 5 seconds. Please check your \
-                             endpoint URL and network connection."
-                                .to_string(),
-                        )
+                        this.pages.s3.error =
+                            Some(tr::settings::integrations::s3::test_timeout().to_string())
                     }
                     Err(error) => this.pages.s3.error = Some(error.text()),
                 }
@@ -4507,7 +4900,6 @@ impl SettingsWindow {
             "{}/api/desktop/storage/google-drive/connect",
             self.settings.server_url
         );
-        let server = self.settings.server_url.clone();
         self.spawn_tokio(
             window,
             cx,
@@ -4532,12 +4924,10 @@ impl SettingsWindow {
                             this.gdrive_wait_for_connection(window, cx);
                         }
                     }
-                    // `showWindow("Upgrade")` has no gpui equivalent; the
-                    // pricing page is the closest external destination.
-                    Ok((403, _)) => cx.open_url(&format!("{server}/pricing")),
+                    Ok((403, _)) => cx.open_url(crate::auth::PRICING_URL),
                     Ok(_) => {
                         this.pages.gdrive.error =
-                            Some("Failed to start Google Drive connection".to_string())
+                            Some(tr::settings::integrations::gdrive::connect_failed().to_string())
                     }
                     Err(error) => this.pages.gdrive.error = Some(error.text()),
                 }
@@ -4613,7 +5003,7 @@ impl SettingsWindow {
             this.update_in(cx, |this, window, cx| {
                 this.pages.gdrive.waiting = false;
                 this.info_dialog(
-                    "Finish connecting Google Drive in your browser, then return here and refresh.",
+                    tr::settings::integrations::gdrive::finish_in_browser(),
                     window,
                     cx,
                 );
@@ -4662,16 +5052,14 @@ impl SettingsWindow {
                 match result {
                     Ok((200, body)) => {
                         let message = match body.get("email").and_then(Value::as_str) {
-                            Some(email) => {
-                                format!("Google Drive connection is working for {email}")
-                            }
-                            None => "Google Drive connection is working".to_string(),
+                            Some(email) => tr::settings::integrations::gdrive::working_for(email),
+                            None => tr::settings::integrations::gdrive::working().to_string(),
                         };
                         this.info_dialog(&message, window, cx);
                     }
                     _ => {
                         this.pages.gdrive.error =
-                            Some("Google Drive connection test failed".to_string())
+                            Some(tr::settings::integrations::gdrive::test_failed().to_string())
                     }
                 }
             },
@@ -4714,8 +5102,9 @@ impl SettingsWindow {
                 match result {
                     Ok((200, _)) => this.gdrive_refresh(window, cx),
                     _ => {
-                        this.pages.gdrive.error =
-                            Some("Failed to update active storage provider".to_string())
+                        this.pages.gdrive.error = Some(
+                            tr::settings::integrations::gdrive::set_active_failed().to_string(),
+                        )
                     }
                 }
             },
@@ -4753,11 +5142,16 @@ impl SettingsWindow {
                 match result {
                     Ok((200, _)) => {
                         this.gdrive_refresh(window, cx);
-                        this.info_dialog("Google Drive disconnected", window, cx);
+                        this.info_dialog(
+                            tr::settings::integrations::gdrive::disconnected(),
+                            window,
+                            cx,
+                        );
                     }
                     _ => {
-                        this.pages.gdrive.error =
-                            Some("Failed to disconnect Google Drive".to_string())
+                        this.pages.gdrive.error = Some(
+                            tr::settings::integrations::gdrive::disconnect_failed().to_string(),
+                        )
                     }
                 }
             },
@@ -4782,25 +5176,18 @@ impl SettingsWindow {
             .as_ref()
             .and_then(|storage| storage.managed_by_organization.as_ref())
             .map(|organization| organization.name.clone());
-        let server = self.settings.server_url.clone();
 
         let apps: [(&'static str, &'static str, &'static str, IntegrationsView); 2] = [
             (
                 "Google Drive",
                 "icons/google-drive.svg",
-                "Connect Google Drive for new shareable link uploads. Cap stores new videos in \
-                 a private Cap folder in your Drive and continues serving them through Cap \
-                 after normal access checks.",
+                tr::settings::integrations::google_drive_description(),
                 IntegrationsView::GoogleDrive,
             ),
             (
-                "S3 Config",
+                tr::settings::integrations::s3_name(),
                 "icons/database.svg",
-                "Connect your own S3 bucket for complete control over your data storage. All \
-                 new shareable link uploads will be automatically uploaded to your configured \
-                 S3 bucket, ensuring you maintain complete ownership and control over your \
-                 content. Perfect for organizations requiring data sovereignty and custom \
-                 storage policies.",
+                tr::settings::integrations::s3_description(),
                 IntegrationsView::S3,
             ),
         ];
@@ -4813,14 +5200,13 @@ impl SettingsWindow {
                 .children(apps.into_iter().enumerate().map(
                     |(index, (name, icon, description, view))| {
                         let button_label = if managed.is_some() {
-                            "Managed by your organization"
+                            tr::settings::integrations::managed()
                         } else if !is_pro {
-                            "Upgrade to Pro"
+                            tr::settings::integrations::upgrade()
                         } else {
-                            "Configure"
+                            tr::settings::integrations::configure()
                         };
                         let managed_here = managed.is_some();
-                        let server = server.clone();
                         self.card(true)
                             .flex()
                             .flex_col()
@@ -4859,9 +5245,7 @@ impl SettingsWindow {
                                                 return;
                                             }
                                             if !store::auth_snapshot().plan_upgraded {
-                                                // `showWindow("Upgrade")` in the Tauri
-                                                // app; no upgrade window exists here.
-                                                cx.open_url(&format!("{server}/pricing"));
+                                                cx.open_url(crate::auth::PRICING_URL);
                                                 return;
                                             }
                                             match view {
@@ -4886,11 +5270,8 @@ impl SettingsWindow {
 
         vec![
             self.section(
-                "Integrations",
-                Some(
-                    "Configure integrations to extend Cap's functionality and connect with \
-                     third-party services.",
-                ),
+                tr::settings::integrations::title(),
+                Some(tr::settings::integrations::description()),
                 None,
                 vec![cards.into_any_element()],
             )
@@ -4913,7 +5294,7 @@ impl SettingsWindow {
             .child(self.button(
                 "integration-back",
                 (ui::ButtonVariant::Gray, Some("icons/arrow-left.svg")),
-                "Back",
+                tr::common::back(),
                 false,
                 cx,
                 |this, _window, cx| {
@@ -4937,16 +5318,17 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap(px(6.))
-            .child(div().text_size(px(13.)).child("Sign in required"))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .child(tr::settings::sign_in_required::title()),
+            )
             .child(
                 div()
                     .text_size(px(12.))
                     .line_height(px(18.))
                     .text_color(theme.settings_muted())
-                    .child(
-                        "Please sign in to continue. Alternatively, email hello@cap.so or join \
-                         our Discord at cap.link/discord",
-                    ),
+                    .child(tr::settings::sign_in_required::body()),
             )
             .into_any_element()
     }
@@ -4955,14 +5337,14 @@ impl SettingsWindow {
         let theme = self.theme;
         let auth = store::auth_snapshot();
         let header = self
-            .render_config_header("S3 Config", cx)
+            .render_config_header(tr::settings::integrations::s3_name(), cx)
             .into_any_element();
 
         if !auth.signed_in() {
             return vec![
                 header,
                 self.section(
-                    "Configuration",
+                    tr::settings::integrations::s3::configuration(),
                     None,
                     None,
                     vec![self.render_sign_in_required()],
@@ -4978,8 +5360,7 @@ impl SettingsWindow {
         let provider_label = S3_PROVIDERS
             .iter()
             .find(|(value, _)| *value == s3.provider)
-            .map(|(_, label)| *label)
-            .unwrap_or("AWS S3");
+            .map_or("AWS S3", |(_, label)| label());
 
         let mut form = div().flex().flex_col().gap(px(16.));
         if let Some(organization) = managed.clone() {
@@ -4988,7 +5369,7 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .line_height(px(18.))
                     .text_color(theme.settings_muted())
-                    .child(format!("Managed by your organization: {organization}")),
+                    .child(tr::settings::integrations::managed_by(organization)),
             );
         }
         form = form.child(
@@ -4996,7 +5377,11 @@ impl SettingsWindow {
                 .flex()
                 .flex_col()
                 .gap(px(8.))
-                .child(div().text_size(px(13.)).child("Storage Provider"))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .child(tr::settings::integrations::s3::provider()),
+                )
                 .child(
                     self.pages_select("s3-provider", provider_label, MenuKind::S3Provider, cx)
                         .stretch_label()
@@ -5011,13 +5396,17 @@ impl SettingsWindow {
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .child(div().text_size(px(13.)).child(*label))
+                    .child(div().text_size(px(13.)).child(label()))
                     .child(self.pages_input(("s3-field", index), &s3.inputs[index])),
             );
         }
 
         // The custom section header carries the linked Storage Config Guide,
         // which `ui::Section`'s plain-string description cannot.
+        let guide_intro = tr::settings::integrations::s3::guide_intro(COMMAND_MARKER);
+        let (before_guide, after_guide) = guide_intro
+            .split_once(COMMAND_MARKER)
+            .unwrap_or((guide_intro.as_str(), ""));
         let section_header = div()
             .flex()
             .flex_col()
@@ -5027,7 +5416,7 @@ impl SettingsWindow {
                 div()
                     .text_size(px(14.))
                     .font_weight(FontWeight::BOLD)
-                    .child("Configuration"),
+                    .child(tr::settings::integrations::s3::configuration()),
             )
             .child(
                 div()
@@ -5037,20 +5426,17 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .line_height(px(18.))
                     .text_color(theme.settings_muted())
-                    .child(
-                        "It should take under 10 minutes to set up and connect your storage \
-                         bucket to Cap. View the\u{a0}",
-                    )
+                    .child(before_guide.to_string())
                     .child(
                         div()
                             .id("s3-guide-link")
                             .text_color(theme.settings_text())
                             .underline()
                             .cursor_pointer()
-                            .child("Storage Config Guide")
+                            .child(tr::settings::integrations::s3::guide())
                             .on_click(|_, _, cx| cx.open_url("https://cap.so/docs/s3-config")),
                     )
-                    .child("\u{a0}to get started."),
+                    .child(after_guide.to_string()),
             );
 
         let footer = div()
@@ -5068,9 +5454,9 @@ impl SettingsWindow {
                             "s3-remove",
                             (ui::ButtonVariant::Destructive, None),
                             if s3.deleting {
-                                "Removing..."
+                                tr::settings::integrations::s3::removing()
                             } else {
-                                "Remove Config"
+                                tr::settings::integrations::s3::remove()
                             },
                             busy,
                             cx,
@@ -5081,9 +5467,9 @@ impl SettingsWindow {
                         "s3-test",
                         (ui::ButtonVariant::Gray, None),
                         if s3.testing {
-                            "Testing..."
+                            tr::settings::integrations::s3::testing()
                         } else {
-                            "Test Connection"
+                            tr::settings::integrations::s3::test()
                         },
                         busy,
                         cx,
@@ -5093,7 +5479,11 @@ impl SettingsWindow {
             .child(self.button(
                 "s3-save",
                 (ui::ButtonVariant::Primary, None),
-                if s3.saving { "Saving..." } else { "Save" },
+                if s3.saving {
+                    tr::settings::integrations::s3::saving()
+                } else {
+                    tr::common::save()
+                },
                 busy,
                 cx,
                 |this, window, cx| this.s3_save(window, cx),
@@ -5133,11 +5523,8 @@ impl SettingsWindow {
             return vec![
                 header,
                 self.section(
-                    "Connection",
-                    Some(
-                        "Google Drive stores new uploads in a private Cap folder in your Drive. \
-                         Existing Cap-hosted and S3 videos keep using their current storage.",
-                    ),
+                    tr::settings::integrations::gdrive::connection_title(),
+                    Some(tr::settings::integrations::gdrive::connection_description()),
                     None,
                     vec![self.render_sign_in_required()],
                 )
@@ -5171,7 +5558,7 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .line_height(px(18.))
                     .text_color(theme.settings_muted())
-                    .child(format!("Managed by your organization: {organization}")),
+                    .child(tr::settings::integrations::managed_by(organization)),
             );
         }
         card = card.child(
@@ -5199,12 +5586,12 @@ impl SettingsWindow {
                                 .text_color(theme.settings_muted())
                                 .child(if connected {
                                     if active {
-                                        "Active for new uploads"
+                                        tr::settings::integrations::gdrive::active_for_uploads()
                                     } else {
-                                        "Connected but not active"
+                                        tr::settings::integrations::gdrive::connected_inactive()
                                     }
                                 } else {
-                                    "Not connected"
+                                    tr::settings::integrations::gdrive::not_connected()
                                 }),
                         ),
                 )
@@ -5212,9 +5599,9 @@ impl SettingsWindow {
                     "gdrive-refresh",
                     (ui::ButtonVariant::Gray, None),
                     if gdrive.refreshing {
-                        "Refreshing..."
+                        tr::settings::integrations::gdrive::refreshing()
                     } else {
-                        "Refresh"
+                        tr::settings::integrations::gdrive::refresh()
                     },
                     busy,
                     cx,
@@ -5224,11 +5611,11 @@ impl SettingsWindow {
 
         if !connected {
             let connect_label = if gdrive.waiting {
-                "Waiting..."
+                tr::settings::integrations::gdrive::waiting()
             } else if gdrive.connect_pending {
-                "Opening..."
+                tr::settings::integrations::gdrive::opening()
             } else {
-                "Connect Google Drive"
+                tr::settings::integrations::gdrive::connect()
             };
             card = card.child(div().flex().flex_row().child(self.button(
                 "gdrive-connect",
@@ -5251,7 +5638,11 @@ impl SettingsWindow {
                     .child(self.button(
                         "gdrive-use",
                         (ui::ButtonVariant::Primary, None),
-                        if active { "Active" } else { "Use Google Drive" },
+                        if active {
+                            tr::settings::integrations::gdrive::active()
+                        } else {
+                            tr::settings::integrations::gdrive::use_drive()
+                        },
                         busy || active,
                         cx,
                         |this, window, cx| this.gdrive_set_active("googleDrive", window, cx),
@@ -5260,7 +5651,7 @@ impl SettingsWindow {
                         this.child(self.button(
                             "gdrive-use-s3",
                             (ui::ButtonVariant::Gray, None),
-                            "Use S3",
+                            tr::settings::integrations::gdrive::use_s3(),
                             busy || !active,
                             cx,
                             |this, window, cx| this.gdrive_set_active("s3", window, cx),
@@ -5269,7 +5660,11 @@ impl SettingsWindow {
                     .child(self.button(
                         "gdrive-test",
                         (ui::ButtonVariant::Gray, None),
-                        if gdrive.testing { "Testing..." } else { "Test" },
+                        if gdrive.testing {
+                            tr::settings::integrations::gdrive::testing()
+                        } else {
+                            tr::settings::integrations::gdrive::test()
+                        },
                         busy,
                         cx,
                         |this, window, cx| this.gdrive_test(window, cx),
@@ -5277,7 +5672,7 @@ impl SettingsWindow {
                     .child(self.button(
                         "gdrive-disconnect",
                         (ui::ButtonVariant::Destructive, None),
-                        "Disconnect",
+                        tr::settings::integrations::gdrive::disconnect(),
                         busy,
                         cx,
                         |this, window, cx| this.gdrive_disconnect(window, cx),
@@ -5296,11 +5691,8 @@ impl SettingsWindow {
         vec![
             header,
             self.section(
-                "Connection",
-                Some(
-                    "Google Drive stores new uploads in a private Cap folder in your Drive. \
-                     Existing Cap-hosted and S3 videos keep using their current storage.",
-                ),
+                tr::settings::integrations::gdrive::connection_title(),
+                Some(tr::settings::integrations::gdrive::connection_description()),
                 None,
                 vec![self.card(true).child(card).into_any_element()],
             )
@@ -5315,8 +5707,8 @@ impl SettingsWindow {
         // `quotaUsageLabel()`.
         let usage_label = format_bytes(quota.usage.as_deref()).map(|usage| {
             match format_bytes(quota.limit.as_deref()) {
-                Some(limit) => format!("{usage} of {limit} used"),
-                None => format!("{usage} used"),
+                Some(limit) => tr::settings::integrations::gdrive::used_of(usage, limit),
+                None => tr::settings::integrations::gdrive::used(usage),
             }
         });
         // `quotaUsagePercent()`.
@@ -5337,10 +5729,11 @@ impl SettingsWindow {
         };
         // `quotaTimestampLabel()`.
         let timestamp = format_timestamp(&quota.fetched_at).map(|formatted| {
-            format!(
-                "{} {formatted}",
-                if quota.stale { "Cached" } else { "Updated" }
-            )
+            if quota.stale {
+                tr::settings::integrations::gdrive::cached(formatted)
+            } else {
+                tr::settings::integrations::gdrive::updated(formatted)
+            }
         });
 
         let detail_row = |label: &'static str, value: String| {
@@ -5373,7 +5766,11 @@ impl SettingsWindow {
                             .flex_col()
                             .gap(px(2.))
                             .min_w_0()
-                            .child(div().text_size(px(13.)).child("Storage"))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .child(tr::settings::integrations::gdrive::storage()),
+                            )
                             .children(usage_label.map(|label| {
                                 div()
                                     .text_size(px(12.))
@@ -5409,17 +5806,16 @@ impl SettingsWindow {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
+                    .children(format_bytes(quota.remaining.as_deref()).map(|value| {
+                        detail_row(tr::settings::integrations::gdrive::remaining(), value)
+                    }))
+                    .children(format_bytes(quota.usage_in_drive.as_deref()).map(|value| {
+                        detail_row(tr::settings::integrations::gdrive::drive_files(), value)
+                    }))
                     .children(
-                        format_bytes(quota.remaining.as_deref())
-                            .map(|value| detail_row("Remaining", value)),
-                    )
-                    .children(
-                        format_bytes(quota.usage_in_drive.as_deref())
-                            .map(|value| detail_row("Drive files", value)),
-                    )
-                    .children(
-                        format_bytes(quota.usage_in_drive_trash.as_deref())
-                            .map(|value| detail_row("Trash", value)),
+                        format_bytes(quota.usage_in_drive_trash.as_deref()).map(|value| {
+                            detail_row(tr::settings::integrations::gdrive::trash(), value)
+                        }),
                     ),
             )
     }
@@ -5523,10 +5919,19 @@ const ALL_CONDITION_TYPES: [ConditionType; 6] = [
     ConditionType::OrganizationIs,
 ];
 
-const CAPTURE_TARGETS: [(CaptureTargetKind, &str); 3] = [
-    (CaptureTargetKind::Display, "Display"),
-    (CaptureTargetKind::Window, "Window"),
-    (CaptureTargetKind::Area, "Area"),
+const CAPTURE_TARGETS: [(CaptureTargetKind, fn() -> &'static str); 3] = [
+    (
+        CaptureTargetKind::Display,
+        tr::settings::automations::target::display,
+    ),
+    (
+        CaptureTargetKind::Window,
+        tr::settings::automations::target::window,
+    ),
+    (
+        CaptureTargetKind::Area,
+        tr::settings::automations::target::area,
+    ),
 ];
 
 const RECORDING_MODES: [(AutomationRecordingMode, &str); 2] = [
@@ -5534,9 +5939,15 @@ const RECORDING_MODES: [(AutomationRecordingMode, &str); 2] = [
     (AutomationRecordingMode::Instant, "Instant"),
 ];
 
-const CLIPBOARD_SOURCES: [(ClipboardSource, &str); 2] = [
-    (ClipboardSource::Raw, "Original capture"),
-    (ClipboardSource::Rendered, "Edited / rendered"),
+const CLIPBOARD_SOURCES: [(ClipboardSource, fn() -> &'static str); 2] = [
+    (
+        ClipboardSource::Raw,
+        tr::settings::automations::clipboard::original,
+    ),
+    (
+        ClipboardSource::Rendered,
+        tr::settings::automations::clipboard::rendered,
+    ),
 ];
 
 const WEBHOOK_METHODS: [&str; 3] = ["POST", "PUT", "GET"];
@@ -5556,49 +5967,95 @@ const RESOLUTION_PRESETS: [(&str, &str, u32, u32); 4] = [
     ("4k", "4K", 3840, 2160),
 ];
 
-const COMPRESSIONS: [(AutomationExportCompression, &str); 4] = [
-    (AutomationExportCompression::Maximum, "Maximum"),
-    (AutomationExportCompression::Social, "Social"),
-    (AutomationExportCompression::Web, "Web"),
-    (AutomationExportCompression::Potato, "Potato"),
+const COMPRESSIONS: [(AutomationExportCompression, fn() -> &'static str); 4] = [
+    (
+        AutomationExportCompression::Maximum,
+        tr::settings::automations::compression::maximum,
+    ),
+    (
+        AutomationExportCompression::Social,
+        tr::settings::automations::compression::social,
+    ),
+    (
+        AutomationExportCompression::Web,
+        tr::settings::automations::compression::web,
+    ),
+    (
+        AutomationExportCompression::Potato,
+        tr::settings::automations::compression::potato,
+    ),
 ];
 
 /// `TRIGGER_LABELS` (`utils/automations.ts`).
 fn trigger_label(trigger: Trigger) -> &'static str {
     match trigger {
-        Trigger::ScreenshotTaken => "On screenshot taken",
-        Trigger::StudioRecordingFinished => "On studio recording finished",
-        Trigger::InstantRecordingFinished => "On instant recording finished",
-        Trigger::RecordingStarted => "On recording started",
-        Trigger::UploadCompleted => "On upload completed",
-        Trigger::VideoImported => "On video imported",
-        Trigger::RecordingDeleted => "On recording deleted",
+        Trigger::ScreenshotTaken => tr::settings::automations::trigger::screenshot_taken::label(),
+        Trigger::StudioRecordingFinished => {
+            tr::settings::automations::trigger::studio_finished::label()
+        }
+        Trigger::InstantRecordingFinished => {
+            tr::settings::automations::trigger::instant_finished::label()
+        }
+        Trigger::RecordingStarted => tr::settings::automations::trigger::recording_started::label(),
+        Trigger::UploadCompleted => tr::settings::automations::trigger::upload_completed::label(),
+        Trigger::VideoImported => tr::settings::automations::trigger::video_imported::label(),
+        Trigger::RecordingDeleted => tr::settings::automations::trigger::recording_deleted::label(),
     }
 }
 
 /// `TRIGGER_PHRASE`.
 fn trigger_phrase(trigger: Trigger) -> &'static str {
     match trigger {
-        Trigger::ScreenshotTaken => "Screenshot taken",
-        Trigger::StudioRecordingFinished => "Studio recording ends",
-        Trigger::InstantRecordingFinished => "Instant recording ends",
-        Trigger::RecordingStarted => "Recording starts",
-        Trigger::UploadCompleted => "Upload completes",
-        Trigger::VideoImported => "Video imported",
-        Trigger::RecordingDeleted => "Recording deleted",
+        Trigger::ScreenshotTaken => tr::settings::automations::trigger::screenshot_taken::phrase(),
+        Trigger::StudioRecordingFinished => {
+            tr::settings::automations::trigger::studio_finished::phrase()
+        }
+        Trigger::InstantRecordingFinished => {
+            tr::settings::automations::trigger::instant_finished::phrase()
+        }
+        Trigger::RecordingStarted => {
+            tr::settings::automations::trigger::recording_started::phrase()
+        }
+        Trigger::UploadCompleted => tr::settings::automations::trigger::upload_completed::phrase(),
+        Trigger::VideoImported => tr::settings::automations::trigger::video_imported::phrase(),
+        Trigger::RecordingDeleted => {
+            tr::settings::automations::trigger::recording_deleted::phrase()
+        }
     }
 }
 
 /// `TRIGGER_NOUN`.
 fn trigger_noun(trigger: Trigger) -> &'static str {
     match trigger {
-        Trigger::ScreenshotTaken => "Screenshot",
-        Trigger::StudioRecordingFinished => "Studio recording",
-        Trigger::InstantRecordingFinished => "Instant recording",
-        Trigger::RecordingStarted => "Recording start",
-        Trigger::UploadCompleted => "Upload",
-        Trigger::VideoImported => "Import",
-        Trigger::RecordingDeleted => "Deletion",
+        Trigger::ScreenshotTaken => tr::settings::automations::trigger::screenshot_taken::noun(),
+        Trigger::StudioRecordingFinished => {
+            tr::settings::automations::trigger::studio_finished::noun()
+        }
+        Trigger::InstantRecordingFinished => {
+            tr::settings::automations::trigger::instant_finished::noun()
+        }
+        Trigger::RecordingStarted => tr::settings::automations::trigger::recording_started::noun(),
+        Trigger::UploadCompleted => tr::settings::automations::trigger::upload_completed::noun(),
+        Trigger::VideoImported => tr::settings::automations::trigger::video_imported::noun(),
+        Trigger::RecordingDeleted => tr::settings::automations::trigger::recording_deleted::noun(),
+    }
+}
+
+/// "Runs for every {phrase}." under a rule with no conditions, as one message
+/// per trigger.
+fn trigger_runs(trigger: Trigger) -> &'static str {
+    match trigger {
+        Trigger::ScreenshotTaken => tr::settings::automations::trigger::screenshot_taken::runs(),
+        Trigger::StudioRecordingFinished => {
+            tr::settings::automations::trigger::studio_finished::runs()
+        }
+        Trigger::InstantRecordingFinished => {
+            tr::settings::automations::trigger::instant_finished::runs()
+        }
+        Trigger::RecordingStarted => tr::settings::automations::trigger::recording_started::runs(),
+        Trigger::UploadCompleted => tr::settings::automations::trigger::upload_completed::runs(),
+        Trigger::VideoImported => tr::settings::automations::trigger::video_imported::runs(),
+        Trigger::RecordingDeleted => tr::settings::automations::trigger::recording_deleted::runs(),
     }
 }
 
@@ -5618,72 +6075,82 @@ fn trigger_icon(trigger: Trigger) -> &'static str {
 /// `ACTION_LABELS`.
 fn action_label(kind: ActionType) -> &'static str {
     match kind {
-        ActionType::CopyToClipboard => "Copy to clipboard",
-        ActionType::SaveToLocation => "Save to location",
-        ActionType::Export => "Export with profile",
-        ActionType::Upload => "Upload + copy link",
-        ActionType::RevealInFileManager => "Reveal in file manager",
-        ActionType::OpenFile => "Open file",
-        ActionType::RunCommand => "Run command",
-        ActionType::Webhook => "Send webhook",
-        ActionType::RecognizeTextToClipboard => "Recognize text (OCR) to clipboard",
-        ActionType::Notify => "Show notification",
-        ActionType::OpenEditor => "Open editor",
-        ActionType::SkipEditor => "Skip editor (headless)",
-        ActionType::ApplyPreset => "Apply editor preset",
-        ActionType::DeleteLocalFiles => "Delete local files",
+        ActionType::CopyToClipboard => {
+            tr::settings::automations::action::copy_to_clipboard::label()
+        }
+        ActionType::SaveToLocation => tr::settings::automations::action::save_to_location::label(),
+        ActionType::Export => tr::settings::automations::action::export::label(),
+        ActionType::Upload => tr::settings::automations::action::upload::label(),
+        ActionType::RevealInFileManager => tr::settings::automations::action::reveal::label(),
+        ActionType::OpenFile => tr::settings::automations::action::open_file::label(),
+        ActionType::RunCommand => tr::settings::automations::action::run_command::label(),
+        ActionType::Webhook => tr::settings::automations::action::webhook::label(),
+        ActionType::RecognizeTextToClipboard => tr::settings::automations::action::ocr::label(),
+        ActionType::Notify => tr::settings::automations::action::notify::label(),
+        ActionType::OpenEditor => tr::settings::automations::action::open_editor::label(),
+        ActionType::SkipEditor => tr::settings::automations::action::skip_editor::label(),
+        ActionType::ApplyPreset => tr::settings::automations::action::apply_preset::label(),
+        ActionType::DeleteLocalFiles => {
+            tr::settings::automations::action::delete_local_files::label()
+        }
     }
 }
 
 /// `ACTION_SHORT`.
 fn action_short(kind: ActionType) -> &'static str {
     match kind {
-        ActionType::CopyToClipboard => "Copy to clipboard",
-        ActionType::SaveToLocation => "Save to folder",
-        ActionType::Export => "Export",
-        ActionType::Upload => "Upload & copy link",
-        ActionType::RevealInFileManager => "Reveal in file manager",
-        ActionType::OpenFile => "Open file",
-        ActionType::RecognizeTextToClipboard => "Copy text (OCR)",
-        ActionType::Notify => "Notify",
-        ActionType::OpenEditor => "Open editor",
-        ActionType::SkipEditor => "Skip editor",
-        ActionType::ApplyPreset => "Apply preset",
-        ActionType::RunCommand => "Run command",
-        ActionType::Webhook => "Send webhook",
-        ActionType::DeleteLocalFiles => "Delete local files",
+        ActionType::CopyToClipboard => {
+            tr::settings::automations::action::copy_to_clipboard::short()
+        }
+        ActionType::SaveToLocation => tr::settings::automations::action::save_to_location::short(),
+        ActionType::Export => tr::settings::automations::action::export::short(),
+        ActionType::Upload => tr::settings::automations::action::upload::short(),
+        ActionType::RevealInFileManager => tr::settings::automations::action::reveal::short(),
+        ActionType::OpenFile => tr::settings::automations::action::open_file::short(),
+        ActionType::RecognizeTextToClipboard => tr::settings::automations::action::ocr::short(),
+        ActionType::Notify => tr::settings::automations::action::notify::short(),
+        ActionType::OpenEditor => tr::settings::automations::action::open_editor::short(),
+        ActionType::SkipEditor => tr::settings::automations::action::skip_editor::short(),
+        ActionType::ApplyPreset => tr::settings::automations::action::apply_preset::short(),
+        ActionType::RunCommand => tr::settings::automations::action::run_command::short(),
+        ActionType::Webhook => tr::settings::automations::action::webhook::short(),
+        ActionType::DeleteLocalFiles => {
+            tr::settings::automations::action::delete_local_files::short()
+        }
     }
 }
 
 /// `ACTION_NOUN`.
 fn action_noun(kind: ActionType) -> &'static str {
     match kind {
-        ActionType::CopyToClipboard => "Clipboard",
-        ActionType::SaveToLocation => "Folder",
-        ActionType::Export => "Export",
-        ActionType::Upload => "Upload",
-        ActionType::RevealInFileManager => "Reveal",
-        ActionType::OpenFile => "Open",
-        ActionType::RecognizeTextToClipboard => "Text",
-        ActionType::Notify => "Notify",
-        ActionType::OpenEditor => "Editor",
-        ActionType::SkipEditor => "Skip editor",
-        ActionType::ApplyPreset => "Preset",
-        ActionType::RunCommand => "Command",
-        ActionType::Webhook => "Webhook",
-        ActionType::DeleteLocalFiles => "Delete",
+        ActionType::CopyToClipboard => tr::settings::automations::action::copy_to_clipboard::noun(),
+        ActionType::SaveToLocation => tr::settings::automations::action::save_to_location::noun(),
+        ActionType::Export => tr::settings::automations::action::export::noun(),
+        ActionType::Upload => tr::settings::automations::action::upload::noun(),
+        ActionType::RevealInFileManager => tr::settings::automations::action::reveal::noun(),
+        ActionType::OpenFile => tr::settings::automations::action::open_file::noun(),
+        ActionType::RecognizeTextToClipboard => tr::settings::automations::action::ocr::noun(),
+        ActionType::Notify => tr::settings::automations::action::notify::noun(),
+        ActionType::OpenEditor => tr::settings::automations::action::open_editor::noun(),
+        ActionType::SkipEditor => tr::settings::automations::action::skip_editor::noun(),
+        ActionType::ApplyPreset => tr::settings::automations::action::apply_preset::noun(),
+        ActionType::RunCommand => tr::settings::automations::action::run_command::noun(),
+        ActionType::Webhook => tr::settings::automations::action::webhook::noun(),
+        ActionType::DeleteLocalFiles => {
+            tr::settings::automations::action::delete_local_files::noun()
+        }
     }
 }
 
 /// `CONDITION_LABELS`.
 fn condition_label(kind: ConditionType) -> &'static str {
     match kind {
-        ConditionType::CaptureTargetIs => "Capture target is",
-        ConditionType::RecordingModeIs => "Recording mode is",
-        ConditionType::DurationAtLeast => "Duration at least (seconds)",
-        ConditionType::DurationAtMost => "Duration at most (seconds)",
-        ConditionType::WindowTitleContains => "Window title contains",
-        ConditionType::OrganizationIs => "Organization is",
+        ConditionType::CaptureTargetIs => tr::settings::automations::condition::capture_target(),
+        ConditionType::RecordingModeIs => tr::settings::automations::condition::recording_mode(),
+        ConditionType::DurationAtLeast => tr::settings::automations::condition::duration_at_least(),
+        ConditionType::DurationAtMost => tr::settings::automations::condition::duration_at_most(),
+        ConditionType::WindowTitleContains => tr::settings::automations::condition::window_title(),
+        ConditionType::OrganizationIs => tr::settings::automations::condition::organization(),
     }
 }
 
@@ -5879,7 +6346,7 @@ fn action_is_dangerous(kind: ActionType) -> bool {
 fn rule_summary(rule: &AutomationRule) -> String {
     let trigger = trigger_phrase(rule.trigger);
     if rule.actions.is_empty() {
-        return format!("{trigger} → no actions yet");
+        return tr::settings::automations::summary_empty(trigger);
     }
     let actions = rule
         .actions
@@ -5895,7 +6362,7 @@ fn auto_rule_name(rule: &AutomationRule) -> String {
     let trigger = trigger_noun(rule.trigger);
     match rule.actions.first() {
         Some(action) => format!("{trigger} → {}", action_noun(action_type_of(action))),
-        None => format!("{trigger} automation"),
+        None => tr::settings::automations::auto_name_empty(trigger),
     }
 }
 
@@ -5927,11 +6394,29 @@ fn format_secs(secs: f64) -> String {
     }
 }
 
+/// The editor placeholders that are words rather than example values. They
+/// are set while the editor paints, so a language change reaches them.
+fn translated_placeholder(field: AutoField, rule: &AutomationRule) -> Option<SharedString> {
+    match field {
+        AutoField::Name => Some(auto_rule_name(rule).into()),
+        AutoField::ConditionPattern(_) => {
+            Some(tr::settings::automations::placeholder::window_title().into())
+        }
+        AutoField::ConditionOrg(_) => {
+            Some(tr::settings::automations::placeholder::organization_id().into())
+        }
+        AutoField::ActionExportDir(_) => {
+            Some(tr::settings::automations::placeholder::project_folder().into())
+        }
+        _ => None,
+    }
+}
+
 /// One of `TEMPLATES` -- id, name, description, icon, and the built rule.
 struct Template {
     id: &'static str,
-    name: &'static str,
-    description: &'static str,
+    name: fn() -> &'static str,
+    description: fn() -> &'static str,
     icon: &'static str,
     build: fn() -> AutomationRule,
 }
@@ -5951,12 +6436,12 @@ fn template_rule(name: &str, trigger: Trigger, actions: Vec<Action>) -> Automati
 const TEMPLATES: [Template; 8] = [
     Template {
         id: "copy-screenshot",
-        name: "Auto-copy new screenshots to clipboard",
-        description: "Snap a screenshot and it's right there, ready to paste.",
+        name: tr::settings::automations::template::copy_screenshot::name,
+        description: tr::settings::automations::template::copy_screenshot::description,
         icon: "icons/copy.svg",
         build: || {
             template_rule(
-                "Auto-copy new screenshots to clipboard",
+                tr::settings::automations::template::copy_screenshot::name(),
                 Trigger::ScreenshotTaken,
                 vec![Action::CopyToClipboard {
                     source: ClipboardSource::Raw,
@@ -5966,12 +6451,12 @@ const TEMPLATES: [Template; 8] = [
     },
     Template {
         id: "ocr-screenshot",
-        name: "Pull the text out of screenshots",
-        description: "Cap reads the text in your screenshot and copies it for you.",
+        name: tr::settings::automations::template::ocr_screenshot::name,
+        description: tr::settings::automations::template::ocr_screenshot::description,
         icon: "icons/scan-text.svg",
         build: || {
             template_rule(
-                "Pull the text out of screenshots",
+                tr::settings::automations::template::ocr_screenshot::name(),
                 Trigger::ScreenshotTaken,
                 vec![Action::RecognizeTextToClipboard],
             )
@@ -5979,12 +6464,12 @@ const TEMPLATES: [Template; 8] = [
     },
     Template {
         id: "save-screenshot",
-        name: "Tuck screenshots into a folder",
-        description: "Send every new screenshot straight to a folder you pick.",
+        name: tr::settings::automations::template::save_screenshot::name,
+        description: tr::settings::automations::template::save_screenshot::description,
         icon: "icons/folder-down.svg",
         build: || {
             template_rule(
-                "Tuck screenshots into a folder",
+                tr::settings::automations::template::save_screenshot::name(),
                 Trigger::ScreenshotTaken,
                 vec![default_action(ActionType::SaveToLocation)],
             )
@@ -5992,12 +6477,12 @@ const TEMPLATES: [Template; 8] = [
     },
     Template {
         id: "reveal-screenshot",
-        name: "Jump to each new screenshot",
-        description: "Pop open every screenshot in Finder the moment you take it.",
+        name: tr::settings::automations::template::reveal_screenshot::name,
+        description: tr::settings::automations::template::reveal_screenshot::description,
         icon: "icons/folder-open.svg",
         build: || {
             template_rule(
-                "Jump to each new screenshot",
+                tr::settings::automations::template::reveal_screenshot::name(),
                 Trigger::ScreenshotTaken,
                 vec![Action::RevealInFileManager],
             )
@@ -6005,12 +6490,12 @@ const TEMPLATES: [Template; 8] = [
     },
     Template {
         id: "export-studio",
-        name: "Auto-export when you finish recording",
-        description: "Render an MP4 the second a Studio recording wraps up.",
+        name: tr::settings::automations::template::export_studio::name,
+        description: tr::settings::automations::template::export_studio::description,
         icon: "icons/film.svg",
         build: || {
             template_rule(
-                "Auto-export when you finish recording",
+                tr::settings::automations::template::export_studio::name(),
                 Trigger::StudioRecordingFinished,
                 vec![default_action(ActionType::Export)],
             )
@@ -6018,12 +6503,12 @@ const TEMPLATES: [Template; 8] = [
     },
     Template {
         id: "upload-share",
-        name: "Upload and grab the share link",
-        description: "Finish a recording and the link is waiting on your clipboard.",
+        name: tr::settings::automations::template::upload_share::name,
+        description: tr::settings::automations::template::upload_share::description,
         icon: "icons/link.svg",
         build: || {
             template_rule(
-                "Upload and grab the share link",
+                tr::settings::automations::template::upload_share::name(),
                 Trigger::StudioRecordingFinished,
                 vec![default_action(ActionType::Upload)],
             )
@@ -6031,28 +6516,29 @@ const TEMPLATES: [Template; 8] = [
     },
     Template {
         id: "notify-upload",
-        name: "Ping me when an upload is ready",
-        description: "Get a gentle desktop nudge once your recording is shareable.",
+        name: tr::settings::automations::template::notify_upload::name,
+        description: tr::settings::automations::template::notify_upload::description,
         icon: "icons/bell.svg",
         build: || {
             template_rule(
-                "Ping me when an upload is ready",
+                tr::settings::automations::template::notify_upload::name(),
                 Trigger::UploadCompleted,
                 vec![Action::Notify {
                     title_template: "Cap".to_string(),
-                    body_template: "Your recording is ready to share.".to_string(),
+                    body_template: tr::settings::automations::template::notify_upload::body()
+                        .to_string(),
                 }],
             )
         },
     },
     Template {
         id: "webhook-share",
-        name: "Tell Slack when you share something",
-        description: "Send the share link to Slack, Discord, or your own webhook.",
+        name: tr::settings::automations::template::webhook_share::name,
+        description: tr::settings::automations::template::webhook_share::description,
         icon: "icons/webhook.svg",
         build: || {
             template_rule(
-                "Tell Slack when you share something",
+                tr::settings::automations::template::webhook_share::name(),
                 Trigger::InstantRecordingFinished,
                 vec![Action::Webhook {
                     url: String::new(),
@@ -6166,7 +6652,7 @@ impl SettingsWindow {
         };
 
         let mut specs: Vec<(AutoField, String, String)> =
-            vec![(AutoField::Name, rule.name.clone(), auto_rule_name(rule))];
+            vec![(AutoField::Name, rule.name.clone(), String::new())];
         for (index, condition) in rule.conditions.iter().enumerate() {
             match condition {
                 Condition::DurationAtLeast { secs } | Condition::DurationAtMost { secs } => {
@@ -6180,15 +6666,11 @@ impl SettingsWindow {
                     specs.push((
                         AutoField::ConditionPattern(index),
                         pattern.clone(),
-                        "e.g. Slack".to_string(),
+                        String::new(),
                     ));
                 }
                 Condition::OrganizationIs { id } => {
-                    specs.push((
-                        AutoField::ConditionOrg(index),
-                        id.clone(),
-                        "Organization ID".to_string(),
-                    ));
+                    specs.push((AutoField::ConditionOrg(index), id.clone(), String::new()));
                 }
                 _ => {}
             }
@@ -6215,11 +6697,7 @@ impl SettingsWindow {
                         ExportDestination::ProjectFolder => String::new(),
                         ExportDestination::CustomPath { dir } => dir.clone(),
                     };
-                    specs.push((
-                        AutoField::ActionExportDir(index),
-                        dir,
-                        "Project folder".to_string(),
-                    ));
+                    specs.push((AutoField::ActionExportDir(index), dir, String::new()));
                 }
                 Action::Upload {
                     organization_id, ..
@@ -6509,7 +6987,7 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .line_height(px(18.))
                     .text_color(Hsla::from(theme.amber_11))
-                    .child("Failed to save automations. Your changes have not been saved.")
+                    .child(tr::settings::automations::save_failed())
                     .child(
                         ui::Button::settings(
                             &theme,
@@ -6517,7 +6995,7 @@ impl SettingsWindow {
                             ui::ButtonVariant::Gray,
                             ui::ButtonSize::Xs,
                         )
-                        .label("Retry save")
+                        .label(tr::settings::automations::retry_save())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.automations_persist();
                             cx.notify();
@@ -6547,18 +7025,15 @@ impl SettingsWindow {
 
         vec![
             self.section(
-                "Automations",
-                Some(
-                    "Rules are shared with classic Cap and the Cap CLI. Experimental GPUI \
-                     saves these rules but does not run automations.",
-                ),
+                tr::settings::automations::title(),
+                Some(tr::settings::automations::description()),
                 None,
                 rule_content,
             )
             .into_any_element(),
             self.section(
-                "Templates",
-                Some("One click to add a ready-made automation. Tweak anything afterwards."),
+                tr::settings::automations::templates_title(),
+                Some(tr::settings::automations::templates_description()),
                 None,
                 vec![templates.into_any_element()],
             )
@@ -6596,7 +7071,7 @@ impl SettingsWindow {
                     div()
                         .text_size(px(13.))
                         .font_weight(FontWeight::MEDIUM)
-                        .child("No automations yet"),
+                        .child(tr::settings::automations::empty_title()),
                 )
                 .child(
                     div()
@@ -6605,15 +7080,12 @@ impl SettingsWindow {
                         .line_height(px(18.))
                         .text_center()
                         .text_color(theme.settings_muted())
-                        .child(
-                            "Pick a template below to get started in one click, or build your \
-                             own from scratch.",
-                        ),
+                        .child(tr::settings::automations::empty_description()),
                 )
                 .child(div().mt(px(4.)).child(self.button(
                     "automations-scratch",
                     (ui::ButtonVariant::Gray, Some("icons/plus.svg")),
-                    "Start from scratch",
+                    tr::settings::automations::start_from_scratch(),
                     false,
                     cx,
                     |this, window, cx| {
@@ -6653,7 +7125,7 @@ impl SettingsWindow {
                     .size(px(16.))
                     .text_color(theme.settings_muted()),
             )
-            .child("New automation")
+            .child(tr::settings::automations::new())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.automation_add_rule(create_empty_rule(), window, cx);
             }))
@@ -6667,7 +7139,7 @@ impl SettingsWindow {
     ) -> gpui::AnyElement {
         let theme = self.theme;
         let build = template.build;
-        let name = template.name;
+        let id = template.id;
         div()
             .id(SharedString::from(format!("template-{}", template.id)))
             .flex()
@@ -6709,7 +7181,7 @@ impl SettingsWindow {
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(name),
+                            .child((template.name)()),
                     )
                     .child(
                         div()
@@ -6717,13 +7189,13 @@ impl SettingsWindow {
                             .text_size(px(11.))
                             .line_height(px(15.))
                             .text_color(theme.settings_muted())
-                            .child(template.description),
+                            .child((template.description)()),
                     ),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
                 // `addFromTemplate` also toasts `Added "{name}"`; no toast
                 // layer here, the expanded editor is the feedback.
-                tracing::info!(template = name, "added an automation template");
+                tracing::info!(template = id, "added an automation template");
                 this.automation_add_rule(build(), window, cx);
             }))
             .into_any_element()
@@ -6806,21 +7278,31 @@ impl SettingsWindow {
                             .text_size(px(11.))
                             .text_color(theme.settings_muted())
                             .child(match (enabled, self.pages.automations_save_failed) {
-                                (true, false) => "Enabled · Saved",
-                                (false, false) => "Disabled · Saved",
-                                (true, true) => "Enabled · Not saved",
-                                (false, true) => "Disabled · Not saved",
+                                (true, false) => tr::settings::automations::status::enabled_saved(),
+                                (false, false) => {
+                                    tr::settings::automations::status::disabled_saved()
+                                }
+                                (true, true) => {
+                                    tr::settings::automations::status::enabled_unsaved()
+                                }
+                                (false, true) => {
+                                    tr::settings::automations::status::disabled_unsaved()
+                                }
                             }),
                     )
-                    .child(
-                        self.toggle(("rule-enabled", index), enabled, cx, move |this, cx| {
+                    .child(self.toggle(
+                        ("rule-enabled", index),
+                        tr::settings::automations::enabled(),
+                        enabled,
+                        cx,
+                        move |this, cx| {
                             if let Some(rule) = this.pages.automations.rules.get_mut(index) {
                                 rule.enabled = !rule.enabled;
                                 this.automations_persist();
                                 cx.notify();
                             }
-                        }),
-                    ),
+                        },
+                    )),
             )
             .child(
                 div()
@@ -6909,13 +7391,14 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    /// `<GroupLabel>`.
+    /// `<GroupLabel>`. The catalog holds the uppercase form, so scripts
+    /// without case keep their text.
     fn group_label(&self, text: &'static str) -> impl IntoElement {
         div()
             .text_size(px(11.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(self.theme.settings_muted())
-            .child(text.to_uppercase())
+            .child(text)
     }
 
     /// `<RuleEditorBody>`.
@@ -6930,14 +7413,24 @@ impl SettingsWindow {
             .iter()
             .any(|action| action_is_dangerous(action_type_of(action)));
         let compatibility_checked = self.pages.compatibility_checks.contains(&rule.id);
+        if let Some(editor) = &self.pages.rule_editor {
+            for (field, input) in &editor.fields {
+                if let Some(placeholder) = translated_placeholder(*field, rule) {
+                    input.update(cx, |input, _| input.set_placeholder(placeholder));
+                }
+            }
+        }
 
-        let name_field = self.editor_field("Name", self.render_editor_input(AutoField::Name));
+        let name_field = self.editor_field(
+            tr::settings::automations::name(),
+            self.render_editor_input(AutoField::Name),
+        );
 
         let trigger_block = div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .child(self.group_label("When this happens"))
+            .child(self.group_label(tr::settings::automations::when()))
             .child(
                 self.pages_select(
                     ("rule-trigger", index),
@@ -6954,12 +7447,12 @@ impl SettingsWindow {
             .flex_row()
             .items_center()
             .justify_between()
-            .child(self.group_label("Only run if"));
+            .child(self.group_label(tr::settings::automations::only_if()));
         let mut header_right = div().flex().flex_row().items_center().gap(px(8.));
         if rule.conditions.len() > 1 {
             let mode_label = match rule.match_mode {
-                MatchMode::All => "Match all",
-                MatchMode::Any => "Match any",
+                MatchMode::All => tr::settings::automations::match_all(),
+                MatchMode::Any => tr::settings::automations::match_any(),
             };
             header_right = header_right.child(self.pages_select(
                 ("rule-match-mode", index),
@@ -6975,7 +7468,7 @@ impl SettingsWindow {
                 ui::ButtonVariant::Gray,
                 ui::ButtonSize::Xs,
             )
-            .label("Add condition")
+            .label(tr::settings::automations::add_condition())
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.automation_mutate(index, true, window, cx, |rule| {
                     // The first condition type that applies to the trigger,
@@ -6995,10 +7488,7 @@ impl SettingsWindow {
             div()
                 .text_size(px(12.))
                 .text_color(theme.settings_muted())
-                .child(format!(
-                    "Runs for every {}.",
-                    trigger_phrase(trigger).to_lowercase()
-                ))
+                .child(trigger_runs(trigger))
                 .into_any_element()
         } else {
             div()
@@ -7020,7 +7510,7 @@ impl SettingsWindow {
             .flex_row()
             .items_center()
             .justify_between()
-            .child(self.group_label("Then do this"))
+            .child(self.group_label(tr::settings::automations::then()))
             .child(
                 ui::Button::settings(
                     &theme,
@@ -7028,7 +7518,7 @@ impl SettingsWindow {
                     ui::ButtonVariant::Gray,
                     ui::ButtonSize::Xs,
                 )
-                .label("Add action")
+                .label(tr::settings::automations::add_action())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.automation_mutate(index, true, window, cx, |rule| {
                         // `copyToClipboard` when it applies, else the first
@@ -7075,7 +7565,7 @@ impl SettingsWindow {
                     ui::ButtonVariant::Gray,
                     ui::ButtonSize::Xs,
                 )
-                .label("Check compatibility")
+                .label(tr::settings::automations::check_compatibility())
                 .on_click(cx.listener(move |this, _, _window, cx| this.automation_test(index, cx))),
             )
             .child(
@@ -7102,7 +7592,7 @@ impl SettingsWindow {
                             .size(px(14.))
                             .text_color(theme.settings_muted()),
                     )
-                    .child("Delete")
+                    .child(tr::settings::automations::delete())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.automation_remove_rule(index, window, cx);
                     })),
@@ -7137,10 +7627,7 @@ impl SettingsWindow {
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .text_color(Hsla::from(theme.amber_11))
-                        .child(
-                            "In classic Cap or the Cap CLI, this automation runs commands or sends \
-                             network requests with your permissions. Only use values you trust.",
-                        ),
+                        .child(tr::settings::automations::dangerous()),
                 )
             })
             .when(compatibility_checked, |this| {
@@ -7150,11 +7637,7 @@ impl SettingsWindow {
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .text_color(Hsla::from(theme.amber_11))
-                        .child(
-                            "Compatibility checked: this automation cannot run in Experimental \
-                             GPUI. Saved rules remain available to classic Cap and the Cap CLI. \
-                             No actions were run.",
-                        ),
+                        .child(tr::settings::automations::compatibility_checked()),
                 )
             })
             .child(footer)
@@ -7182,8 +7665,9 @@ impl SettingsWindow {
                 let label = CAPTURE_TARGETS
                     .iter()
                     .find(|(candidate, _)| candidate == target)
-                    .map(|(_, label)| *label)
-                    .unwrap_or("Window");
+                    .map_or_else(tr::settings::automations::target::window, |(_, label)| {
+                        label()
+                    });
                 self.pages_select(
                     SharedString::from(format!("condition-target-{rule}-{index}")),
                     label,
@@ -7276,7 +7760,7 @@ impl SettingsWindow {
                         .px(px(4.))
                         .text_size(px(11.))
                         .text_color(Hsla::from(theme.amber_11))
-                        .child("This condition never matches for the selected trigger."),
+                        .child(tr::settings::automations::condition_never_matches()),
                 )
             })
             .into_any_element()
@@ -7399,7 +7883,7 @@ impl SettingsWindow {
                     div()
                         .text_size(px(11.))
                         .text_color(Hsla::from(theme.amber_11))
-                        .child("This action has no effect for the selected trigger."),
+                        .child(tr::settings::automations::action_no_effect()),
                 )
             })
             .into_any_element()
@@ -7419,11 +7903,13 @@ impl SettingsWindow {
                 let label = CLIPBOARD_SOURCES
                     .iter()
                     .find(|(candidate, _)| candidate == source)
-                    .map(|(_, label)| *label)
-                    .unwrap_or("Original capture");
+                    .map_or_else(
+                        tr::settings::automations::clipboard::original,
+                        |(_, label)| label(),
+                    );
                 Some(
                     self.editor_field(
-                        "Source",
+                        tr::settings::automations::field::source(),
                         self.pages_select(
                             SharedString::from(format!("action-source-{rule}-{index}")),
                             label,
@@ -7443,7 +7929,7 @@ impl SettingsWindow {
                         .gap(px(8.))
                         .child(
                             self.editor_field(
-                                "Folder",
+                                tr::settings::automations::field::folder(),
                                 div()
                                     .flex()
                                     .flex_row()
@@ -7454,7 +7940,7 @@ impl SettingsWindow {
                                     .child(self.button(
                                         SharedString::from(format!("action-browse-{rule}-{index}")),
                                         (ui::ButtonVariant::Gray, None),
-                                        "Browse",
+                                        tr::settings::automations::browse(),
                                         false,
                                         cx,
                                         move |this, window, cx| {
@@ -7470,7 +7956,7 @@ impl SettingsWindow {
                             ),
                         )
                         .child(self.editor_field(
-                            "Filename template (optional)",
+                            tr::settings::automations::field::filename(),
                             self.render_editor_input(AutoField::ActionFilename(index)),
                         ))
                         .into_any_element(),
@@ -7492,7 +7978,7 @@ impl SettingsWindow {
                         .flex_col()
                         .gap(px(8.))
                         .child(self.editor_field(
-                            "Organization ID (optional)",
+                            tr::settings::automations::field::organization(),
                             self.render_editor_input(AutoField::ActionOrgId(index)),
                         ))
                         .child(
@@ -7510,6 +7996,7 @@ impl SettingsWindow {
                                             SharedString::from(format!(
                                                 "action-copy-link-{rule}-{index}"
                                             )),
+                                            tr::settings::automations::copy_link(),
                                             copy_link,
                                             cx,
                                             move |this, cx| {
@@ -7529,7 +8016,7 @@ impl SettingsWindow {
                                         .child(
                                             div()
                                                 .text_size(px(13.))
-                                                .child("Copy link to clipboard"),
+                                                .child(tr::settings::automations::copy_link()),
                                         ),
                                 )
                                 .child(
@@ -7542,6 +8029,7 @@ impl SettingsWindow {
                                             SharedString::from(format!(
                                                 "action-open-browser-{rule}-{index}"
                                             )),
+                                            tr::settings::automations::open_in_browser(),
                                             open_in_browser,
                                             cx,
                                             move |this, cx| {
@@ -7561,7 +8049,11 @@ impl SettingsWindow {
                                                 }
                                             },
                                         ))
-                                        .child(div().text_size(px(13.)).child("Open in browser")),
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .child(tr::settings::automations::open_in_browser()),
+                                        ),
                                 ),
                         )
                         .into_any_element(),
@@ -7580,11 +8072,11 @@ impl SettingsWindow {
                                 .flex_row()
                                 .gap(px(8.))
                                 .child(self.editor_field(
-                                    "Program",
+                                    tr::settings::automations::field::program(),
                                     self.render_editor_input(AutoField::ActionProgram(index)),
                                 ))
                                 .child(self.editor_field(
-                                    "Arguments (space-separated)",
+                                    tr::settings::automations::field::arguments(),
                                     self.render_editor_input(AutoField::ActionArgs(index)),
                                 )),
                         )
@@ -7596,6 +8088,7 @@ impl SettingsWindow {
                                 .gap(px(8.))
                                 .child(self.toggle(
                                     SharedString::from(format!("action-shell-{rule}-{index}")),
+                                    tr::settings::automations::run_through_shell(),
                                     use_shell,
                                     cx,
                                     move |this, cx| {
@@ -7612,7 +8105,11 @@ impl SettingsWindow {
                                         }
                                     },
                                 ))
-                                .child(div().text_size(px(13.)).child("Run through shell")),
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .child(tr::settings::automations::run_through_shell()),
+                                ),
                         )
                         .into_any_element(),
                 )
@@ -7630,13 +8127,13 @@ impl SettingsWindow {
                                 .flex_row()
                                 .gap(px(8.))
                                 .child(self.editor_field(
-                                    "URL",
+                                    tr::settings::automations::field::url(),
                                     self.render_editor_input(AutoField::ActionUrl(index)),
                                 ))
                                 .child(
                                     div().w(px(112.)).flex_shrink_0().child(
                                         self.editor_field(
-                                            "Method",
+                                            tr::settings::automations::field::method(),
                                             self.pages_select(
                                                 SharedString::from(format!(
                                                     "action-method-{rule}-{index}"
@@ -7652,7 +8149,7 @@ impl SettingsWindow {
                                 ),
                         )
                         .child(self.editor_field(
-                            "Body template (optional)",
+                            tr::settings::automations::field::body_template(),
                             self.render_editor_input(AutoField::ActionWebhookBody(index)),
                         ))
                         .into_any_element(),
@@ -7664,11 +8161,11 @@ impl SettingsWindow {
                     .flex_row()
                     .gap(px(8.))
                     .child(self.editor_field(
-                        "Title",
+                        tr::settings::automations::field::title(),
                         self.render_editor_input(AutoField::ActionNotifyTitle(index)),
                     ))
                     .child(self.editor_field(
-                        "Body",
+                        tr::settings::automations::field::body(),
                         self.render_editor_input(AutoField::ActionNotifyBody(index)),
                     ))
                     .into_any_element(),
@@ -7682,7 +8179,7 @@ impl SettingsWindow {
                             .py(px(6.))
                             .text_size(px(11.))
                             .text_color(theme.settings_muted())
-                            .child("No presets yet — create one in the editor first.")
+                            .child(tr::settings::automations::no_presets())
                             .into_any_element(),
                     );
                 }
@@ -7693,7 +8190,7 @@ impl SettingsWindow {
                 };
                 Some(
                     self.editor_field(
-                        "Preset",
+                        tr::settings::automations::field::preset(),
                         self.pages_select(
                             SharedString::from(format!("action-preset-{rule}-{index}")),
                             label,
@@ -7735,8 +8232,9 @@ impl SettingsWindow {
                         .compression
                         .unwrap_or(AutomationExportCompression::Web)
             })
-            .map(|(_, label)| *label)
-            .unwrap_or("Web");
+            .map_or_else(tr::settings::automations::compression::web, |(_, label)| {
+                label()
+            });
         let is_mp4 = profile.format == ExportFormat::Mp4;
 
         div()
@@ -7750,7 +8248,7 @@ impl SettingsWindow {
                     .gap(px(8.))
                     .child(
                         self.editor_field(
-                            "Format",
+                            tr::settings::automations::field::format(),
                             self.pages_select(
                                 SharedString::from(format!("export-format-{rule}-{index}")),
                                 format_label,
@@ -7763,7 +8261,7 @@ impl SettingsWindow {
                     )
                     .child(
                         self.editor_field(
-                            "Resolution",
+                            tr::settings::automations::field::resolution(),
                             self.pages_select(
                                 SharedString::from(format!("export-resolution-{rule}-{index}")),
                                 resolution_label,
@@ -7782,7 +8280,7 @@ impl SettingsWindow {
                     .gap(px(8.))
                     .child(
                         self.editor_field(
-                            "Frame rate",
+                            tr::settings::automations::field::frame_rate(),
                             self.pages_select(
                                 SharedString::from(format!("export-fps-{rule}-{index}")),
                                 format!("{} FPS", profile.fps),
@@ -7796,7 +8294,7 @@ impl SettingsWindow {
                     .when(is_mp4, |this| {
                         this.child(
                             self.editor_field(
-                                "Compression",
+                                tr::settings::automations::field::compression(),
                                 self.pages_select(
                                     SharedString::from(format!(
                                         "export-compression-{rule}-{index}"
@@ -7813,7 +8311,7 @@ impl SettingsWindow {
             )
             .child(
                 self.editor_field(
-                    "Destination folder (optional, blank = project folder)",
+                    tr::settings::automations::field::destination(),
                     div()
                         .flex()
                         .flex_row()
@@ -7827,7 +8325,7 @@ impl SettingsWindow {
                         .child(self.button(
                             SharedString::from(format!("export-browse-{rule}-{index}")),
                             (ui::ButtonVariant::Gray, None),
-                            "Browse",
+                            tr::settings::automations::browse(),
                             false,
                             cx,
                             move |this, window, cx| {
@@ -7866,7 +8364,7 @@ enum HttpError {
 impl HttpError {
     fn text(&self) -> String {
         match self {
-            Self::Timeout => "The request timed out".to_string(),
+            Self::Timeout => tr::settings::integrations::request_timed_out().to_string(),
             Self::Message(message) => message.clone(),
         }
     }
@@ -7936,647 +8434,6 @@ async fn http_json(
 /// depend on the crate, and the whole point is that `status`/`install`/
 /// `uninstall` behave byte-for-byte like the Tauri commands
 /// (`src-tauri/src/cli.rs`) so the two apps manage the same shim.
-mod cli_install {
-    #[cfg(unix)]
-    use std::ffi::OsStr;
-    use std::{
-        env, fs,
-        path::{Path, PathBuf},
-    };
-
-    const CAP_DIR_NAME: &str = ".cap";
-    const BIN_DIR_NAME: &str = "bin";
-    const CLI_BINARY_STEM: &str = "cap-cli";
-
-    #[cfg(windows)]
-    const SHIM_NAME: &str = "cap.cmd";
-    #[cfg(not(windows))]
-    const SHIM_NAME: &str = "cap";
-
-    #[cfg(windows)]
-    const CLI_BINARY_NAME: &str = "cap-cli.exe";
-    #[cfg(not(windows))]
-    const CLI_BINARY_NAME: &str = "cap-cli";
-
-    /// `CliInstallStatus`, minus the serde/specta derives the commands need
-    /// and minus `install_dir`, which neither cli.tsx nor this page displays
-    /// (`path_entry` carries the same string).
-    #[derive(Clone, Debug)]
-    pub(crate) struct CliInstallStatus {
-        pub shim_path: String,
-        pub target_path: String,
-        pub installed: bool,
-        pub on_path: bool,
-        pub conflict: Option<String>,
-        pub path_entry: String,
-        pub shell_command: String,
-        pub path_configured: bool,
-    }
-
-    fn home_dir() -> Result<PathBuf, String> {
-        dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())
-    }
-
-    fn install_dir() -> Result<PathBuf, String> {
-        let home = home_dir()?;
-        let cap_bin = home.join(CAP_DIR_NAME).join(BIN_DIR_NAME);
-        let local_bin = home.join(".local/bin");
-
-        // Prefer whichever candidate already holds a Cap-managed shim, so
-        // status and install agree regardless of the launching PATH.
-        if let Ok(target) = target_path() {
-            for candidate in [&cap_bin, &local_bin] {
-                let shim = candidate.join(SHIM_NAME);
-                if shim_points_to(&shim, &target).unwrap_or(false) || shim_is_cap_managed(&shim) {
-                    return Ok(candidate.clone());
-                }
-            }
-        }
-
-        if path_is_present(&cap_bin.join(SHIM_NAME)) || cfg!(windows) {
-            return Ok(cap_bin);
-        }
-
-        if path_contains_install_dir(&local_bin) {
-            return Ok(local_bin);
-        }
-
-        Ok(cap_bin)
-    }
-
-    fn shim_path() -> Result<PathBuf, String> {
-        Ok(install_dir()?.join(SHIM_NAME))
-    }
-
-    fn target_path() -> Result<PathBuf, String> {
-        let exe =
-            env::current_exe().map_err(|e| format!("Could not locate Cap executable: {e}"))?;
-        let exe = resolve_path_for_target_lookup(exe);
-        let dir = exe
-            .parent()
-            .ok_or_else(|| "Could not locate Cap executable directory".to_string())?;
-
-        for candidate in cli_binary_candidates(dir) {
-            if candidate.exists() {
-                return Ok(resolve_path_for_target_lookup(candidate));
-            }
-        }
-
-        Ok(dir.join(CLI_BINARY_NAME))
-    }
-
-    #[cfg(windows)]
-    fn resolve_path_for_target_lookup(path: PathBuf) -> PathBuf {
-        path
-    }
-
-    #[cfg(not(windows))]
-    fn resolve_path_for_target_lookup(path: PathBuf) -> PathBuf {
-        fs::canonicalize(&path).unwrap_or(path)
-    }
-
-    fn cli_binary_candidates(dir: &Path) -> Vec<PathBuf> {
-        let mut names = vec![CLI_BINARY_NAME.to_string()];
-        if let Some(target_triple) = current_target_triple() {
-            names.push(target_specific_cli_binary_name(target_triple));
-        }
-
-        let dirs = [
-            dir.to_path_buf(),
-            dir.join("../MacOS"),
-            dir.join("../Resources"),
-        ];
-        let mut candidates = Vec::new();
-        for dir in dirs {
-            for name in &names {
-                candidates.push(dir.join(name));
-            }
-        }
-        candidates
-    }
-
-    fn target_specific_cli_binary_name(target_triple: &str) -> String {
-        format!(
-            "{CLI_BINARY_STEM}-{target_triple}{}",
-            exe_suffix_for_target(target_triple)
-        )
-    }
-
-    fn exe_suffix_for_target(target_triple: &str) -> &'static str {
-        if target_triple.contains("windows") {
-            ".exe"
-        } else {
-            ""
-        }
-    }
-
-    fn current_target_triple() -> Option<&'static str> {
-        if cfg!(all(
-            target_os = "windows",
-            target_arch = "x86_64",
-            target_env = "msvc"
-        )) {
-            Some("x86_64-pc-windows-msvc")
-        } else if cfg!(all(
-            target_os = "windows",
-            target_arch = "aarch64",
-            target_env = "msvc"
-        )) {
-            Some("aarch64-pc-windows-msvc")
-        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            Some("aarch64-apple-darwin")
-        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-            Some("x86_64-apple-darwin")
-        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            Some("x86_64-unknown-linux-gnu")
-        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-            Some("aarch64-unknown-linux-gnu")
-        } else {
-            None
-        }
-    }
-
-    #[cfg(unix)]
-    fn cli_binary_file_name_is_cap_managed(name: &OsStr) -> bool {
-        if name == CLI_BINARY_NAME {
-            return true;
-        }
-
-        let Some(name) = name.to_str() else {
-            return false;
-        };
-
-        current_target_triple().is_some_and(|target_triple| {
-            name.eq_ignore_ascii_case(&target_specific_cli_binary_name(target_triple))
-        })
-    }
-
-    fn display_path(path: &Path) -> String {
-        path.to_string_lossy().into_owned()
-    }
-
-    fn path_is_present(path: &Path) -> bool {
-        fs::symlink_metadata(path).is_ok()
-    }
-
-    fn path_contains_install_dir(install_dir: &Path) -> bool {
-        let Some(path) = env::var_os("PATH") else {
-            return false;
-        };
-
-        env::split_paths(&path).any(|entry| entry == install_dir)
-    }
-
-    #[cfg(unix)]
-    fn shim_points_to(shim_path: &Path, target_path: &Path) -> Result<bool, String> {
-        match fs::read_link(shim_path) {
-            Ok(link) => Ok(link == target_path || same_file(&link, target_path)),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-                ) =>
-            {
-                Ok(false)
-            }
-            Err(err) => Err(format!("Could not read CLI shim: {err}")),
-        }
-    }
-
-    #[cfg(unix)]
-    fn same_file(a: &Path, b: &Path) -> bool {
-        match (fs::canonicalize(a), fs::canonicalize(b)) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        }
-    }
-
-    #[cfg(windows)]
-    fn shim_points_to(shim_path: &Path, target_path: &Path) -> Result<bool, String> {
-        let contents = match fs::read(shim_path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(format!("Could not read CLI shim: {err}")),
-        };
-
-        let target = windows_command_path(target_path);
-        Ok(windows_shim_target(&contents).is_some_and(|shim_target| {
-            windows_shim_target_matches(shim_target, &target, |name| env::var(name).ok())
-        }))
-    }
-
-    #[cfg(unix)]
-    fn shim_is_cap_managed(shim_path: &Path) -> bool {
-        match fs::read_link(shim_path) {
-            Ok(link) => link
-                .file_name()
-                .is_some_and(cli_binary_file_name_is_cap_managed),
-            Err(_) => false,
-        }
-    }
-
-    #[cfg(windows)]
-    fn shim_is_cap_managed(shim_path: &Path) -> bool {
-        fs::read(shim_path).is_ok_and(|contents| windows_shim_target(&contents).is_some())
-    }
-
-    #[cfg(windows)]
-    fn windows_shim_target(contents: &[u8]) -> Option<&[u8]> {
-        let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
-        let mut lines = contents.split(|byte| *byte == b'\n');
-        if !trim_ascii_whitespace(lines.next()?).eq_ignore_ascii_case(b"@echo off") {
-            return None;
-        }
-
-        let command = trim_ascii_whitespace(lines.next()?);
-        if lines.any(|line| !trim_ascii_whitespace(line).is_empty()) {
-            return None;
-        }
-
-        let target = command.strip_prefix(b"\"")?.strip_suffix(b"\" %*")?;
-        if windows_cli_binary_file_name_is_cap_managed(windows_path_file_name(target)) {
-            Some(target)
-        } else {
-            None
-        }
-    }
-
-    #[cfg(windows)]
-    fn windows_path_file_name(path: &[u8]) -> &[u8] {
-        path.rsplit(|byte| *byte == b'\\' || *byte == b'/')
-            .next()
-            .unwrap_or(path)
-    }
-
-    #[cfg(windows)]
-    fn windows_cli_binary_file_name_is_cap_managed(name: &[u8]) -> bool {
-        name.eq_ignore_ascii_case(b"cap-cli.exe")
-            || name.eq_ignore_ascii_case(b"cap-cli-x86_64-pc-windows-msvc.exe")
-            || name.eq_ignore_ascii_case(b"cap-cli-aarch64-pc-windows-msvc.exe")
-    }
-
-    #[cfg(windows)]
-    fn windows_command_path(path: &Path) -> String {
-        let path = display_path(path);
-
-        if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
-            return format!("\\\\{rest}");
-        }
-
-        if let Some(rest) = path.strip_prefix("\\\\?\\") {
-            return rest.to_string();
-        }
-
-        path
-    }
-
-    #[cfg(windows)]
-    fn windows_shim_target_matches<F>(shim_target: &[u8], target: &str, env_value: F) -> bool
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        if shim_target.eq_ignore_ascii_case(target.as_bytes()) {
-            return true;
-        }
-
-        let Ok(shim_target) = std::str::from_utf8(shim_target) else {
-            return false;
-        };
-
-        windows_expand_env_prefix(shim_target, env_value)
-            .is_some_and(|expanded| expanded.eq_ignore_ascii_case(target))
-    }
-
-    #[cfg(windows)]
-    fn windows_expand_env_prefix<F>(target: &str, mut env_value: F) -> Option<String>
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        let rest = target.strip_prefix('%')?;
-        let (name, suffix) = rest.split_once('%')?;
-        if name.is_empty() {
-            return None;
-        }
-
-        env_value(name).map(|value| format!("{value}{suffix}"))
-    }
-
-    #[cfg(windows)]
-    fn windows_env_prefixed_path<F>(target: &str, mut env_value: F) -> Option<String>
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        for name in ["LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"] {
-            let Some(value) = env_value(name) else {
-                continue;
-            };
-            let Some(suffix) = strip_ascii_prefix(target, &value) else {
-                continue;
-            };
-            if suffix.is_empty() || suffix.starts_with('\\') || suffix.starts_with('/') {
-                return Some(format!("%{name}%{suffix}"));
-            }
-        }
-
-        None
-    }
-
-    #[cfg(windows)]
-    fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-        let head = value.get(..prefix.len())?;
-        let tail = value.get(prefix.len()..)?;
-        head.eq_ignore_ascii_case(prefix).then_some(tail)
-    }
-
-    #[cfg(windows)]
-    fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
-        while value.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            value = &value[1..];
-        }
-
-        while value.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            value = &value[..value.len() - 1];
-        }
-
-        value
-    }
-
-    fn shell_command(install_dir: &Path) -> String {
-        let install_dir = display_path(install_dir);
-
-        if cfg!(windows) {
-            let install_dir = install_dir.replace('\'', "''");
-            format!(
-                r#"powershell -NoProfile -Command "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';{install_dir}', 'User')""#
-            )
-        } else {
-            format!(r#"export PATH="{install_dir}:$PATH""#)
-        }
-    }
-
-    pub(crate) fn status() -> Result<CliInstallStatus, String> {
-        let install_dir = install_dir()?;
-        let shim_path = shim_path()?;
-        let target_path = target_path()?;
-        let target_exists = target_path.exists();
-        let shim_exists = path_is_present(&shim_path);
-        let installed = target_exists && shim_points_to(&shim_path, &target_path)?;
-        let conflict = if shim_exists && !installed && !shim_is_cap_managed(&shim_path) {
-            Some(format!(
-                "{} already exists and is not managed by Cap",
-                display_path(&shim_path)
-            ))
-        } else if !target_exists {
-            Some(format!(
-                "Bundled CLI binary not found at {}",
-                display_path(&target_path)
-            ))
-        } else {
-            None
-        };
-
-        let on_path = path_contains_install_dir(&install_dir);
-
-        Ok(CliInstallStatus {
-            shim_path: display_path(&shim_path),
-            target_path: display_path(&target_path),
-            installed,
-            on_path,
-            conflict,
-            path_entry: display_path(&install_dir),
-            shell_command: shell_command(&install_dir),
-            path_configured: path_persisted(&install_dir, on_path),
-        })
-    }
-
-    #[cfg(unix)]
-    fn write_shim(shim_path: &Path, target_path: &Path) -> Result<(), String> {
-        std::os::unix::fs::symlink(target_path, shim_path)
-            .map_err(|e| format!("Could not create CLI symlink: {e}"))
-    }
-
-    #[cfg(windows)]
-    fn write_shim(shim_path: &Path, target_path: &Path) -> Result<(), String> {
-        let target = windows_command_path(target_path);
-        let target =
-            windows_env_prefixed_path(&target, |name| env::var(name).ok()).unwrap_or(target);
-        let contents = format!(
-            r#"@echo off
-"{target}" %*
-"#
-        );
-        fs::write(shim_path, contents).map_err(|e| format!("Could not write CLI shim: {e}"))
-    }
-
-    pub(crate) fn install() -> Result<CliInstallStatus, String> {
-        let install_dir = install_dir()?;
-        let shim_path = shim_path()?;
-        let target_path = target_path()?;
-
-        if !target_path.exists() {
-            return Err(format!(
-                "Bundled CLI binary not found at {}",
-                display_path(&target_path)
-            ));
-        }
-
-        fs::create_dir_all(&install_dir)
-            .map_err(|e| format!("Could not create CLI directory: {e}"))?;
-
-        if path_is_present(&shim_path) {
-            // Repoint our own shim and any other Cap-managed one; only refuse
-            // to clobber a genuinely foreign file.
-            if !shim_points_to(&shim_path, &target_path)? && !shim_is_cap_managed(&shim_path) {
-                return Err(format!(
-                    "{} already exists and is not managed by Cap",
-                    display_path(&shim_path)
-                ));
-            }
-
-            match fs::remove_file(&shim_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("Could not replace CLI shim: {e}")),
-            }
-        }
-
-        write_shim(&shim_path, &target_path)?;
-
-        let mut status = status()?;
-        if !status.on_path && ensure_path_persisted(&install_dir) {
-            status.path_configured = true;
-        }
-        Ok(status)
-    }
-
-    #[cfg(unix)]
-    fn ensure_path_persisted(install_dir: &Path) -> bool {
-        if env::var_os("CAP_NO_MODIFY_PATH").is_some() {
-            return false;
-        }
-        let Some(home) = dirs::home_dir() else {
-            return false;
-        };
-        let needle = display_path(install_dir);
-        if profile_mentions_dir(&home, &needle) {
-            return true;
-        }
-        let shell = env::var("SHELL").unwrap_or_default();
-        let shell_name = Path::new(&shell)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        append_path_export(&shell_profile(&home, shell_name), &needle)
-    }
-
-    #[cfg(windows)]
-    fn ensure_path_persisted(install_dir: &Path) -> bool {
-        if env::var_os("CAP_NO_MODIFY_PATH").is_some() {
-            return false;
-        }
-        let dir = display_path(install_dir).replace('\'', "''");
-        let script = format!(
-            "$d = '{dir}'; \
-             $u = [Environment]::GetEnvironmentVariable('Path', 'User'); \
-             $e = if ($u) {{ $u -split ';' }} else {{ @() }}; \
-             if ($e -notcontains $d) {{ \
-             $n = if ($u) {{ \"$d;$u\" }} else {{ $d }}; \
-             [Environment]::SetEnvironmentVariable('Path', $n, 'User') }}"
-        );
-        let mut command = powershell_command();
-        command
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-
-    #[cfg(unix)]
-    fn path_persisted(install_dir: &Path, on_path: bool) -> bool {
-        on_path
-            || dirs::home_dir()
-                .is_some_and(|home| profile_mentions_dir(&home, &display_path(install_dir)))
-    }
-
-    #[cfg(windows)]
-    fn path_persisted(install_dir: &Path, on_path: bool) -> bool {
-        on_path || windows_user_path_contains(install_dir)
-    }
-
-    #[cfg(windows)]
-    fn windows_user_path_contains(install_dir: &Path) -> bool {
-        let mut command = powershell_command();
-        let Ok(output) = command
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[Environment]::GetEnvironmentVariable('Path', 'User')",
-            ])
-            .output()
-        else {
-            return false;
-        };
-        if !output.status.success() {
-            return false;
-        }
-        let needle = display_path(install_dir);
-        let needle = needle.trim();
-        String::from_utf8_lossy(&output.stdout)
-            .split(';')
-            .any(|entry| entry.trim().eq_ignore_ascii_case(needle))
-    }
-
-    #[cfg(windows)]
-    fn powershell_command() -> std::process::Command {
-        use std::os::windows::process::CommandExt;
-
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let mut command = std::process::Command::new("powershell");
-        command.creation_flags(CREATE_NO_WINDOW);
-        command
-    }
-
-    #[cfg(unix)]
-    fn shell_profile(home: &Path, shell_name: &str) -> PathBuf {
-        match shell_name {
-            "zsh" => home.join(".zshrc"),
-            "bash" => home.join(".bashrc"),
-            "" if home.join(".zshrc").exists() => home.join(".zshrc"),
-            _ => home.join(".profile"),
-        }
-    }
-
-    #[cfg(unix)]
-    fn profile_mentions_dir(home: &Path, needle: &str) -> bool {
-        [".zshrc", ".bashrc", ".bash_profile", ".profile"]
-            .iter()
-            .any(|file| fs::read_to_string(home.join(file)).is_ok_and(|c| c.contains(needle)))
-    }
-
-    #[cfg(unix)]
-    fn append_path_export(profile: &Path, install_dir: &str) -> bool {
-        use std::io::Write;
-        let line = format!("export PATH=\"{install_dir}:$PATH\"");
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(profile)
-            .and_then(|mut file| writeln!(file, "\n# Added by Cap\n{line}"))
-            .is_ok()
-    }
-
-    pub(crate) fn uninstall() -> Result<CliInstallStatus, String> {
-        let shim_path = shim_path()?;
-        let target_path = target_path()?;
-
-        if shim_points_to(&shim_path, &target_path)? {
-            fs::remove_file(&shim_path).map_err(|e| format!("Could not remove CLI shim: {e}"))?;
-        }
-
-        status()
-    }
-
-    #[cfg(all(test, unix))]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn shell_profile_selection() {
-            let home = Path::new("/home/u");
-            assert_eq!(shell_profile(home, "zsh"), home.join(".zshrc"));
-            assert_eq!(shell_profile(home, "bash"), home.join(".bashrc"));
-            assert_eq!(shell_profile(home, "fish"), home.join(".profile"));
-        }
-
-        #[test]
-        fn cap_managed_shim_detection() {
-            let dir =
-                std::env::temp_dir().join(format!("cap-gpui-cli-test-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            let shim = dir.join(SHIM_NAME);
-
-            // A symlink to a cap-cli binary is Cap-managed even when it points
-            // at a different install (the target need not exist).
-            std::os::unix::fs::symlink("/elsewhere/Cap.app/Contents/MacOS/cap-cli", &shim).unwrap();
-            assert!(shim_is_cap_managed(&shim));
-
-            // A symlink to anything else is not.
-            fs::remove_file(&shim).unwrap();
-            std::os::unix::fs::symlink("/bin/ls", &shim).unwrap();
-            assert!(!shim_is_cap_managed(&shim));
-
-            // Nor is a regular file, so install refuses to clobber it.
-            fs::remove_file(&shim).unwrap();
-            fs::write(&shim, b"#!/bin/sh\n").unwrap();
-            assert!(!shim_is_cap_managed(&shim));
-
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -8585,6 +8442,303 @@ mod cli_install {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hotkey(code: &str, meta: bool, ctrl: bool, alt: bool, shift: bool) -> Hotkey {
+        Hotkey {
+            code: code.into(),
+            meta,
+            ctrl,
+            alt,
+            shift,
+        }
+    }
+
+    #[test]
+    fn shortcuts_need_a_typing_safe_modifier() {
+        assert!(shortcut_needs_modifier(&hotkey(
+            "KeyA", false, false, false, false
+        )));
+        assert!(shortcut_needs_modifier(&hotkey(
+            "Digit4", false, false, false, true
+        )));
+        assert!(!shortcut_needs_modifier(&hotkey(
+            "Digit4", true, false, false, true
+        )));
+        assert!(!shortcut_needs_modifier(&hotkey(
+            "KeyS", false, true, false, false
+        )));
+        assert!(!shortcut_needs_modifier(&hotkey(
+            "KeyS", false, false, true, false
+        )));
+        assert!(!shortcut_needs_modifier(&hotkey(
+            "F5", false, false, false, false
+        )));
+        assert!(!shortcut_needs_modifier(&hotkey(
+            "F12", false, false, false, true
+        )));
+        assert!(shortcut_needs_modifier(&hotkey(
+            "Space", false, false, false, false
+        )));
+    }
+
+    #[test]
+    fn every_hotkey_action_appears_once_with_a_label_and_effect() {
+        let shown: Vec<&str> = SCREENSHOT_SHORTCUTS
+            .iter()
+            .chain(RECORDING_SHORTCUTS.iter())
+            .chain(WHILE_RECORDING_SHORTCUTS.iter())
+            .copied()
+            .collect();
+        assert_eq!(shown.len(), 13);
+        let settings = store::GeneralSettings::default();
+        for action in &shown {
+            assert_eq!(shown.iter().filter(|other| *other == action).count(), 1);
+            assert_ne!(shortcut_label(action), "Shortcut", "{action}");
+            assert!(
+                shortcut_effect(action, &settings, crate::main_window::Mode::Studio).is_some(),
+                "{action}"
+            );
+        }
+    }
+
+    /// The reserved two lines only hold if no outcome-dependent description
+    /// wraps to a third at the window's minimum width (about 55 characters
+    /// per line there).
+    #[test]
+    fn outcome_descriptions_fit_the_reserved_two_lines() {
+        let mut settings = store::GeneralSettings::default();
+        let mut longest = 0;
+        for screenshot in [
+            store::PostScreenshotBehaviour::OpenEditor,
+            store::PostScreenshotBehaviour::Copy,
+            store::PostScreenshotBehaviour::CopyAndOpenEditor,
+            store::PostScreenshotBehaviour::Save,
+        ] {
+            settings.post_screenshot_behaviour = screenshot;
+            for open_links_disabled in [false, true] {
+                settings.disable_auto_open_links = open_links_disabled;
+                for studio in [
+                    store::PostStudioBehaviour::OpenEditor,
+                    store::PostStudioBehaviour::ShowOverlay,
+                    store::PostStudioBehaviour::DoNothing,
+                ] {
+                    settings.post_studio_recording_behaviour = studio;
+                    for action in SCREENSHOT_SHORTCUTS
+                        .iter()
+                        .chain(RECORDING_SHORTCUTS.iter())
+                        .filter(|action| description_follows_outcome(action))
+                    {
+                        let text = sentence(action, &settings, crate::main_window::Mode::Studio);
+                        longest = longest.max(text.chars().count());
+                    }
+                }
+            }
+        }
+        assert!(
+            longest <= 104,
+            "longest outcome description is {longest} characters"
+        );
+    }
+
+    #[test]
+    fn every_after_capture_value_has_exactly_one_card() {
+        use store::SettingsEnum as _;
+        for value in store::PostScreenshotBehaviour::ALL {
+            assert_eq!(
+                SCREENSHOT_OUTCOMES
+                    .iter()
+                    .filter(|(v, _)| v == value)
+                    .count(),
+                1
+            );
+        }
+        for value in store::PostStudioBehaviour::ALL {
+            assert_eq!(
+                STUDIO_OUTCOMES.iter().filter(|(v, _)| v == value).count(),
+                1
+            );
+        }
+        for value in [
+            store::PostInstantBehaviour::OpenLink,
+            store::PostInstantBehaviour::ShowCap,
+            store::PostInstantBehaviour::CopyLink,
+        ] {
+            assert_eq!(
+                INSTANT_OUTCOMES.iter().filter(|(v, _)| *v == value).count(),
+                1
+            );
+        }
+    }
+
+    fn phrase(
+        action: &str,
+        settings: &store::GeneralSettings,
+        mode: crate::main_window::Mode,
+    ) -> &'static str {
+        (shortcut_effect(action, settings, mode).unwrap().phrase)()
+    }
+
+    fn sentence(
+        action: &str,
+        settings: &store::GeneralSettings,
+        mode: crate::main_window::Mode,
+    ) -> &'static str {
+        (shortcut_effect(action, settings, mode).unwrap().sentence)()
+    }
+
+    #[test]
+    fn descriptions_follow_the_after_capture_settings() {
+        let mut settings = store::GeneralSettings::default();
+        let studio = crate::main_window::Mode::Studio;
+        assert_eq!(
+            phrase("screenshotArea", &settings, studio),
+            "select an area and open it in the editor"
+        );
+        settings.post_screenshot_behaviour = store::PostScreenshotBehaviour::Copy;
+        assert_eq!(
+            phrase("screenshotArea", &settings, studio),
+            "select an area and copy it to your clipboard"
+        );
+        assert!(
+            phrase("startStudioRecording", &settings, studio)
+                .ends_with("open the editor when you stop")
+        );
+        settings.post_studio_recording_behaviour = store::PostStudioBehaviour::ShowOverlay;
+        assert!(!phrase("startStudioRecording", &settings, studio).contains("editor"));
+        settings.disable_auto_open_links = true;
+        assert!(
+            phrase("startInstantRecording", &settings, studio)
+                .ends_with("copy its share link when you stop")
+        );
+        assert_eq!(
+            phrase(
+                "openRecordingPickerWindow",
+                &settings,
+                crate::main_window::Mode::Instant
+            ),
+            "choose a window, then record it in Instant mode"
+        );
+        assert_eq!(
+            sentence("stopRecording", &settings, studio),
+            "Stop the current recording."
+        );
+    }
+
+    /// The phrases as they were assembled before they moved to the catalog,
+    /// pinning every combination of action, after-capture setting and mode.
+    fn assembled_effect(
+        action: &str,
+        settings: &store::GeneralSettings,
+        mode: crate::main_window::Mode,
+    ) -> String {
+        let screenshot = match settings.post_screenshot_behaviour {
+            store::PostScreenshotBehaviour::OpenEditor => "open it in the editor",
+            store::PostScreenshotBehaviour::Copy => "copy it to your clipboard",
+            store::PostScreenshotBehaviour::CopyAndOpenEditor => "copy it and open the editor",
+            store::PostScreenshotBehaviour::Save => {
+                "save it to your library without opening anything"
+            }
+        };
+        let picker = match mode {
+            crate::main_window::Mode::Studio => "record it in Studio mode",
+            crate::main_window::Mode::Instant => "record it in Instant mode",
+            crate::main_window::Mode::Screenshot => "take a screenshot of it",
+        };
+        let studio_stop = match settings.post_studio_recording_behaviour {
+            store::PostStudioBehaviour::OpenEditor => ", then open the editor when you stop",
+            store::PostStudioBehaviour::ShowOverlay | store::PostStudioBehaviour::DoNothing => "",
+        };
+        let instant_stop = if settings.disable_auto_open_links {
+            ", then copy its share link when you stop"
+        } else {
+            ", then copy and open its share link when you stop"
+        };
+        match action {
+            "screenshotArea" => format!("select an area and {screenshot}"),
+            "screenshotWindow" => {
+                format!("capture the window under your pointer and {screenshot}")
+            }
+            "screenshotDisplay" => {
+                format!("capture the display under your pointer and {screenshot}")
+            }
+            "startStudioRecording" => {
+                format!("record your selected screen or window in Studio mode{studio_stop}")
+            }
+            "startInstantRecording" => {
+                format!("record your selected screen or window in Instant mode{instant_stop}")
+            }
+            "openRecordingPickerArea" => format!("select an area, then {picker}"),
+            "openRecordingPickerWindow" => format!("choose a window, then {picker}"),
+            "openRecordingPickerDisplay" => format!("choose a display, then {picker}"),
+            "openRecordingPicker" => "open Cap so you can choose what to record".into(),
+            "cycleRecordingMode" => "switch between Studio, Instant and Screenshot mode".into(),
+            "stopRecording" => "stop the current recording".into(),
+            "togglePauseRecording" => "pause the current recording, or resume it".into(),
+            "restartRecording" => "throw away the current take and start again".into(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn shortcut_effects_match_the_sentences_they_replaced() {
+        use crate::main_window::Mode;
+        let mut settings = store::GeneralSettings::default();
+        let mut checked = std::collections::HashSet::new();
+        for screenshot in [
+            store::PostScreenshotBehaviour::OpenEditor,
+            store::PostScreenshotBehaviour::Copy,
+            store::PostScreenshotBehaviour::CopyAndOpenEditor,
+            store::PostScreenshotBehaviour::Save,
+        ] {
+            settings.post_screenshot_behaviour = screenshot;
+            for studio in [
+                store::PostStudioBehaviour::OpenEditor,
+                store::PostStudioBehaviour::ShowOverlay,
+                store::PostStudioBehaviour::DoNothing,
+            ] {
+                settings.post_studio_recording_behaviour = studio;
+                for open_links_disabled in [false, true] {
+                    settings.disable_auto_open_links = open_links_disabled;
+                    for mode in [Mode::Studio, Mode::Instant, Mode::Screenshot] {
+                        for action in SCREENSHOT_SHORTCUTS
+                            .iter()
+                            .chain(RECORDING_SHORTCUTS.iter())
+                            .chain(WHILE_RECORDING_SHORTCUTS.iter())
+                        {
+                            let assembled = assembled_effect(action, &settings, mode);
+                            assert_eq!(phrase(action, &settings, mode), assembled);
+                            let mut chars = assembled.chars();
+                            let first = chars.next().unwrap();
+                            assert_eq!(
+                                sentence(action, &settings, mode),
+                                format!("{}{}.", first.to_uppercase(), chars.as_str())
+                            );
+                            checked.insert(phrase(action, &settings, mode));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked.len(), 30, "every effect message is reachable");
+        assert!(shortcut_effect("nope", &settings, Mode::Studio).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn combos_read_naturally_inside_a_sentence() {
+        assert_eq!(
+            hotkey_inline_text(&hotkey("Digit4", true, false, false, true)),
+            "⌘⇧4"
+        );
+        assert_eq!(
+            hotkey_inline_text(&hotkey("KeyR", false, true, true, false)),
+            "⌃⌥R"
+        );
+        assert_eq!(
+            hotkey_inline_text(&hotkey("Slash", true, false, false, false)),
+            "⌘/"
+        );
+    }
 
     /// gpui keystroke names against the `KeyboardEvent.code` strings hotkeys
     /// written by the Tauri app carry.
@@ -8669,35 +8823,17 @@ mod tests {
         );
     }
 
-    /// The switch-back target matches how this binary was started: the `.app`
-    /// it is staged inside beats everything, a cargo `target/` path means the
-    /// dev harness (never the installed app), and only a bare binary from
-    /// neither falls through to `/Applications`.
     #[test]
-    fn the_classic_target_matches_the_launch_context() {
-        assert_eq!(
-            classic_target_for_exe(std::path::Path::new(
-                "/Applications/Cap.app/Contents/MacOS/cap-gpui"
-            )),
-            Some(ClassicTarget::Bundle(std::path::PathBuf::from(
-                "/Applications/Cap.app"
-            )))
-        );
-        assert_eq!(
-            classic_target_for_exe(std::path::Path::new(
-                "/Users/x/Cap/apps/desktop-gpui/target/debug/cap-gpui"
-            )),
-            Some(ClassicTarget::DevSupervisor)
-        );
-        // A dev binary staged inside a bundle is still that bundle's.
-        assert_eq!(
-            classic_target_for_exe(std::path::Path::new(
-                "/Users/x/Cap/target/debug/bundle/osx/Cap.app/Contents/MacOS/cap-gpui"
-            )),
-            Some(ClassicTarget::Bundle(std::path::PathBuf::from(
-                "/Users/x/Cap/target/debug/bundle/osx/Cap.app"
-            )))
-        );
+    fn only_debug_cargo_builds_can_switch_back_to_the_dev_harness() {
+        let cargo_build =
+            std::path::Path::new("/Users/x/Cap/apps/desktop-gpui/target/debug/cap-gpui");
+        let installed_app = std::path::Path::new("/Applications/Cap.app/Contents/MacOS/Cap");
+
+        assert!(dev_supervisor_available_for(Some(cargo_build), true));
+        assert!(!dev_supervisor_available_for(Some(cargo_build), false));
+        assert!(!dev_supervisor_available_for(Some(installed_app), true));
+        assert!(!dev_supervisor_available_for(Some(installed_app), false));
+        assert!(!dev_supervisor_available_for(None, true));
     }
 
     /// The takeover's whole timeline, read off its one clock.

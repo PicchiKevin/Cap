@@ -1,4 +1,6 @@
 import { getServerSession } from "@cap/database/auth/auth-options";
+import { isBlockedAccountEmail } from "@cap/database/auth/domain-utils";
+import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import * as Db from "@cap/database/schema";
 import {
 	CurrentUser,
@@ -14,6 +16,19 @@ import { Database } from "./Database.ts";
 
 export const getCurrentUser = Effect.gen(function* () {
 	const db = yield* Database;
+	const request = yield* Effect.serviceOption(
+		HttpServerRequest.HttpServerRequest,
+	);
+
+	if (
+		Option.isSome(request) &&
+		isCrossSiteCookieWrite({
+			method: request.value.method,
+			url: request.value.originalUrl,
+			headers: new Headers(request.value.headers),
+		})
+	)
+		return Option.none<typeof Db.users.$inferSelect>();
 
 	return yield* Option.fromNullable(
 		yield* Effect.tryPromise(() => getServerSession()),
@@ -80,7 +95,13 @@ export const HttpAuthMiddlewareLive = Layer.effect(
 								)
 								.where(Dz.eq(Db.authApiKeys.id, authHeader)),
 						)
-						.pipe(Effect.map(([entry]) => Option.fromNullable(entry?.users)));
+						.pipe(
+							Effect.map(([entry]) =>
+								Option.fromNullable(entry?.users).pipe(
+									Option.filter((user) => !isBlockedAccountEmail(user.email)),
+								),
+							),
+						);
 				} else {
 					user = yield* getCurrentUser;
 				}

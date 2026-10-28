@@ -324,6 +324,8 @@ fn full_timeline_for_segments(
                 end: duration,
                 name: None,
                 speed_audio_mode: None,
+                hide_cursor: None,
+                volume: None,
             })
         })
         .collect()
@@ -358,6 +360,8 @@ fn full_timeline_for_source_segments(
                 end: duration,
                 name: None,
                 speed_audio_mode: None,
+                hide_cursor: None,
+                volume: None,
             })
         })
         .collect()
@@ -374,6 +378,8 @@ fn ensure_project_timeline<'a>(
             transitions: Vec::new(),
             zoom_segments: Vec::new(),
             scene_segments: Vec::new(),
+            style_segments: Vec::new(),
+            image_segments: Vec::new(),
             mask_segments: Vec::new(),
             text_segments: Vec::new(),
             caption_segments: Vec::new(),
@@ -919,7 +925,9 @@ fn source_timeline_segments_for_import(
             start,
             end,
             name: None,
-            speed_audio_mode: None,
+            speed_audio_mode: segment.speed_audio_mode,
+            hide_cursor: segment.hide_cursor,
+            volume: segment.volume,
         });
     }
 
@@ -1509,6 +1517,7 @@ pub async fn start_video_import(app: AppHandle, source_path: PathBuf) -> Result<
                             start_time: Some(0.0),
                             device_id: None,
                             gap_summary: None,
+                            digital_silence_ms: None,
                         })
                     } else {
                         None
@@ -1694,6 +1703,7 @@ async fn append_mp4_to_editor_project(
             start_time: Some(0.0),
             device_id: None,
             gap_summary: None,
+            digital_silence_ms: None,
         })
     } else {
         None
@@ -1729,6 +1739,8 @@ async fn append_mp4_to_editor_project(
             end: duration,
             name: None,
             speed_audio_mode: None,
+            hide_cursor: None,
+            volume: None,
         });
     add_clip_configs(
         &mut config,
@@ -1860,6 +1872,8 @@ async fn append_cap_project_to_editor_project(
                 end: source_segment.end,
                 name: None,
                 speed_audio_mode: source_segment.speed_audio_mode,
+                hide_cursor: source_segment.hide_cursor,
+                volume: source_segment.volume,
             });
         }
     }

@@ -1,6 +1,8 @@
 import { db } from "@cap/database";
+import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
 import { nanoId } from "@cap/database/helpers";
+import { enqueueLoopsSync } from "@cap/database/loops/queue";
 import {
 	organizationInvites,
 	organizationMembers,
@@ -16,7 +18,7 @@ import {
 } from "@/utils/organization";
 
 export async function POST(request: NextRequest) {
-	const user = await getCurrentUser();
+	const user = isCrossSiteCookieWrite(request) ? null : await getCurrentUser();
 	if (!user) {
 		return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 	}
@@ -141,6 +143,7 @@ export async function POST(request: NextRequest) {
 			const userUpdate: Partial<typeof users.$inferInsert> = {
 				onboardingSteps,
 				activeOrganizationId: invite.organizationId,
+				marketingOrigin: "teammate",
 			};
 			if (!user.defaultOrgId) {
 				userUpdate.defaultOrgId = invite.organizationId;
@@ -148,6 +151,7 @@ export async function POST(request: NextRequest) {
 
 			await tx.update(users).set(userUpdate).where(eq(users.id, user.id));
 
+			await enqueueLoopsSync(tx, user.id, true);
 			await tx
 				.delete(organizationInvites)
 				.where(eq(organizationInvites.id, inviteId));

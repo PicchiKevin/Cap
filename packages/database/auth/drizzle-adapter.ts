@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import { isProSubscription, STRIPE_AVAILABLE, stripe } from "@cap/utils";
+import { STRIPE_AVAILABLE } from "@cap/utils";
 import { type ImageUpload, Organisation, User } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 import type { MySql2Database } from "drizzle-orm/mysql2";
 import type { Adapter } from "next-auth/adapters";
-import type Stripe from "stripe";
 import { nanoId } from "../helpers.ts";
+import { enqueueLoopsSync } from "../loops/queue.ts";
 import {
 	accounts,
 	organizationInvites,
@@ -16,6 +16,16 @@ import {
 	verificationTokens,
 } from "../schema.ts";
 import type { ValidatedSsoIdentity } from "./sso.ts";
+import { provisionStripeCustomer } from "./stripe-customer.ts";
+
+const getAffectedRows = (result: unknown) => {
+	if (Array.isArray(result)) {
+		return (
+			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
+		);
+	}
+	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
+};
 
 type CreateUserData = Parameters<NonNullable<Adapter["createUser"]>>[0];
 type LinkAccountData = Parameters<NonNullable<Adapter["linkAccount"]>>[0];
@@ -118,6 +128,7 @@ export function DrizzleAdapter(
 						await tx.update(users).set(userUpdate).where(eq(users.id, userId));
 					}
 
+					await enqueueLoopsSync(tx, userId);
 					return;
 				}
 
@@ -139,6 +150,8 @@ export function DrizzleAdapter(
 					name: userData.name,
 					image: userData.image as ImageUpload.ImageUrlOrKey | null,
 					activeOrganizationId: Organisation.OrganisationId.make(""),
+					marketingOrigin:
+						pendingInvite || ssoIdentity ? "teammate" : "independent",
 				});
 				if (ssoIdentity) {
 					await insertUser.onDuplicateKeyUpdate({
@@ -155,6 +168,7 @@ export function DrizzleAdapter(
 					await insertUser;
 				}
 
+				await enqueueLoopsSync(tx, userId);
 				if (pendingInvite || ssoIdentity) {
 					return;
 				}
@@ -192,69 +206,7 @@ export function DrizzleAdapter(
 			if (!row) throw new Error("User not found");
 
 			if (STRIPE_AVAILABLE() && !ssoIdentity) {
-				const existingCustomers = await stripe().customers.list({
-					email: normalizedEmail,
-					limit: 1,
-				});
-
-				let customer: Stripe.Customer;
-				if (existingCustomers.data.length > 0 && existingCustomers.data[0]) {
-					customer = existingCustomers.data[0];
-
-					customer = await stripe().customers.update(customer.id, {
-						metadata: {
-							...customer.metadata,
-							userId: row.id,
-						},
-					});
-				} else {
-					customer = await stripe().customers.create({
-						email: normalizedEmail,
-						metadata: {
-							userId: row.id,
-						},
-					});
-				}
-
-				const subscriptions = await stripe().subscriptions.list({
-					customer: customer.id,
-					status: "active",
-					limit: 100,
-				});
-
-				const proSubscriptions = subscriptions.data.filter(isProSubscription);
-				const inviteQuota = proSubscriptions.reduce((total, sub) => {
-					return (
-						total +
-						sub.items.data.reduce(
-							(subTotal, item) => subTotal + (item.quantity || 1),
-							0,
-						)
-					);
-				}, 0);
-
-				const mostRecentSubscription = proSubscriptions[0];
-
-				await db
-					.update(users)
-					.set({
-						stripeCustomerId: customer.id,
-						...(mostRecentSubscription && {
-							stripeSubscriptionId: mostRecentSubscription.id,
-							stripeSubscriptionStatus: mostRecentSubscription.status,
-							inviteQuota: inviteQuota || 1,
-						}),
-					})
-					.where(eq(users.id, row.id));
-
-				const [updatedRow] = await db
-					.select()
-					.from(users)
-					.where(eq(users.id, row.id))
-					.limit(1);
-				if (updatedRow) {
-					row = updatedRow;
-				}
+				row = await provisionStripeCustomer(db, row);
 			}
 
 			return row;
@@ -307,13 +259,16 @@ export function DrizzleAdapter(
 		},
 		async updateUser({ id, image, ...userData }) {
 			if (!id) throw new Error("User not found");
-			await db
-				.update(users)
-				.set({
-					...userData,
-					image: image as ImageUpload.ImageUrlOrKey | null,
-				})
-				.where(eq(users.id, User.UserId.make(id)));
+			await db.transaction(async (tx) => {
+				await tx
+					.update(users)
+					.set({
+						...userData,
+						image: image as ImageUpload.ImageUrlOrKey | null,
+					})
+					.where(eq(users.id, User.UserId.make(id)));
+				await enqueueLoopsSync(tx, User.UserId.make(id));
+			});
 			const rows = await db
 				.select()
 				.from(users)
@@ -510,31 +465,40 @@ export function DrizzleAdapter(
 			return row;
 		},
 		async useVerificationToken({ identifier, token }) {
+			const normalizedIdentifier = identifier?.toLowerCase() ?? "";
 			const rows = await db
 				.select()
 				.from(verificationTokens)
-				.where(eq(verificationTokens.token, token))
+				.where(eq(verificationTokens.identifier, normalizedIdentifier))
 				.limit(1);
 			const row = rows[0];
 			if (!row) {
 				console.warn("[useVerificationToken] No token found");
 				return null;
 			}
-			const normalizedIdentifier = identifier?.toLowerCase() ?? "";
-			const storedIdentifier = row.identifier?.toLowerCase() ?? "";
-			if (normalizedIdentifier !== storedIdentifier) {
-				console.warn("[useVerificationToken] Identifier mismatch");
-				return null;
-			}
-			await db
+			// Claim the exact row we just read (identifier + token) with a single
+			// delete, and only proceed if we actually removed it. This makes
+			// consumption atomic: concurrent requests race on the same delete, so
+			// at most one of them can claim the row, whether the guess is right or
+			// wrong. Scoping by token too (not identifier alone) means the delete
+			// can't clobber a resend that replaced this row after we read it.
+			const result = await db
 				.delete(verificationTokens)
 				.where(
 					and(
-						eq(verificationTokens.token, token),
 						eq(verificationTokens.identifier, row.identifier),
+						eq(verificationTokens.token, row.token),
 					),
 				);
-			return { ...row, identifier: storedIdentifier };
+			if (getAffectedRows(result) !== 1) {
+				console.warn("[useVerificationToken] Token already consumed");
+				return null;
+			}
+			if (row.token !== token) {
+				console.warn("[useVerificationToken] Token mismatch");
+				return null;
+			}
+			return { ...row, identifier: normalizedIdentifier };
 		},
 	};
 }

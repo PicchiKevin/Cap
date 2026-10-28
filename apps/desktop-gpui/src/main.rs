@@ -1,60 +1,98 @@
 //! Cap desktop, rewritten in gpui.
 //!
-//! Milestone 1 is the main recording window (compact + expanded) with real
-//! device enumeration. No tauri, no webview: the whole UI is gpui.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod app_sounds;
 mod app_windows;
 mod assets;
 mod auth;
+mod blur_recovery;
 #[cfg(target_os = "macos")]
 mod camera_bench;
 #[cfg(target_os = "macos")]
 mod camera_blur;
 #[cfg(any(not(target_os = "macos"), test))]
 mod camera_blur_portable;
+mod camera_loading;
 mod camera_window;
 mod controls_window;
+mod crash_capture;
 mod deeplink;
 mod dev_restore;
 mod devices;
 mod diagnostics;
+mod doodle;
+mod draw_bench;
 mod editor_audio;
+mod editor_bench;
 mod editor_canvas;
 mod editor_clips;
 mod editor_color;
 mod editor_crop;
 mod editor_edits;
 mod editor_export;
+mod editor_hover_bench;
+#[cfg(target_os = "linux")]
+mod editor_modal;
 mod editor_panels;
+mod editor_preparing;
 mod editor_sidebar;
 mod editor_tabs;
 mod editor_timeline;
 mod editor_window;
 mod feeds;
+mod focus_border;
 mod hotkeys;
+mod i18n;
 mod import;
+mod installer;
+mod jpeg_thumbnail;
 mod library;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod linux_dialog;
+#[cfg(target_os = "linux")]
+mod linux_display;
+#[cfg(target_os = "linux")]
+mod linux_portal_id;
+#[cfg(target_os = "linux")]
+mod linux_wallpaper;
 mod main_window;
+mod media_access;
 mod menus;
 mod mode_select_window;
 mod onboarding_audio;
+mod onboarding_doodles;
 mod onboarding_window;
+mod overlay_backdrop;
+mod permission_guide;
 mod permissions;
 mod permissions_ui;
+#[cfg(test)]
+mod picker_benchmark;
+#[cfg(debug_assertions)]
+mod glass_probe;
+#[cfg(debug_assertions)]
+mod picker_probe;
+#[cfg(debug_assertions)]
+mod picker_ui_benchmark;
 mod platform;
 mod presets;
+mod project_save;
 mod recording;
 mod screenshot;
 mod screenshot_annotations;
 mod screenshot_crop;
 mod screenshot_editor;
 mod screenshot_export;
+mod script_text;
 mod session;
 mod settings_pages;
 mod settings_window;
+mod sign_in;
 mod single_instance;
+#[cfg(debug_assertions)]
+mod snapshot;
 mod store;
 mod target_overlay;
 mod target_thumbnails;
@@ -65,13 +103,15 @@ mod tray;
 mod ui;
 mod updates;
 mod upload;
+mod foreign_window;
+mod window_arrange;
 
 use gpui::{App, AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 
 use crate::{assets::Assets, main_window::MainWindow, session::RecordingSession};
 
 const MAIN_WINDOW_WIDTH: f32 = 330.;
-const MAIN_WINDOW_HEIGHT: f32 = 432.;
+const MAIN_WINDOW_HEIGHT: f32 = 435.;
 
 /// The corner radius the native material is clipped to. `radius = 16` for
 /// material `"panel"` on both visual systems in
@@ -124,6 +164,20 @@ fn resolve_auto_screenshot_editor(target: &str) -> Option<std::path::PathBuf> {
         .map(|item| item.bundle)
 }
 
+/// Windows ends the process at logoff or shutdown without running
+/// `on_app_quit`, so both markers that mean "this session crashed" clear here.
+#[cfg(target_os = "windows")]
+fn end_windows_session() {
+    crate::store::clear_handoff_marker();
+    crash_capture::mark_clean_exit();
+}
+
+/// zbus warns whenever a portal request object is gone before its
+/// properties are cached, which every finished portal request is; at `warn`
+/// that filled each Linux log with lines that say nothing.
+const DEFAULT_LOG_FILTER: &str =
+    "warn,cap_gpui=info,wgpu_core=error,wgpu_hal=error,zbus::proxy=error";
+
 /// stdout, plus a rolling daily file the Feedback page can upload.
 ///
 /// Mirrors `src-tauri/src/main.rs`: `tracing_appender::rolling::daily` into
@@ -139,30 +193,45 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     // matches nothing.
     let filter = || {
         tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "cap_gpui=info".into())
+            .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into())
     };
 
-    let logs_dir = diagnostics::logs_dir();
-    let file = match std::fs::create_dir_all(&logs_dir) {
-        Ok(()) => {
-            let (writer, guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(
-                &logs_dir,
-                diagnostics::LOG_FILE_PREFIX,
-            ));
-            Some((
+    let file = create_log_appender(&diagnostics::logs_dir(), diagnostics::LOG_FILE_PREFIX).map(
+        |appender| {
+            let (writer, guard) = tracing_appender::non_blocking(
+                cap_utils::diagnostic_writer::DiagnosticWriter::new(
+                    appender,
+                    &diagnostics::logs_dir(),
+                    diagnostics::LOG_FILE_PREFIX,
+                ),
+            );
+            let queue_errors = writer.error_counter();
+            cap_utils::operation_diagnostics::install_queue_loss_counter(move || {
+                queue_errors.dropped_lines()
+            });
+            let diagnostic_writer = writer.clone();
+            cap_utils::operation_diagnostics::install_sink(
+                cap_utils::operation_diagnostics::AppInfo {
+                    flavor: "gpui",
+                    version: env!("CARGO_PKG_VERSION"),
+                    source_revision: option_env!("CAP_BUILD_REVISION"),
+                    debug_build: cfg!(debug_assertions),
+                    source_dirty: option_env!("CAP_BUILD_DIRTY").map(|value| value == "true"),
+                },
+                move |bytes| {
+                    use std::io::Write;
+                    let _ = diagnostic_writer.clone().write_all(bytes);
+                },
+            );
+            (
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false)
                     .with_writer(writer)
                     .with_filter(filter()),
                 guard,
-            ))
-        }
-        Err(error) => {
-            // A log file is a nice-to-have; losing it must never stop the app.
-            eprintln!("failed to create the logs directory {logs_dir:?}: {error}");
-            None
-        }
-    };
+            )
+        },
+    );
     let (file_layer, guard) = match file {
         Some((layer, guard)) => (Some(layer), Some(guard)),
         None => (None, None),
@@ -173,6 +242,48 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         .with(file_layer)
         .init();
     guard
+}
+
+fn create_log_appender(
+    directory: &std::path::Path,
+    prefix: &str,
+) -> Option<tracing_appender::rolling::RollingFileAppender> {
+    use std::io::Write;
+
+    match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(prefix)
+        .build(directory)
+    {
+        Ok(appender) => Some(appender),
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Could not open {prefix} in {}: {error}; console logging remains enabled",
+                directory.display()
+            );
+            None
+        }
+    }
+}
+
+/// Stack for every thread that renders, decodes, encodes or runs camera
+/// effects. Render and export futures are generic over this crate's closures,
+/// so they compile at this crate's dev opt-level and need far more stack than
+/// Rust's 2 MiB default: the export estimate overflowed a 2 MiB tokio worker
+/// on macOS (2026-10-10). Only address space is reserved; pages are committed
+/// as the thread actually uses them.
+pub(crate) const MEDIA_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// gpui_tokio's own runtime keeps tokio's 2 MiB worker stacks; this one
+/// matches the Tauri app's runtime on every platform.
+fn app_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(MEDIA_THREAD_STACK_SIZE)
+        .enable_all()
+        .build()
+        .expect("Failed to initialize Tokio")
 }
 
 fn main() {
@@ -192,11 +303,52 @@ fn main() {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    let stale_wayland_display = linux_display::stale_wayland_display();
+    #[cfg(target_os = "linux")]
+    if stale_wayland_display.is_some() {
+        // gpui and screen capture both choose Wayland from this variable; drop
+        // it before logging starts threads.
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
+    }
+
+    // The AppImage CLI launcher re-enters the AppImage with `--cap-cli`; hand
+    // it to the bundled CLI before logging, single-instance or the GUI start.
+    #[cfg(target_os = "linux")]
+    if let Err(error) = cap_cli_install::appimage::dispatch_cli() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
+    // A confirmation or alert shown for the running app on a desktop without
+    // zenity (`linux_dialog`): not a second Cap, so before logging and the
+    // single-instance check.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    if let Some(status) = linux_dialog::run_from_args() {
+        std::process::exit(status);
+    }
+
     let _log_guard = init_logging();
+    crash_capture::install(&diagnostics::logs_dir());
+    #[cfg(target_os = "linux")]
+    if let Some(wayland_display) = stale_wayland_display {
+        tracing::warn!(
+            wayland_display = %wayland_display.to_string_lossy(),
+            "WAYLAND_DISPLAY names no running compositor; using the X display"
+        );
+    }
 
     single_instance::acquire();
-    store::mark_handoff_session();
+    let previous_session = crash_capture::begin_session(&diagnostics::logs_dir());
+    blur_recovery::configure(previous_session);
+    if cfg!(debug_assertions) {
+        store::mark_handoff_session();
+    }
 
+    #[cfg(target_os = "macos")]
+    platform::install_appkit_exception_guards();
     platform::install_url_scheme_handler();
     for argument in std::env::args().skip(1) {
         if argument.contains("token") || argument.contains("api_key") {
@@ -204,13 +356,28 @@ fn main() {
         }
     }
 
+    let runtime = app_runtime();
+    // Before gpui exists: its appearance read is a portal call, and the
+    // portals only take an app id before the first one.
+    #[cfg(target_os = "linux")]
+    runtime.block_on(linux_portal_id::register());
+
     let app = gpui_platform::application().with_assets(Assets);
     // `RunEvent::Reopen`: the dock icon clicked while the app runs. Must be
     // registered on the builder -- gpui exposes it nowhere else -- with the
     // handler guarding against firing before the window registry exists.
     app.on_reopen(crate::app_windows::handle_dock_reopen);
-    app.run(|cx: &mut App| {
-        gpui_tokio::init(cx);
+    #[cfg(target_os = "macos")]
+    app.on_open_urls(|urls| {
+        for url in urls {
+            crate::deeplink::submit_deep_link(&url);
+        }
+    });
+    let runtime_handle = runtime.handle().clone();
+
+    app.run(move |cx: &mut App| {
+        gpui_tokio::init_from_handle(cx, runtime_handle);
+        gpui_tokio::Tokio::spawn(cx, cap_utils::operation_diagnostics::run_checkpoints()).detach();
         // The dock icon: an unbundled dev binary shows the generic terminal
         // document without it. The bytes are the shipping app's icon.png.
         platform::set_dock_icon(include_bytes!("../assets/dock-icon.png"));
@@ -228,17 +395,30 @@ fn main() {
         // binding consumes the keystroke before any `on_key_down` listener on
         // the path runs (`gpui/src/window.rs:5280-5296`).
         ui::bind_text_input_keys(cx);
-        crate::theme::init(cx);
+        let general_settings = crate::store::GeneralSettings::load();
+        crate::i18n::init(general_settings.ui_language.as_deref());
+        crate::theme::init(general_settings.theme, cx);
+        platform::follow_system_reduce_motion(cx);
 
         let session = RecordingSession::init(cx);
+        crate::sign_in::SignIn::init(cx);
         crate::feeds::Feeds::init(cx);
+        crate::media_access::MediaAccess::init(cx);
         crate::target_overlay::TargetSelect::init(cx);
 
-        let bounds = Bounds::centered(
-            None,
-            size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
-            cx,
-        );
+        let dev_restore = dev_restore::load();
+        let main_size = size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT));
+        let bounds = dev_restore
+            .as_ref()
+            .and_then(|restore| restore.main_window_bounds(main_size, cx))
+            .unwrap_or_else(|| Bounds::centered(None, main_size, cx));
+        // A first run always lands in onboarding, and these two flags are a
+        // store read rather than the gate's TCC queries -- so the main window
+        // starts hidden instead of flashing up before onboarding replaces it.
+        // Linux keeps the gate: its main window tracks retained visibility.
+        let first_run = cfg!(not(target_os = "linux"))
+            && (!crate::store::has_completed_startup()
+                || !crate::store::has_completed_onboarding());
         let window_handle = cx
             .open_window(
                 WindowOptions {
@@ -264,7 +444,7 @@ fn main() {
                         ..Default::default()
                     }),
                     #[cfg(target_os = "linux")]
-                    app_id: Some("Cap".into()),
+                    app_id: Some(crate::app_windows::app_id().into()),
                     #[cfg(target_os = "linux")]
                     window_min_size: Some(size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT))),
                     #[cfg(target_os = "linux")]
@@ -283,7 +463,9 @@ fn main() {
                         gpui::WindowBackgroundAppearance::Transparent
                     },
                     is_resizable: false,
-                    is_minimizable: false,
+                    is_minimizable: cfg!(target_os = "windows"),
+                    focus: !first_run,
+                    show: !first_run,
                     ..Default::default()
                 },
                 {
@@ -297,8 +479,14 @@ fn main() {
             return;
         };
 
+        if cfg!(debug_assertions) {
+            cx.on_app_quit(|_| async {
+                crate::store::clear_handoff_marker();
+            })
+            .detach();
+        }
         cx.on_app_quit(|_| async {
-            crate::store::clear_handoff_marker();
+            crash_capture::mark_clean_exit();
         })
         .detach();
 
@@ -322,7 +510,9 @@ fn main() {
         #[cfg(target_os = "linux")]
         single_instance::init_linux_reopen(cx);
         updates::schedule_startup_check(cx);
+        app_windows::schedule_launch_render_warmup(cx);
         upload::queue::init(cx);
+        upload::instant_cleanup::init(cx);
 
         // The app menu (and with it ⌘W/⌘M/⌘Q) and the status-bar item. Both
         // reach into the window registry, so they come after it -- and the menu
@@ -339,17 +529,21 @@ fn main() {
         // are ~30ms of synchronous XPC on this Mac -- the whole startup delta
         // between the 08-17 and 08-18 builds. Both are thread-safe reads, so
         // the gate runs off-main and onboarding opens a beat after the main
-        // window instead of holding it back.
-        cx.spawn(async move |cx| {
-            let show_onboarding = cx
-                .background_executor()
-                .spawn(async { crate::store::should_show_onboarding() })
-                .await;
-            if show_onboarding {
-                cx.update(app_windows::open_onboarding);
-            }
-        })
-        .detach();
+        // window instead of holding it back. A first run skips the gate.
+        if first_run {
+            app_windows::open_onboarding(cx);
+        } else {
+            cx.spawn(async move |cx| {
+                let show_onboarding = cx
+                    .background_executor()
+                    .spawn(async { crate::store::should_show_onboarding() })
+                    .await;
+                if show_onboarding {
+                    cx.update(app_windows::open_onboarding);
+                }
+            })
+            .detach();
+        }
         // `CAP_GPUI_AUTO_TRAY` / `CAP_GPUI_TRAY_DUMP`: the tray's harness path.
         tray::drive_from_env(cx);
         // `CAP_GPUI_AUTO_CLOSE=settings|main:<secs>`: run the ⌘W body against
@@ -386,7 +580,9 @@ fn main() {
         // `CAP_GPUI_DEV_RESTORE=<state file>`: `dev.sh`'s relaunch loop.
         // Reopens the previous process's windows in place and keeps the
         // state file current for the next swap.
-        dev_restore::init(cx);
+        if let Some(dev_restore) = dev_restore {
+            dev_restore.init(cx);
+        }
 
         // Enumeration is started here rather than in `MainWindow::new`, which
         // runs before the window is fully built -- see `start_enumeration`.
@@ -398,6 +594,9 @@ fn main() {
                 platform::apply_panel_behavior(
                     window,
                     platform::PanelBehavior {
+                        #[cfg(target_os = "macos")]
+                        level: objc2_app_kit::NSFloatingWindowLevel,
+                        #[cfg(not(target_os = "macos"))]
                         level: platform::MAIN_WINDOW_LEVEL,
                         join_all_spaces: true,
                         shadow: true,
@@ -413,8 +612,6 @@ fn main() {
                 );
                 view.start_enumeration(window, cx);
                 view.start_recovery_check(window, cx);
-                view.auto_expand(window, cx);
-                view.auto_open_recent(window, cx);
                 // The AppKit work below must not run inside this update:
                 // inserting a subview and mutating the content view's layer
                 // synchronously re-enters gpui's own window callbacks, which
@@ -423,6 +620,14 @@ fn main() {
                 platform::native_window(window)
             })
             .expect("failed to start device enumeration");
+
+        // Before the launch thumbnail sweep can reach ReplayKit, which would
+        // otherwise add the standard titlebar buttons next to the hand-drawn
+        // close light (`platform::lock_borderless_style`).
+        #[cfg(target_os = "macos")]
+        if let Some(native) = &native_main {
+            platform::lock_borderless_style(native);
+        }
 
         // The native window material: `NSGlassEffectView` on macOS 26+,
         // `NSVisualEffectView` vibrancy below that -- what
@@ -448,7 +653,21 @@ fn main() {
             });
         })
         .detach();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        cx.spawn(async move |_| {
+            let Some(native) = native_main else {
+                return;
+            };
+            if let Err(error) = platform::install_main_window_frame_policy(&native) {
+                tracing::warn!(%error, "could not install Main window frame policy");
+            }
+            if let Err(error) = platform::install_session_end_handler(&native, end_windows_session)
+            {
+                tracing::warn!(%error, "could not install the Windows session end handler");
+            }
+        })
+        .detach();
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = native_main;
 
         // `CAP_GPUI_DEBUG_LIGHTS=1`: poll the main window's style mask and
@@ -489,6 +708,8 @@ fn main() {
         }
 
         permissions_ui::auto_open_from_env(cx); // `CAP_GPUI_AUTO_PERMISSIONS=1`: the permissions surface.
+        #[cfg(debug_assertions)]
+        snapshot::arm_from_env(cx);
 
         // `CAP_GPUI_AUTO_MODE_SELECT=1`: open the 580x340 mode picker the way
         // the mode dot does, main window hidden included. A mode name instead
@@ -591,6 +812,12 @@ fn main() {
         // the primary display and record for N seconds (or capture once). The
         // end-to-end check drives the recorder this way because unprivileged
         // synthetic clicks are dropped.
+        #[cfg(debug_assertions)]
+        picker_ui_benchmark::run(window_handle, cx);
+        #[cfg(debug_assertions)]
+        picker_probe::run(window_handle, cx);
+        #[cfg(debug_assertions)]
+        glass_probe::run(cx);
         if let Ok(auto) = std::env::var("CAP_GPUI_AUTO_RECORD")
             && let Some((mode, secs)) = parse_auto_record(&auto)
         {
@@ -616,4 +843,167 @@ fn main() {
             cx.activate(true);
         }
     });
+    runtime.shutdown_background();
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
+mod runtime_tests {
+    #[cfg(target_os = "windows")]
+    fn current_stack_size() -> usize {
+        let (mut low, mut high) = (0, 0);
+        unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high);
+        }
+        high.saturating_sub(low)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn current_stack_size() -> usize {
+        unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_stack_size() -> usize {
+        unsafe {
+            let mut attr = std::mem::zeroed::<libc::pthread_attr_t>();
+            assert_eq!(libc::pthread_getattr_np(libc::pthread_self(), &mut attr), 0);
+            let mut address = std::ptr::null_mut();
+            let mut size = 0;
+            assert_eq!(
+                libc::pthread_attr_getstack(&attr, &mut address, &mut size),
+                0
+            );
+            libc::pthread_attr_destroy(&mut attr);
+            size
+        }
+    }
+
+    #[test]
+    fn media_workers_and_blocking_tasks_have_large_stacks() {
+        let runtime = super::app_runtime();
+        runtime.block_on(async {
+            let worker_size = tokio::spawn(async { current_stack_size() }).await.unwrap();
+            let blocking_size = tokio::task::spawn_blocking(current_stack_size)
+                .await
+                .unwrap();
+            assert!(
+                worker_size >= super::MEDIA_THREAD_STACK_SIZE,
+                "worker stack: {worker_size}"
+            );
+            assert!(
+                blocking_size >= super::MEDIA_THREAD_STACK_SIZE,
+                "blocking stack: {blocking_size}"
+            );
+        });
+        runtime.shutdown_background();
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::create_log_appender;
+    use std::{io::Write, path::PathBuf};
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+
+    struct LogDirectory(PathBuf);
+
+    impl LogDirectory {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir()
+                .join(format!("cap-gpui-logging-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            Self(directory)
+        }
+    }
+
+    impl Drop for LogDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_default_filter_drops_zbus_property_cache_warnings_only() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .with_filter(tracing_subscriber::EnvFilter::new(super::DEFAULT_LOG_FILTER)),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "zbus::proxy", "Failed to populate properties cache");
+            tracing::error!(target: "zbus::proxy", "a zbus error still shows");
+            tracing::warn!(target: "zbus::connection", "other zbus warnings still show");
+            tracing::info!(target: "cap_gpui::session", "recording started");
+        });
+        let logged = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains("Failed to populate properties cache"), "{logged}");
+        assert!(logged.contains("a zbus error still shows"), "{logged}");
+        assert!(logged.contains("other zbus warnings still show"), "{logged}");
+        assert!(logged.contains("recording started"), "{logged}");
+    }
+
+    #[test]
+    fn healthy_log_destination_preserves_existing_records() {
+        let directory = LogDirectory::new();
+        let destination = directory.0.join("nested");
+        for record in ["first\n", "second\n"] {
+            let mut appender = create_log_appender(&destination, "cap.log").unwrap();
+            appender.write_all(record.as_bytes()).unwrap();
+            appender.flush().unwrap();
+        }
+        let records: String = std::fs::read_dir(destination)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        assert!(records.contains("first\n"));
+        assert!(records.contains("second\n"));
+    }
+
+    #[test]
+    fn unavailable_log_directory_disables_only_file_logging() {
+        let directory = LogDirectory::new();
+        let destination = directory.0.join("blocked");
+        std::fs::write(&destination, "existing file").unwrap();
+        assert!(create_log_appender(&destination, "cap.log").is_none());
+        assert_eq!(
+            std::fs::read_to_string(destination).unwrap(),
+            "existing file"
+        );
+    }
+
+    #[test]
+    fn unavailable_daily_log_file_disables_only_file_logging() {
+        let directory = LogDirectory::new();
+        let today = chrono::Utc::now().date_naive();
+        for days in [-1, 0, 1] {
+            let date = today + chrono::Duration::days(days);
+            std::fs::create_dir(directory.0.join(format!("cap.log.{date}"))).unwrap();
+        }
+        assert!(create_log_appender(&directory.0, "cap.log").is_none());
+        assert!(create_log_appender(&directory.0, "other.log").is_some());
+    }
 }

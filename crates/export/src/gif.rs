@@ -3,10 +3,10 @@ use cap_rendering::{ProjectUniforms, RenderSegment, RenderedFrame};
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use tracing::trace;
 
-use crate::{ExportError, ExporterBase};
+use crate::{ExportError, ExporterBase, prepare_new_output};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Type)]
 pub struct GifQuality {
@@ -35,6 +35,40 @@ impl Default for GifExportSettings {
 
 impl GifExportSettings {
     pub async fn export(
+        self,
+        base: ExporterBase,
+        on_progress: impl FnMut(u32) -> bool + Send + 'static,
+    ) -> Result<PathBuf, String> {
+        use cap_utils::operation_diagnostics::{Field, observe};
+        observe(
+            "export_gif",
+            &[
+                Field::number("requested_fps", self.fps as u64),
+                Field::number("requested_width", self.resolution_base.x as u64),
+                Field::number("requested_height", self.resolution_base.y as u64),
+                Field::identifier(
+                    "resource",
+                    cap_utils::operation_diagnostics::resource_id(&base.project_path),
+                ),
+                Field::number(
+                    "source_width",
+                    base.render_constants.options.screen_size.x as u64,
+                ),
+                Field::number(
+                    "source_height",
+                    base.render_constants.options.screen_size.y as u64,
+                ),
+                Field::number("source_segments", base.segments.len() as u64),
+                Field::number("clips", base.project_config.clips.len() as u64),
+                Field::flag("captions", base.project_config.captions.is_some()),
+                Field::flag("streaming_audio", base.streaming_audio.is_some()),
+            ],
+            self.export_inner(base, on_progress),
+        )
+        .await
+    }
+
+    async fn export_inner(
         self,
         base: ExporterBase,
         mut on_progress: impl FnMut(u32) -> bool + Send + 'static,
@@ -75,8 +109,11 @@ impl GifExportSettings {
             })
             .unwrap_or_default();
 
+        let temporary_output = prepare_new_output(&gif_output_path)?;
         let mut gif_encoder = cap_enc_gif::GifEncoderWrapper::new_with_quality(
-            &gif_output_path,
+            temporary_output
+                .as_ref()
+                .map_or(gif_output_path.as_path(), AsRef::as_ref),
             output_size.0,
             output_size.1,
             fps,
@@ -84,6 +121,7 @@ impl GifExportSettings {
         )
         .map_err(|e| format!("Failed to create GIF encoder: {e}"))?;
 
+        let sample_timing = base.sample_timing.clone();
         let encoder_thread = tokio::task::spawn_blocking(move || {
             let mut frame_count = 0;
 
@@ -92,22 +130,37 @@ impl GifExportSettings {
                     return Err(ExportError::Other("Export cancelled".to_string()));
                 }
 
-                if let Err(e) =
-                    gif_encoder.add_frame(&frame.data, frame.padded_bytes_per_row as usize)
-                {
+                let add_result = match Arc::try_unwrap(frame.data) {
+                    Ok(data) => {
+                        gif_encoder.add_frame_owned(data, frame.padded_bytes_per_row as usize)
+                    }
+                    Err(shared) => {
+                        gif_encoder.add_frame(&shared, frame.padded_bytes_per_row as usize)
+                    }
+                };
+                if let Err(e) = add_result {
                     return Err(ExportError::Other(format!(
                         "Failed to add frame to GIF: {e}"
                     )));
                 }
 
+                if sample_timing
+                    .as_ref()
+                    .is_some_and(|timing| timing.is_cancelled())
+                {
+                    return Err(ExportError::Other("Export cancelled".into()));
+                }
                 frame_count += 1;
+                if let Some(timing) = &sample_timing {
+                    timing.record_frame(frame.frame_number);
+                }
             }
 
             if let Err(e) = gif_encoder.finish() {
                 return Err(ExportError::Other(format!("Failed to finish GIF: {e}")));
             }
 
-            Ok(gif_output_path)
+            Ok(())
         })
         .then(|f| async {
             f.map_err(|e| e.to_string())
@@ -132,12 +185,18 @@ impl GifExportSettings {
             fps,
             self.resolution_base,
             &base.recordings,
+            base.sample_windows.clone(),
+            true,
         )
         .then(|f| async { f.map_err(|v| v.to_string()) });
 
-        let (output_path, _) =
-            tokio::try_join!(encoder_thread, render_video_task).map_err(|e| e.to_string())?;
+        tokio::try_join!(encoder_thread, render_video_task)?;
+        if let Some(temporary_output) = temporary_output {
+            temporary_output
+                .persist_noclobber(&gif_output_path)
+                .map_err(|e| e.to_string())?;
+        }
 
-        Ok(output_path)
+        Ok(gif_output_path)
     }
 }

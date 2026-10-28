@@ -124,6 +124,24 @@ impl WindowOption {
             (None, None) => None,
         }
     }
+
+    /// Whether two entries draw the same card. `position` only feeds the
+    /// thumbnail signature, so a window that moved still draws the same card.
+    pub fn same_card(&self, other: &Self) -> bool {
+        let Self {
+            id,
+            label,
+            app,
+            size,
+            position: _,
+            refresh_rate,
+        } = self;
+        *id == other.id
+            && *label == other.label
+            && *app == other.app
+            && *size == other.size
+            && *refresh_rate == other.refresh_rate
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -135,16 +153,432 @@ pub struct DeviceSnapshot {
 }
 
 impl DeviceSnapshot {
+    /// Store a fresh display list. Returns whether any card changed.
+    pub fn install_displays(&mut self, displays: Vec<DisplayOption>) -> bool {
+        if self.displays == displays {
+            return false;
+        }
+        self.displays = displays;
+        true
+    }
+
+    /// Store a fresh window list. Returns whether any card changed. The list is
+    /// stored either way so the thumbnail signature sees moved windows.
+    pub fn install_windows(&mut self, windows: Vec<WindowOption>) -> bool {
+        let changed = self.windows.len() != windows.len()
+            || self
+                .windows
+                .iter()
+                .zip(&windows)
+                .any(|(current, next)| !current.same_card(next));
+        self.windows = windows;
+        changed
+    }
+
+    pub fn update_camera_formats(
+        &mut self,
+        queried: &CameraOption,
+        formats: Vec<CameraFormat>,
+    ) -> bool {
+        let Some(camera) = self
+            .cameras
+            .iter_mut()
+            .find(|camera| camera.same_device(queried))
+        else {
+            return false;
+        };
+        camera.best_format = formats.first().copied();
+        camera.formats = formats;
+        true
+    }
+
     /// Enumerate everything. This blocks — AVFoundation camera discovery and the
     /// window-server queries are both slow enough to drop frames — so callers
     /// should run it on the background executor, never inside `render`.
     pub fn enumerate() -> Self {
         Self {
             cameras: list_cameras(),
-            microphones: list_microphones(),
+            microphones: list_microphone_names(),
             displays: list_displays(),
             windows: list_windows(),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct InputEnumerationGate(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+pub struct InputEnumerationPermit(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl InputEnumerationGate {
+    pub fn try_enter(&self) -> Option<InputEnumerationPermit> {
+        self.0
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| InputEnumerationPermit(self.0.clone()))
+    }
+}
+
+impl Drop for InputEnumerationPermit {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub enum InputSnapshot {
+    Cameras(Vec<CameraOption>),
+    Microphones(Vec<MicrophoneOption>),
+}
+
+impl InputSnapshot {
+    pub fn cameras(previous: &[CameraOption]) -> Self {
+        Self::Cameras(list_cameras_with_previous(previous))
+    }
+
+    pub fn microphones() -> Self {
+        Self::Microphones(list_microphones())
+    }
+
+    pub fn install(self, snapshot: &mut DeviceSnapshot) -> bool {
+        match self {
+            Self::Cameras(mut cameras) => {
+                for camera in &mut cameras {
+                    if camera.formats.is_empty()
+                        && let Some(current) = snapshot.cameras.iter().find(|current| {
+                            current.same_device(camera) && !current.formats.is_empty()
+                        })
+                    {
+                        camera.best_format = current.best_format;
+                        camera.formats = current.formats.clone();
+                    }
+                }
+                if snapshot.cameras == cameras {
+                    return false;
+                }
+                snapshot.cameras = cameras;
+            }
+            Self::Microphones(microphones) if snapshot.microphones != microphones => {
+                snapshot.microphones = microphones;
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod target_list_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn window(id: &str, label: &str) -> WindowOption {
+        WindowOption {
+            id: WindowId::from_str(id).unwrap(),
+            label: label.into(),
+            app: "Cap".into(),
+            size: Some((1920, 1080)),
+            position: Some((0., 0.)),
+            refresh_rate: Some(60.),
+        }
+    }
+
+    fn display(id: &str, label: &str) -> DisplayOption {
+        DisplayOption {
+            id: DisplayId::from_str(id).unwrap(),
+            label: label.into(),
+            refresh_rate: 60.,
+        }
+    }
+
+    #[test]
+    fn unchanged_display_list_does_not_repaint() {
+        let list = vec![display("1", "Built-in"), display("2", "Studio Display")];
+        let mut snapshot = DeviceSnapshot::default();
+        assert!(snapshot.install_displays(list.clone()));
+        assert!(!snapshot.install_displays(list.clone()));
+        assert_eq!(snapshot.displays, list);
+    }
+
+    #[test]
+    fn display_changes_repaint() {
+        let list = vec![display("1", "Built-in"), display("2", "Studio Display")];
+        let mut renamed = list.clone();
+        renamed[1].label = "Sidecar".into();
+        let mut slower = list.clone();
+        slower[0].refresh_rate = 30.;
+        let reordered = vec![list[1].clone(), list[0].clone()];
+        for next in [
+            renamed,
+            slower,
+            reordered,
+            vec![list[0].clone()],
+            Vec::new(),
+        ] {
+            let mut snapshot = DeviceSnapshot {
+                displays: list.clone(),
+                ..Default::default()
+            };
+            assert!(snapshot.install_displays(next.clone()));
+            assert_eq!(snapshot.displays, next);
+        }
+    }
+
+    #[test]
+    fn unchanged_window_list_does_not_repaint() {
+        let list = vec![window("1", "Main"), window("2", "Editor")];
+        let mut snapshot = DeviceSnapshot::default();
+        assert!(snapshot.install_windows(list.clone()));
+        assert!(!snapshot.install_windows(list.clone()));
+        assert_eq!(snapshot.windows, list);
+    }
+
+    #[test]
+    fn moved_window_is_stored_without_a_repaint() {
+        let list = vec![window("1", "Main"), window("2", "Editor")];
+        let mut moved = list.clone();
+        moved[1].position = Some((240., 96.));
+        let mut snapshot = DeviceSnapshot {
+            windows: list,
+            ..Default::default()
+        };
+        assert!(!snapshot.install_windows(moved.clone()));
+        assert_eq!(snapshot.windows, moved);
+    }
+
+    #[test]
+    fn window_card_changes_repaint() {
+        let list = vec![window("1", "Main"), window("2", "Editor")];
+        let mut renamed = list.clone();
+        renamed[0].label = "Untitled".into();
+        let mut other_app = list.clone();
+        other_app[1].app = "Finder".into();
+        let mut resized = list.clone();
+        resized[0].size = Some((1280, 720));
+        let mut sizeless = list.clone();
+        sizeless[0].size = None;
+        let mut slower = list.clone();
+        slower[1].refresh_rate = Some(30.);
+        let reordered = vec![list[1].clone(), list[0].clone()];
+        let mut opened = list.clone();
+        opened.push(window("3", "Settings"));
+        for next in [
+            renamed,
+            other_app,
+            resized,
+            sizeless,
+            slower,
+            reordered,
+            opened,
+            vec![list[0].clone()],
+            Vec::new(),
+        ] {
+            let mut snapshot = DeviceSnapshot {
+                windows: list.clone(),
+                ..Default::default()
+            };
+            assert!(snapshot.install_windows(next.clone()));
+            assert_eq!(snapshot.windows, next);
+        }
+    }
+}
+
+#[cfg(test)]
+mod input_enumeration_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_refresh_keeps_its_permit_until_enumeration_finishes() {
+        let gate = InputEnumerationGate::default();
+        let pending = gate.try_enter().expect("first refresh");
+        assert!(gate.clone().try_enter().is_none());
+        drop(pending);
+        assert!(gate.try_enter().is_some());
+    }
+
+    #[test]
+    fn enumeration_unwind_releases_the_gate() {
+        let gate = InputEnumerationGate::default();
+        let worker_gate = gate.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _permit = worker_gate.try_enter().expect("first refresh");
+            panic!("enumeration fixture");
+        });
+        assert!(result.is_err());
+        assert!(gate.try_enter().is_some());
+    }
+
+    #[test]
+    fn camera_refresh_preserves_other_device_lists() {
+        let microphone = MicrophoneOption {
+            name: "Selected microphone".into(),
+            sample_rate: Some(48_000),
+            channels: Some(2),
+        };
+        let mut snapshot = DeviceSnapshot {
+            microphones: vec![microphone.clone()],
+            ..Default::default()
+        };
+        let camera = CameraOption {
+            device_id: "new-camera".into(),
+            model_id: None,
+            label: "Connected camera".into(),
+            best_format: None,
+            formats: Vec::new(),
+        };
+        assert!(InputSnapshot::Cameras(vec![camera.clone()]).install(&mut snapshot));
+        assert_eq!(snapshot.cameras, vec![camera.clone()]);
+        assert_eq!(snapshot.microphones, vec![microphone]);
+        assert!(!InputSnapshot::Cameras(vec![camera.clone()]).install(&mut snapshot));
+        assert!(InputSnapshot::Microphones(Vec::new()).install(&mut snapshot));
+        assert_eq!(snapshot.cameras, vec![camera]);
+    }
+    fn camera_fixture(id: &str) -> CameraOption {
+        CameraOption {
+            device_id: id.into(),
+            model_id: None,
+            label: "Camera".into(),
+            best_format: None,
+            formats: Vec::new(),
+        }
+    }
+
+    fn formats_fixture() -> Vec<CameraFormat> {
+        vec![CameraFormat {
+            width: 1920,
+            height: 1080,
+            frame_rate: 30.0,
+        }]
+    }
+
+    #[test]
+    fn completed_query_updates_matching_camera_capabilities() {
+        let queried = camera_fixture("camera-a");
+        let mut snapshot = DeviceSnapshot {
+            cameras: vec![queried.clone()],
+            ..Default::default()
+        };
+        assert!(snapshot.update_camera_formats(&queried, formats_fixture()));
+        assert_eq!(snapshot.cameras[0].formats, formats_fixture());
+        assert_eq!(
+            snapshot.cameras[0].best_format,
+            formats_fixture().first().copied()
+        );
+    }
+
+    #[test]
+    fn completed_query_cannot_overwrite_replacement_camera_capabilities() {
+        let queried = camera_fixture("camera-a");
+        let mut changed_id = queried.clone();
+        changed_id.device_id = "camera-b".into();
+        let mut changed_model = queried.clone();
+        changed_model.model_id =
+            Some(cap_camera::ModelID::try_from("046d:08e5".to_string()).unwrap());
+        let mut changed_label = queried.clone();
+        changed_label.label = "Replacement camera".into();
+        for replacement in [changed_id, changed_model, changed_label] {
+            let mut snapshot = DeviceSnapshot {
+                cameras: vec![replacement.clone()],
+                ..Default::default()
+            };
+            assert!(!snapshot.update_camera_formats(&queried, formats_fixture()));
+            assert_eq!(snapshot.cameras, vec![replacement]);
+        }
+    }
+
+    #[test]
+    fn completed_query_cannot_restore_disconnected_camera() {
+        let mut snapshot = DeviceSnapshot::default();
+        assert!(!snapshot.update_camera_formats(&camera_fixture("camera-a"), formats_fixture()));
+        assert!(snapshot.cameras.is_empty());
+    }
+
+    #[test]
+    fn repeated_camera_refresh_does_not_reopen_unchanged_devices() {
+        let mut previous = vec![camera_fixture("camera-a").with_formats(&[], formats_fixture)];
+        for _ in 0..1000 {
+            let refreshed = camera_fixture("camera-a").with_formats(&previous, || {
+                panic!("unchanged camera must not reopen its driver")
+            });
+            assert_eq!(refreshed, previous[0]);
+            previous = vec![refreshed];
+        }
+    }
+
+    #[test]
+    fn new_camera_does_not_inherit_another_devices_formats() {
+        let previous = vec![camera_fixture("camera-a").with_formats(&[], formats_fixture)];
+        let mut probes = 0;
+        let refreshed = camera_fixture("camera-b").with_formats(&previous, || {
+            probes += 1;
+            Vec::new()
+        });
+        assert_eq!(probes, 1);
+        assert!(refreshed.formats.is_empty());
+        assert!(refreshed.best_format.is_none());
+    }
+
+    #[test]
+    fn reconnect_refreshes_formats_after_camera_disappears() {
+        let connected = camera_fixture("camera-a").with_formats(&[], formats_fixture);
+        let after_disconnect = Vec::new();
+        let changed_format = CameraFormat {
+            width: 1280,
+            height: 720,
+            frame_rate: 60.0,
+        };
+        let reconnected =
+            camera_fixture("camera-a").with_formats(&after_disconnect, || vec![changed_format]);
+        assert_ne!(reconnected.formats, connected.formats);
+        assert_eq!(reconnected.best_format, Some(changed_format));
+    }
+
+    #[test]
+    fn renamed_camera_refreshes_capabilities() {
+        let previous = vec![camera_fixture("camera-a").with_formats(&[], formats_fixture)];
+        let mut camera = camera_fixture("camera-a");
+        camera.label = "Reconfigured virtual camera".into();
+        let mut probes = 0;
+        camera.with_formats(&previous, || {
+            probes += 1;
+            Vec::new()
+        });
+        assert_eq!(probes, 1);
+    }
+    #[test]
+    fn failed_probe_is_not_retried_by_background_refresh() {
+        let previous = vec![camera_fixture("camera-a").with_formats(&[], Vec::new)];
+        let refreshed = camera_fixture("camera-a").with_formats(&previous, || {
+            panic!("background refresh must not retry a native probe")
+        });
+        assert!(refreshed.formats.is_empty());
+    }
+
+    #[test]
+    fn late_refresh_does_not_erase_successful_explicit_retry() {
+        let refreshed = vec![camera_fixture("camera-a")];
+        let mut snapshot = DeviceSnapshot {
+            cameras: vec![camera_fixture("camera-a").with_formats(&[], formats_fixture)],
+            ..Default::default()
+        };
+        assert!(!InputSnapshot::Cameras(refreshed).install(&mut snapshot));
+        assert_eq!(snapshot.cameras[0].formats, formats_fixture());
+    }
+
+    #[test]
+    fn changed_device_does_not_inherit_previous_capabilities() {
+        let mut changed = camera_fixture("camera-a");
+        changed.label = "Changed virtual camera".into();
+        let mut snapshot = DeviceSnapshot {
+            cameras: vec![camera_fixture("camera-a").with_formats(&[], formats_fixture)],
+            ..Default::default()
+        };
+        assert!(InputSnapshot::Cameras(vec![changed]).install(&mut snapshot));
+        assert!(snapshot.cameras[0].formats.is_empty());
     }
 }
 
@@ -174,48 +608,127 @@ impl TargetSnapshot {
 }
 
 fn list_cameras() -> Vec<CameraOption> {
+    list_cameras_with_previous(&[])
+}
+
+fn list_cameras_with_previous(previous: &[CameraOption]) -> Vec<CameraOption> {
     cap_camera::list_cameras()
         .map(|camera| {
-            let mut formats = camera
-                .formats()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|format| CameraFormat {
-                    width: format.width(),
-                    height: format.height(),
-                    frame_rate: format.frame_rate(),
-                })
-                .collect::<Vec<_>>();
-            let mut seen = std::collections::HashSet::new();
-            formats.retain(|format| {
-                seen.insert((
-                    format.width,
-                    format.height,
-                    format.frame_rate.round() as u32,
-                ))
-            });
-            formats.sort_by(|a, b| {
-                (b.width * b.height)
-                    .cmp(&(a.width * a.height))
-                    .then(b.frame_rate.total_cmp(&a.frame_rate))
-            });
-            let best_format = formats.first().copied();
-
             CameraOption {
                 device_id: camera.device_id().to_string(),
                 model_id: camera.model_id().cloned(),
                 label: camera.display_name().to_string(),
-                best_format,
-                formats,
+                best_format: None,
+                formats: Vec::new(),
             }
+            .with_formats(previous, || {
+                camera
+                    .formats()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|format| CameraFormat {
+                        width: format.width(),
+                        height: format.height(),
+                        frame_rate: format.frame_rate(),
+                    })
+                    .collect()
+            })
         })
         .collect()
 }
 
-/// Mirrors `MicrophoneFeed::list_with_settings`: the default input device is
-/// inserted first so it heads the list, then every other input device is
-/// appended, deduped by name.
+impl CameraOption {
+    fn same_device(&self, other: &Self) -> bool {
+        self.device_id == other.device_id
+            && self.model_id == other.model_id
+            && self.label == other.label
+    }
+
+    fn with_formats(
+        mut self,
+        previous: &[Self],
+        load_formats: impl FnOnce() -> Vec<CameraFormat>,
+    ) -> Self {
+        // Windows format probing opens native camera sources; polling an unchanged
+        // device must reuse metadata rather than repeatedly activating its driver.
+        if let Some(previous) = previous.iter().find(|previous| previous.same_device(&self)) {
+            self.best_format = previous.best_format;
+            self.formats = previous.formats.clone();
+            return self;
+        }
+
+        let mut formats = load_formats();
+        let mut seen = std::collections::HashSet::new();
+        formats.retain(|format| {
+            seen.insert((
+                format.width,
+                format.height,
+                format.frame_rate.round() as u32,
+            ))
+        });
+        formats.sort_by(|a, b| {
+            (u64::from(b.width) * u64::from(b.height))
+                .cmp(&(u64::from(a.width) * u64::from(a.height)))
+                .then(b.frame_rate.total_cmp(&a.frame_rate))
+        });
+        self.best_format = formats.first().copied();
+        self.formats = formats;
+        self
+    }
+}
+
+pub fn camera_formats(device_id: &str) -> Result<Vec<CameraFormat>, String> {
+    let camera = cap_camera::list_cameras()
+        .find(|camera| camera.device_id() == device_id)
+        .ok_or_else(|| "Camera is no longer available. Reconnect it and try again.".to_string())?;
+    let formats = camera.formats().ok_or_else(|| {
+        "Could not read camera formats. Check camera access and try again.".to_string()
+    })?;
+    if formats.is_empty() {
+        return Err(
+            "No camera formats are available. Check camera access and try again.".to_string(),
+        );
+    }
+    Ok(CameraOption {
+        device_id: camera.device_id().to_string(),
+        model_id: camera.model_id().cloned(),
+        label: camera.display_name().to_string(),
+        best_format: None,
+        formats: Vec::new(),
+    }
+    .with_formats(&[], || {
+        formats
+            .into_iter()
+            .map(|format| CameraFormat {
+                width: format.width(),
+                height: format.height(),
+                frame_rate: format.frame_rate(),
+            })
+            .collect()
+    })
+    .formats)
+}
+
+fn list_microphone_names() -> Vec<MicrophoneOption> {
+    cap_recording::feeds::microphone::MicrophoneFeed::list_names()
+        .into_iter()
+        .map(|name| MicrophoneOption {
+            name,
+            sample_rate: None,
+            channels: None,
+        })
+        .collect()
+}
+
 fn list_microphones() -> Vec<MicrophoneOption> {
+    // CPAL's configuration lookup opens an input AudioUnit and can prompt for consent.
+    #[cfg(target_os = "macos")]
+    if !crate::permissions::check_raw_preflight().is_some_and(|permissions| {
+        permissions.microphone == crate::permissions::MediaAuthorization::Authorized
+    }) {
+        return list_microphone_names();
+    }
+
     let host = cpal::default_host();
     let mut mics: Vec<MicrophoneOption> = Vec::new();
 
@@ -319,7 +832,15 @@ pub fn topmost_foreign_window_at_cursor() -> Option<Window> {
     candidates.into_iter().next().map(|(window, _)| window)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn topmost_foreign_window_at_cursor() -> Option<Window> {
+    match scap_targets::WindowImpl::topmost_x11_snapshot_at_cursor() {
+        Some(found) => found.map(|snapshot| snapshot.window),
+        None => Window::get_topmost_at_cursor(),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn topmost_foreign_window_at_cursor() -> Option<Window> {
     Window::get_topmost_at_cursor()
 }
@@ -355,16 +876,6 @@ pub fn list_display_targets() -> Vec<(DisplayOption, Display)> {
         .collect()
 }
 
-/// Mirrors the picker path of `cap_recording::sources::screen_capture::list_windows`
-/// (i.e. `include_accessory_panels: false`), which collapses to: a non-empty
-/// title, not owned by the Window Server, and at window level 0.
-///
-/// The level check is what actually matters. A raw `Window::list()` on macOS is
-/// dominated by menu-bar extras and status items — Control Centre alone
-/// contributes a dozen `Item-0` windows at level 25 — so without it the picker
-/// is unusable. This is deliberately duplicated rather than imported:
-/// `cap-recording` drags in ffmpeg and the whole encode stack, which this app
-/// has no other reason to build.
 pub fn list_windows() -> Vec<WindowOption> {
     list_window_targets()
         .into_iter()
@@ -377,15 +888,37 @@ pub fn list_windows() -> Vec<WindowOption> {
 /// `collect_windows_with_thumbnails` (`thumbnails/mod.rs:107-137`), which needs
 /// the handle for both the ScreenCaptureKit filter and `Window::app_icon()`.
 pub fn list_window_targets() -> Vec<(WindowOption, Window)> {
-    Window::list()
+    list_window_targets_inner(
+        #[cfg(target_os = "windows")]
+        &mut scap_targets::platform::WindowListCache::default(),
+    )
+}
+
+pub(crate) fn list_window_targets_inner(
+    #[cfg(target_os = "windows")] cache: &mut scap_targets::platform::WindowListCache,
+) -> Vec<(WindowOption, Window)> {
+    #[cfg(target_os = "linux")]
+    if let Some(targets) = linux_window_targets_from_snapshot() {
+        return targets;
+    }
+
+    #[cfg(target_os = "windows")]
+    let windows = cache.list();
+    #[cfg(not(target_os = "windows"))]
+    let windows = Window::list();
+
+    windows
         .into_iter()
         .filter_map(|window| {
             #[cfg(target_os = "windows")]
-            if !window.raw_handle().is_valid() || !window.raw_handle().is_on_screen() {
+            if !cache.is_valid(&window) || !cache.is_on_screen(&window) {
                 return None;
             }
 
             let label = window.name().filter(|name| !name.trim().is_empty())?;
+            #[cfg(target_os = "windows")]
+            let app = cache.owner_name(&window)?;
+            #[cfg(not(target_os = "windows"))]
             let app = window.owner_name()?;
 
             if app == "Window Server" {
@@ -397,17 +930,27 @@ pub fn list_window_targets() -> Vec<(WindowOption, Window)> {
             // (`app_windows::begin_recording`), so offering one as a target
             // records a hole. Matched by owner pid rather than title or
             // bundle id -- the dev binary is unbundled, and most of our
-            // windows carry no CG title at all. (The shared
-            // `screen_capture::list_windows` has no such filter; the Tauri
-            // main window only escapes it by being a level>0 panel.)
+            // windows carry no CG title at all.
             #[cfg(target_os = "macos")]
             if window.raw_handle().owner_pid() == Some(std::process::id() as i32) {
                 return None;
             }
 
             #[cfg(target_os = "macos")]
-            if window.raw_handle().level() != Some(0) {
-                return None;
+            {
+                let level = window.raw_handle().level();
+                let bundle_identifier = window.raw_handle().bundle_identifier();
+                let is_accessory_application = matches!(level, Some(level) if level > 0)
+                    && window.raw_handle().is_accessory_application();
+                if !cap_recording::sources::screen_capture::is_listable_macos_window(
+                    level,
+                    &app,
+                    bundle_identifier.as_deref(),
+                    false,
+                    is_accessory_application,
+                ) {
+                    return None;
+                }
             }
 
             Some((
@@ -427,6 +970,45 @@ pub fn list_window_targets() -> Vec<(WindowOption, Window)> {
             ))
         })
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_window_targets_from_snapshot() -> Option<Vec<(WindowOption, Window)>> {
+    let snapshots = scap_targets::WindowImpl::list_x11_snapshots()?;
+    Some(
+        snapshots
+            .into_iter()
+            .filter_map(|snapshot| {
+                let size = snapshot.logical_size();
+                let position = snapshot.display_relative_origin();
+                let refresh_rate = snapshot.refresh_rate();
+                let id = snapshot.window.id();
+                if snapshot.name.trim().is_empty() {
+                    return None;
+                }
+                let app = snapshot.owner_name?;
+                if app == "Window Server" {
+                    return None;
+                }
+                // As on macOS: recording one of our own windows records a
+                // window the recording hides.
+                if snapshot.owner_pid == Some(std::process::id()) {
+                    return None;
+                }
+                Some((
+                    WindowOption {
+                        id,
+                        label: snapshot.name,
+                        app,
+                        size: Some((size.width() as u32, size.height() as u32)),
+                        position,
+                        refresh_rate: Some(refresh_rate),
+                    },
+                    snapshot.window,
+                ))
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

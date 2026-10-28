@@ -8,8 +8,7 @@
 //! {name}.cap/` holding `original.png`, a Studio `SingleSegment` meta whose
 //! display track is the PNG at `fps: 0`, and a project config whose
 //! background is transparent white with no shadow (`recording.rs:2963-2985`).
-//! Known deviations from that command: no capture sound (this app has no
-//! sound assets yet), no native notification, and no `ScreenshotTaken`
+//! Known deviations from that command: no native notification and no `ScreenshotTaken`
 //! automations (no automation runner here).
 
 use std::path::PathBuf;
@@ -30,6 +29,43 @@ pub fn take_screenshot(target: ScreenCaptureTarget, cx: &mut App) {
     }
     tracing::info!(kind = target.kind_str(), "taking a screenshot");
 
+    #[cfg(target_os = "linux")]
+    if cap_recording::screenshot::uses_wayland_portal()
+        && matches!(
+            target,
+            ScreenCaptureTarget::Display { .. } | ScreenCaptureTarget::Area { .. }
+        )
+        && !WAYLAND_SCREENSHOTS_ALLOWED.load(std::sync::atomic::Ordering::Acquire)
+    {
+        // Asked while the picker still has focus: GNOME Shell shows the
+        // permission question only for the focused app, and the capture below
+        // hides the picker first.
+        let request = gpui_tokio::Tokio::spawn_result(
+            cx,
+            cap_recording::screenshot::request_wayland_screenshot_permission(),
+        );
+        cx.spawn(async move |cx| match request.await {
+            Ok(()) => {
+                WAYLAND_SCREENSHOTS_ALLOWED.store(true, std::sync::atomic::Ordering::Release);
+                tracing::info!("the desktop allows Cap's screenshots");
+                cx.update(|cx| capture(target, cx));
+            }
+            // The picker is still up, so the user can try again.
+            Err(error) => tracing::error!("screenshot capture failed: {error:#}"),
+        })
+        .detach();
+        return;
+    }
+    capture(target, cx);
+}
+
+/// Set once the screenshot portal has answered a request: the permission it
+/// may have asked for is granted for the rest of the session.
+#[cfg(target_os = "linux")]
+static WAYLAND_SCREENSHOTS_ALLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn capture(target: ScreenCaptureTarget, cx: &mut App) {
     let settle = app_windows::prepare_for_screenshot_capture(cx);
 
     let task = gpui_tokio::Tokio::spawn_result(cx, async move {
@@ -66,13 +102,15 @@ async fn capture_and_write(target: ScreenCaptureTarget) -> anyhow::Result<PathBu
         .await
         .context("capturing the screenshot")?;
 
+    crate::app_sounds::AppSound::Notification.play();
+
     let base = crate::library::screenshots_dir();
     std::fs::create_dir_all(&base)
         .with_context(|| format!("creating screenshots dir {}", base.display()))?;
 
     // The same naming chain `create_project_dir` uses for recordings: default
     // template only (the custom-template deviation recordings already have),
-    // colons and slashes dotted, then uniqued against the directory.
+    // then sanitized and uniqued against the directory.
     let target_name = target.title().unwrap_or_else(|| "Unknown".into());
     let now = chrono::Local::now();
     let pretty_name = format!(
@@ -82,7 +120,7 @@ async fn capture_and_write(target: ScreenCaptureTarget) -> anyhow::Result<PathBu
         now.format("%Y-%m-%d"),
         now.format("%I.%M %p"),
     );
-    let filename = format!("{}.cap", pretty_name.replace([':', '/'], "."));
+    let filename = crate::recording::project_bundle_filename(&pretty_name);
     let filename = cap_utils::ensure_unique_filename(&filename, &base)
         .map_err(|e| anyhow!("unique filename: {e}"))?;
     let bundle = base.join(filename);
@@ -149,13 +187,16 @@ async fn write_png(path: PathBuf, image: image::DynamicImage) -> anyhow::Result<
 
         let file =
             std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-        let encoder = image::codecs::png::PngEncoder::new_with_quality(
-            std::io::BufWriter::new(file),
+        cap_gpui_kernels::codec::write_png_file(
+            file,
+            &data,
+            width,
+            height,
+            color_type.into(),
             compression,
             image::codecs::png::FilterType::Adaptive,
-        );
-        image::ImageEncoder::write_image(encoder, &data, width, height, color_type.into())
-            .context("encoding the screenshot PNG")
+        )
+        .context("encoding the screenshot PNG")
     })
     .await
     .context("the PNG encode task died")?

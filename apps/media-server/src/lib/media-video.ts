@@ -1,16 +1,46 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { type BunFile, file, spawn } from "bun";
+import {
+	type CapcodecOptions,
+	capcodecOptionsForJob,
+	encodeVideoWithCapcodec,
+	remainingTimeoutMs,
+} from "./capcodec-encoder";
+import { uploadDriveResumable } from "./drive-resumable-upload";
+import { collectFfmpegErrorLine, FfmpegExitError } from "./ffmpeg-errors";
 import type { VideoMetadata } from "./job-manager";
 import {
 	DOWNLOAD_TIMEOUT_MS,
+	decodeThreadsFromEnv,
+	normalizeLocalPath,
 	PROCESS_TIMEOUT_MS,
 	type ProgressCallback,
 	UPLOAD_TIMEOUT_MS,
 	withTimeout,
 } from "./media-common";
 import { probeVideoFile } from "./media-probe";
+import { fetchMedia, materializeMedia } from "./media-transfer";
+import {
+	buildGpuDecodeInputArgs,
+	buildNvencEncodeArgs,
+	canDecodeOnGpu,
+	fitWithinEven,
+	GPU_DECODE_FORMAT_FILTER,
+	logNvencFallback,
+	type NvencOptions,
+	nvencFallbackReason,
+	nvencOptionsFromEnv,
+	recordNvencAttempt,
+	selectedVideoEncoder,
+} from "./nvenc-encoder";
+import {
+	downloadUrlToPathParallel,
+	parallelDownloadOptionsFromEnv,
+} from "./parallel-download";
+import { readRecordingAudioTail } from "./recording-packet-proof";
 import {
 	RecordingTimingError,
 	readRecordingVideoTiming,
@@ -30,7 +60,7 @@ const MAX_PROCESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 // flat 10-minute budget is enough for typical short recordings but not for a
 // long (e.g. 60+ minute) manifest with 1000+ segments.
 const STREAMING_DOWNLOAD_TIMEOUT_PER_SECOND_MS = 5_000;
-const MAX_STREAMING_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
 const THUMBNAIL_TIMEOUT_MS = 60_000;
 const PREVIEW_GIF_TIMEOUT_MS = 30_000;
 const PROBE_H264_LEVEL_TIMEOUT_MS = 10_000;
@@ -47,6 +77,7 @@ const MULTIPART_MIN_PART_SIZE_BYTES = 5 * 1024 * 1024;
 const MULTIPART_MAX_PARTS = 10_000;
 const MULTIPART_ABORT_TIMEOUT_MS = 30_000;
 const STORAGE_ERROR_BODY_LIMIT_BYTES = 2_048;
+export const LOOM_IMPORT_MAX_BYTES = 10 * 1024 ** 3;
 
 export type StorageUploadTarget =
 	| {
@@ -66,6 +97,7 @@ export type StorageUploadTarget =
 			completeUrl: string;
 			abortUrl: string;
 			webhookSecret?: string;
+			loomImportAttemptId?: string;
 	  };
 
 export interface StorageUploadReceipt {
@@ -589,8 +621,13 @@ function buildDashSegments(
 	if (timeline) {
 		const timelineSegments = getXmlElementBlocks(timeline.content, "S");
 		let currentTime = 0;
+		let number = startNumber;
 
 		for (const [index, segment] of timelineSegments.entries()) {
+			if (parseNumber(segment.attributes.d) === 0) {
+				number++;
+				continue;
+			}
 			const duration = parsePositiveNumber(segment.attributes.d);
 			if (!duration) {
 				throw new Error("DASH SegmentTimeline entry is missing duration");
@@ -615,10 +652,9 @@ function buildDashSegments(
 
 			for (let offset = 0; offset < count; offset++) {
 				const time = currentTime + duration * offset;
-				const number = startNumber + segments.length;
 				const resource = substituteDashTemplate(media, {
 					bandwidth,
-					number,
+					number: number++,
 					representationId,
 					time,
 				});
@@ -1164,7 +1200,7 @@ function getStreamingDownloadTimeoutMs(durationSeconds: number | null): number {
 	if (!durationSeconds) return DOWNLOAD_TIMEOUT_MS;
 
 	return Math.min(
-		MAX_STREAMING_DOWNLOAD_TIMEOUT_MS,
+		MAX_DOWNLOAD_TIMEOUT_MS,
 		Math.max(
 			DOWNLOAD_TIMEOUT_MS,
 			Math.ceil(durationSeconds * STREAMING_DOWNLOAD_TIMEOUT_PER_SECOND_MS),
@@ -1175,10 +1211,24 @@ function getStreamingDownloadTimeoutMs(durationSeconds: number | null): number {
 async function downloadStreamingVideoToTemp(
 	videoUrl: string,
 	abortSignal?: AbortSignal,
+	maxBytes?: number,
 ): Promise<TempFileHandle> {
 	await ensureTempDir();
 	const manifestDir = await mkdtemp(join(getTempDir(), "stream-"));
 	const tempFile = await createTempFile(".mkv");
+	const sizeController = new AbortController();
+	const signal = AbortSignal.any([
+		sizeController.signal,
+		...(abortSignal ? [abortSignal] : []),
+	]);
+	const sizeCheck = maxBytes
+		? setInterval(() => {
+				if (file(tempFile.path).size > maxBytes) {
+					sizeController.abort(new Error("Loom imports are limited to 10 GB"));
+				}
+			}, 250)
+		: undefined;
+	sizeCheck?.unref();
 	const cleanup = async () => {
 		await tempFile.cleanup();
 		await rm(manifestDir, { force: true, recursive: true }).catch(() => {});
@@ -1189,7 +1239,7 @@ async function downloadStreamingVideoToTemp(
 		const inputPath = await materializeStreamingInput(
 			videoUrl,
 			manifestDir,
-			abortSignal,
+			signal,
 		);
 		const durationSeconds =
 			await estimateMaterializedStreamingDurationSeconds(manifestDir);
@@ -1202,8 +1252,11 @@ async function downloadStreamingVideoToTemp(
 				ffmpegHlsCapabilities,
 			),
 			downloadTimeoutMs,
-			abortSignal,
+			signal,
 		);
+		if (maxBytes && file(tempFile.path).size > maxBytes) {
+			throw new Error("Loom imports are limited to 10 GB");
+		}
 
 		if (file(tempFile.path).size === 0) {
 			throw new Error("Streaming download produced empty file");
@@ -1215,7 +1268,10 @@ async function downloadStreamingVideoToTemp(
 		};
 	} catch (err) {
 		await cleanup();
+		if (sizeController.signal.aborted) throw sizeController.signal.reason;
 		throw err;
+	} finally {
+		if (sizeCheck) clearInterval(sizeCheck);
 	}
 }
 
@@ -1223,9 +1279,18 @@ export async function downloadVideoToTemp(
 	videoUrl: string,
 	inputExtension?: string,
 	abortSignal?: AbortSignal,
+	maxBytes?: number,
 ): Promise<TempFileHandle> {
 	if (isStreamingUrl(videoUrl)) {
-		return await downloadStreamingVideoToTemp(videoUrl, abortSignal);
+		return await downloadStreamingVideoToTemp(videoUrl, abortSignal, maxBytes);
+	}
+
+	const local = await materializeMedia(videoUrl, abortSignal);
+	if (local) {
+		if (maxBytes && file(local.path).size > maxBytes) {
+			throw new Error("Loom imports are limited to 10 GB");
+		}
+		return { path: local.path, cleanup: async () => {} };
 	}
 
 	const tempFile = await createTempFile(
@@ -1233,12 +1298,26 @@ export async function downloadVideoToTemp(
 	);
 
 	try {
-		const timeoutSignal = AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS);
+		const timeoutSignal = AbortSignal.timeout(
+			maxBytes === undefined ? DOWNLOAD_TIMEOUT_MS : MAX_DOWNLOAD_TIMEOUT_MS,
+		);
 		const combinedSignal = abortSignal
 			? AbortSignal.any([abortSignal, timeoutSignal])
 			: timeoutSignal;
 
-		const response = await fetch(videoUrl, {
+		const parallel = parallelDownloadOptionsFromEnv();
+		if (parallel.concurrency > 1 && maxBytes === undefined) {
+			await downloadUrlToPathParallel(videoUrl, tempFile.path, {
+				...parallel,
+				signal: combinedSignal,
+			});
+			if (file(tempFile.path).size === 0) {
+				throw new Error("Downloaded video is empty");
+			}
+			return tempFile;
+		}
+
+		const response = await fetchMedia(videoUrl, {
 			signal: combinedSignal,
 		});
 
@@ -1252,18 +1331,31 @@ export async function downloadVideoToTemp(
 		if (!response.body) {
 			throw new Error("No response body");
 		}
+		if (maxBytes && Number(response.headers.get("content-length")) > maxBytes) {
+			await response.body.cancel();
+			throw new Error("Loom imports are limited to 10 GB");
+		}
 
 		const reader = response.body.getReader();
 		const writer = file(tempFile.path).writer();
+		let downloadedBytes = 0;
+		let writerEnded = false;
 		try {
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
+				downloadedBytes += value.byteLength;
+				if (maxBytes && downloadedBytes > maxBytes) {
+					throw new Error("Loom imports are limited to 10 GB");
+				}
 				writer.write(value);
 			}
+			writerEnded = true;
 			await writer.end();
 		} finally {
+			await reader.cancel().catch(() => {});
 			reader.releaseLock();
+			if (!writerEnded) await Promise.resolve(writer.end()).catch(() => {});
 		}
 
 		if (file(tempFile.path).size === 0) {
@@ -1297,7 +1389,7 @@ function needsAudioTranscode(metadata: VideoMetadata): boolean {
 	return Boolean(metadata.audioCodec && metadata.audioCodec !== "aac");
 }
 
-function getProcessTimeoutMs(
+export function getProcessTimeoutMs(
 	durationSeconds: number,
 	baseTimeoutMs: number,
 ): number {
@@ -1411,10 +1503,11 @@ export function pickMobileSafeH264Level(
 	return { value: 52, ffmpegValue: "5.2" };
 }
 
-async function probeH264Level(
+async function probeVideoStreamEntries(
 	inputPath: string,
+	showEntries: string,
 	abortSignal?: AbortSignal,
-): Promise<number | null> {
+): Promise<string | null> {
 	const proc = registerSubprocess(
 		spawn({
 			cmd: [
@@ -1424,7 +1517,7 @@ async function probeH264Level(
 				"-select_streams",
 				"v:0",
 				"-show_entries",
-				"stream=level",
+				showEntries,
 				"-of",
 				"default=noprint_wrappers=1:nokey=1",
 				inputPath,
@@ -1458,10 +1551,7 @@ async function probeH264Level(
 		);
 		const exitCode = await proc.exited;
 		if (exitCode !== 0) return null;
-
-		const rawLevel = stdout.trim().split(/\s+/)[0] ?? "";
-		const level = Number.parseInt(rawLevel, 10);
-		return Number.isFinite(level) && level > 0 ? level : null;
+		return stdout.trim();
 	} catch {
 		return null;
 	} finally {
@@ -1472,6 +1562,37 @@ async function probeH264Level(
 	}
 }
 
+async function probeH264Level(
+	inputPath: string,
+	abortSignal?: AbortSignal,
+): Promise<number | null> {
+	const stdout = await probeVideoStreamEntries(
+		inputPath,
+		"stream=level",
+		abortSignal,
+	);
+	if (stdout === null) return null;
+	const rawLevel = stdout.split(/\s+/)[0] ?? "";
+	const level = Number.parseInt(rawLevel, 10);
+	return Number.isFinite(level) && level > 0 ? level : null;
+}
+
+async function probeVideoRotation(
+	inputPath: string,
+	abortSignal?: AbortSignal,
+): Promise<number | null> {
+	const stdout = await probeVideoStreamEntries(
+		inputPath,
+		"stream_side_data=rotation",
+		abortSignal,
+	);
+	if (stdout === null) return null;
+	const rawRotation = stdout.split(/\s+/)[0] ?? "";
+	if (rawRotation === "") return 0;
+	const rotation = Number.parseFloat(rawRotation);
+	return Number.isFinite(rotation) ? rotation : null;
+}
+
 export async function processVideo(
 	inputPath: string,
 	metadata: VideoMetadata,
@@ -1480,6 +1601,7 @@ export async function processVideo(
 	abortSignal?: AbortSignal,
 	resilientFlags?: ResilientInputFlags,
 ): Promise<TempFileHandle> {
+	abortSignal?.throwIfAborted();
 	const definedOptions = Object.fromEntries(
 		Object.entries(options).filter(([, value]) => value !== undefined),
 	) as VideoProcessingOptions;
@@ -1491,6 +1613,7 @@ export async function processVideo(
 		!remuxOnly && metadata.videoCodec === "h264"
 			? await probeH264Level(inputPath, abortSignal)
 			: null;
+	abortSignal?.throwIfAborted();
 	const targetH264Level = pickMobileSafeH264Level(metadata, opts);
 	const normalizeH264Level =
 		opts.normalizeH264Level &&
@@ -1513,43 +1636,213 @@ export async function processVideo(
 		metadata.duration,
 		opts.timeoutMs,
 	);
+	const capcodec =
+		videoTranscode && !normalizeH264Level ? capcodecOptionsForJob(opts) : null;
+	if (capcodec) {
+		try {
+			await processVideoWithCapcodec(
+				inputPath,
+				metadata,
+				opts,
+				capcodec,
+				outputTempFile.path,
+				audioTranscode,
+				extraInputArgs,
+				extraOutputArgs,
+				processTimeoutMs,
+				onProgress,
+				abortSignal,
+			);
+			abortSignal?.throwIfAborted();
+			return outputTempFile;
+		} catch (err) {
+			await outputTempFile.cleanup();
+			abortSignal?.throwIfAborted();
+			throw err;
+		}
+	}
+	const argsInput: ProcessVideoArgsInput = {
+		inputPath,
+		outputPath: outputTempFile.path,
+		videoCodec: metadata.videoCodec,
+		hasAudio: Boolean(metadata.audioCodec),
+		opts,
+		targetH264Level: targetH264Level.ffmpegValue,
+		normalizeH264Level,
+		videoTranscode,
+		audioTranscode,
+		extraInputArgs,
+		extraOutputArgs,
+		sourceWidth: metadata.width,
+		sourceHeight: metadata.height,
+		// NVENC leaves the CPU free, so decode (and scale) can use every core.
+		decodeThreads: decodeThreadsFromEnv(
+			"MEDIA_SERVER_PROCESS_DECODE_THREADS",
+			selectedVideoEncoder() === "nvenc" ? 0 : 2,
+		),
+	};
+	const totalDurationUs = metadata.duration * 1_000_000;
+	const nvenc =
+		videoTranscode && !normalizeH264Level ? nvencOptionsFromEnv() : null;
+
+	try {
+		if (nvenc) {
+			const gpuDecode = canDecodeOnGpu(
+				metadata.videoCodec,
+				await probeVideoRotation(inputPath, abortSignal),
+				nvenc.gpuDecodeCodecs,
+			);
+			try {
+				await runTranscodeCommand(
+					buildProcessVideoArgs({
+						...argsInput,
+						nvenc: { options: nvenc, gpuDecode },
+					}),
+					outputTempFile.path,
+					totalDurationUs,
+					processTimeoutMs,
+					onProgress,
+					abortSignal,
+				);
+				recordNvencAttempt("process");
+				abortSignal?.throwIfAborted();
+				return outputTempFile;
+			} catch (error) {
+				const reason = nvencFallbackReason(
+					error,
+					abortSignal?.aborted ?? false,
+				);
+				if (reason === null) throw error;
+				recordNvencAttempt("process", reason);
+				logNvencFallback({
+					job: "process",
+					sourceCodec: metadata.videoCodec,
+					gpuDecode,
+					reason,
+				});
+			}
+		}
+
+		await runTranscodeCommand(
+			buildProcessVideoArgs(argsInput),
+			outputTempFile.path,
+			totalDurationUs,
+			processTimeoutMs,
+			onProgress,
+			abortSignal,
+		);
+		abortSignal?.throwIfAborted();
+		return outputTempFile;
+	} catch (err) {
+		await outputTempFile.cleanup();
+		abortSignal?.throwIfAborted();
+		throw err;
+	}
+}
+
+export interface ProcessVideoArgsInput {
+	inputPath: string;
+	outputPath: string;
+	videoCodec: string;
+	hasAudio: boolean;
+	opts: Pick<
+		Required<VideoProcessingOptions>,
+		"maxWidth" | "maxHeight" | "preset" | "crf" | "audioBitrate"
+	>;
+	targetH264Level: string;
+	normalizeH264Level: boolean;
+	videoTranscode: boolean;
+	audioTranscode: boolean;
+	extraInputArgs: string[];
+	extraOutputArgs: string[];
+	decodeThreads: string;
+	sourceWidth?: number;
+	sourceHeight?: number;
+	nvenc?: { options: NvencOptions; gpuDecode: boolean } | null;
+}
+
+export function buildProcessVideoArgs(input: ProcessVideoArgsInput): string[] {
+	const { opts, nvenc } = input;
+	const gpuDecode = Boolean(
+		nvenc?.gpuDecode && input.sourceWidth && input.sourceHeight,
+	);
+	const source = {
+		width: input.sourceWidth ?? 0,
+		height: input.sourceHeight ?? 0,
+	};
+	const cpuScaleFilter = `scale='min(${opts.maxWidth},iw)':'min(${opts.maxHeight},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
 	const ffmpegArgs: string[] = [
 		"ffmpeg",
 		"-threads",
-		"2",
-		...extraInputArgs,
+		input.decodeThreads,
+		...(gpuDecode
+			? buildGpuDecodeInputArgs(
+					input.videoCodec,
+					source,
+					fitWithinEven(
+						source.width,
+						source.height,
+						opts.maxWidth,
+						opts.maxHeight,
+					),
+				)
+			: []),
+		...input.extraInputArgs,
+		// Browser captures change size when the tab resizes. Rebuilding the filter graph for that crashes h264_nvenc
+		// (SIGSEGV on FFmpeg 7.1, even with a fixed output size), so keep the first graph; scale absorbs the new size
+		// exactly as the libx264 fallback's auto-inserted scaler does.
+		...(nvenc && !gpuDecode && input.videoTranscode && !input.normalizeH264Level
+			? ["-reinit_filter", "0"]
+			: []),
 		"-i",
-		inputPath,
+		input.inputPath,
 	];
 
-	if (normalizeH264Level) {
+	if (input.normalizeH264Level) {
 		ffmpegArgs.push(
 			"-c:v",
 			"copy",
 			"-bsf:v",
-			`h264_metadata=level=${targetH264Level.ffmpegValue}`,
+			`h264_metadata=level=${input.targetH264Level}`,
 		);
-	} else if (videoTranscode) {
-		ffmpegArgs.push(
-			"-c:v",
-			"libx264",
-			"-preset",
-			opts.preset,
-			"-crf",
-			opts.crf.toString(),
-			"-vf",
-			`scale='min(${opts.maxWidth},iw)':'min(${opts.maxHeight},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`,
-			"-pix_fmt",
-			"yuv420p",
-			"-level:v",
-			targetH264Level.ffmpegValue,
-		);
+	} else if (input.videoTranscode) {
+		if (nvenc) {
+			ffmpegArgs.push(
+				...buildNvencEncodeArgs(nvenc.options, opts.crf),
+				...(gpuDecode
+					? ["-vf", GPU_DECODE_FORMAT_FILTER]
+					: ["-vf", cpuScaleFilter, "-pix_fmt", "yuv420p"]),
+			);
+		} else {
+			ffmpegArgs.push(
+				"-c:v",
+				"libx264",
+				"-preset",
+				opts.preset,
+				"-crf",
+				opts.crf.toString(),
+				"-vf",
+				cpuScaleFilter,
+				"-pix_fmt",
+				"yuv420p",
+			);
+		}
+		if (nvenc) {
+			// h264_nvenc refuses to open when the nominal frame rate exceeds the level (browser WebM often reports 1000 fps); libx264 only writes it into the SPS, so tag it the same way.
+			ffmpegArgs.push("-bsf:v", `h264_metadata=level=${input.targetH264Level}`);
+		} else {
+			ffmpegArgs.push("-level:v", input.targetH264Level);
+		}
+		if (input.videoCodec === "vp8" || input.videoCodec === "vp9") {
+			// Reordered B-frames can make MP4 duration exclude the tail of sparse browser captures.
+			ffmpegArgs.push("-bf", "0");
+		}
 	} else {
 		ffmpegArgs.push("-c:v", "copy");
 	}
 
-	if (metadata.audioCodec) {
-		if (audioTranscode) {
+	if (input.hasAudio) {
+		if (input.audioTranscode) {
 			ffmpegArgs.push("-c:a", "aac", "-b:a", opts.audioBitrate);
 		} else {
 			ffmpegArgs.push("-c:a", "copy");
@@ -1561,13 +1854,24 @@ export async function processVideo(
 	ffmpegArgs.push(
 		"-movflags",
 		"+faststart",
-		...extraOutputArgs,
+		...input.extraOutputArgs,
 		"-progress",
 		"pipe:2",
 		"-y",
-		outputTempFile.path,
+		input.outputPath,
 	);
+	return ffmpegArgs;
+}
 
+async function runTranscodeCommand(
+	ffmpegArgs: string[],
+	outputPath: string,
+	totalDurationUs: number,
+	processTimeoutMs: number,
+	onProgress?: ProgressCallback,
+	abortSignal?: AbortSignal,
+): Promise<void> {
+	if (abortSignal?.aborted) throw new Error("Video processing was cancelled");
 	const proc = registerSubprocess(
 		spawn({
 			cmd: ffmpegArgs,
@@ -1575,7 +1879,6 @@ export async function processVideo(
 			stderr: "pipe",
 		}),
 	);
-	const totalDurationUs = metadata.duration * 1_000_000;
 	let abortCleanup: (() => void) | undefined;
 	if (abortSignal) {
 		abortCleanup = () => {
@@ -1586,6 +1889,7 @@ export async function processVideo(
 
 	const stderrLines: string[] = [];
 	const maxStderrLines = 50;
+	const errorLines: string[] = [];
 
 	try {
 		await withTimeout(
@@ -1612,6 +1916,7 @@ export async function processVideo(
 							if (stderrLines.length > maxStderrLines) {
 								stderrLines.shift();
 							}
+							collectFfmpegErrorLine(errorLines, line);
 							const progress = parseProgressFromStderr(line, totalDurationUs);
 							if (progress !== null && onProgress) {
 								onProgress(progress, `Encoding: ${Math.round(progress)}%`);
@@ -1624,12 +1929,13 @@ export async function processVideo(
 
 				const exitCode = await proc.exited;
 				if (exitCode !== 0) {
-					throw new Error(
+					throw new FfmpegExitError(
 						`FFmpeg exited with code ${exitCode}. Last stderr: ${stderrLines.slice(-10).join(" | ")}`,
+						errorLines,
 					);
 				}
 
-				const outputSize = await file(outputTempFile.path).size;
+				const outputSize = await file(outputPath).size;
 				if (outputSize === 0) {
 					throw new Error("FFmpeg produced empty output file");
 				}
@@ -1637,16 +1943,96 @@ export async function processVideo(
 			processTimeoutMs,
 			() => terminateProcess(proc),
 		);
-
-		return outputTempFile;
-	} catch (err) {
-		await outputTempFile.cleanup();
-		throw err;
 	} finally {
 		if (abortCleanup) {
 			abortSignal?.removeEventListener("abort", abortCleanup);
 		}
 		await terminateProcess(proc);
+	}
+}
+
+async function processVideoWithCapcodec(
+	inputPath: string,
+	metadata: VideoMetadata,
+	opts: Required<VideoProcessingOptions>,
+	capcodec: CapcodecOptions,
+	outputPath: string,
+	audioTranscode: boolean,
+	extraInputArgs: string[],
+	extraOutputArgs: string[],
+	processTimeoutMs: number,
+	onProgress?: ProgressCallback,
+	abortSignal?: AbortSignal,
+): Promise<void> {
+	const videoOnly = await createTempFile(".fmp4");
+	const controller = new AbortController();
+	const forwardAbort = () => controller.abort();
+	abortSignal?.addEventListener("abort", forwardAbort, { once: true });
+	const startedAt = performance.now();
+	const encodePromise = encodeVideoWithCapcodec({
+		inputPath,
+		outputPath: videoOnly.path,
+		width: metadata.width,
+		height: metadata.height,
+		fps: metadata.fps,
+		maxWidth: opts.maxWidth,
+		maxHeight: opts.maxHeight,
+		extraInputArgs,
+		options: capcodec,
+		totalDurationUs: metadata.duration * 1_000_000,
+		onProgress,
+		abortSignal: controller.signal,
+	});
+	try {
+		await withTimeout(encodePromise, processTimeoutMs, async () => {
+			controller.abort();
+			await encodePromise.catch(() => undefined);
+		});
+		const muxArgs = [
+			"ffmpeg",
+			"-hide_banner",
+			"-nostdin",
+			"-i",
+			videoOnly.path,
+		];
+		if (metadata.audioCodec) {
+			muxArgs.push(
+				...extraInputArgs,
+				"-i",
+				inputPath,
+				"-map",
+				"0:v:0",
+				"-map",
+				"1:a:0",
+				"-c:v",
+				"copy",
+			);
+			if (audioTranscode) {
+				muxArgs.push("-c:a", "aac", "-b:a", opts.audioBitrate);
+			} else {
+				muxArgs.push("-c:a", "copy");
+			}
+		} else {
+			muxArgs.push("-map", "0:v:0", "-c:v", "copy", "-an");
+		}
+		muxArgs.push(
+			"-movflags",
+			"+faststart",
+			...extraOutputArgs,
+			"-y",
+			outputPath,
+		);
+		await runFfmpegCommand(
+			muxArgs,
+			remainingTimeoutMs(processTimeoutMs, performance.now() - startedAt),
+			abortSignal,
+		);
+		if ((await file(outputPath).size) === 0) {
+			throw new Error("capcodec mux produced an empty output file");
+		}
+	} finally {
+		abortSignal?.removeEventListener("abort", forwardAbort);
+		await videoOnly.cleanup();
 	}
 }
 
@@ -1663,19 +2049,64 @@ function getThumbnailTimestamp(
 	return Math.min(Math.max(0, timestamp), Math.max(0, duration - 0.1));
 }
 
+class EmptyThumbnailError extends Error {}
+
 export async function generateThumbnail(
 	inputPath: string,
 	duration: number,
 	options: ThumbnailOptions = {},
+	abortSignal?: AbortSignal,
 ): Promise<Uint8Array> {
+	abortSignal?.throwIfAborted();
 	const opts = { ...DEFAULT_THUMBNAIL_OPTIONS, ...options };
 	const timestamp = getThumbnailTimestamp(duration, opts.timestamp);
+	const deadline = performance.now() + THUMBNAIL_TIMEOUT_MS;
+	try {
+		return await generateThumbnailFrame(
+			inputPath,
+			opts,
+			timestamp,
+			THUMBNAIL_TIMEOUT_MS,
+			abortSignal,
+		);
+	} catch (error) {
+		abortSignal?.throwIfAborted();
+		const remainingMs = deadline - performance.now();
+		if (
+			!(error instanceof EmptyThumbnailError) ||
+			!isAbsolute(normalizeLocalPath(inputPath)) ||
+			timestamp <= 0 ||
+			remainingMs <= 0
+		) {
+			throw error;
+		}
+		return await generateThumbnailFrame(
+			inputPath,
+			opts,
+			0,
+			remainingMs,
+			abortSignal,
+			true,
+		);
+	}
+}
+
+async function generateThumbnailFrame(
+	inputPath: string,
+	opts: Required<ThumbnailOptions>,
+	timestamp: number,
+	timeoutMs: number,
+	abortSignal?: AbortSignal,
+	localOnly = false,
+): Promise<Uint8Array> {
+	abortSignal?.throwIfAborted();
 	const qualityValue = Math.max(
 		2,
 		Math.min(31, Math.round(31 - (opts.quality / 100) * 29)),
 	);
 	const ffmpegArgs = [
 		"ffmpeg",
+		...(localOnly ? ["-protocol_whitelist", "file,pipe"] : []),
 		"-ss",
 		timestamp.toString(),
 		"-i",
@@ -1697,37 +2128,55 @@ export async function generateThumbnail(
 			stderr: "pipe",
 		}),
 	);
+	let termination: Promise<void> | undefined;
+	const stop = () => {
+		termination ??= terminateProcess(proc);
+		return termination;
+	};
+	const abort = () => {
+		void stop();
+	};
+	abortSignal?.addEventListener("abort", abort, { once: true });
 
 	try {
+		abortSignal?.throwIfAborted();
 		return await withTimeout(
 			(async () => {
-				const stderrPromise = readStreamWithLimit(
-					proc.stderr as ReadableStream<Uint8Array>,
-					MAX_STDERR_BYTES,
-				);
-
 				const chunks: Uint8Array[] = [];
 				let totalBytes = 0;
-				const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+				const [, , exitCode] = await Promise.all([
+					(async () => {
+						const reader = (
+							proc.stdout as ReadableStream<Uint8Array>
+						).getReader();
+						try {
+							while (true) {
+								const { done, value } = await reader.read();
+								if (done) break;
+								chunks.push(value);
+								totalBytes += value.length;
+							}
+						} finally {
+							reader.releaseLock();
+						}
+					})(),
+					readStreamWithLimit(
+						proc.stderr as ReadableStream<Uint8Array>,
+						MAX_STDERR_BYTES,
+					),
+					proc.exited,
+				]);
+				abortSignal?.throwIfAborted();
 
-				try {
-					while (true) {
-						const { done, value } = await reader.read();
-						if (done) break;
-						chunks.push(value);
-						totalBytes += value.length;
-					}
-				} finally {
-					reader.releaseLock();
+				if (totalBytes === 0) {
+					throw new EmptyThumbnailError(
+						exitCode === 0
+							? "FFmpeg produced empty thumbnail"
+							: `FFmpeg thumbnail exited with code ${exitCode}`,
+					);
 				}
-
-				const [, exitCode] = await Promise.all([stderrPromise, proc.exited]);
-
 				if (exitCode !== 0) {
 					throw new Error(`FFmpeg thumbnail exited with code ${exitCode}`);
-				}
-				if (totalBytes === 0) {
-					throw new Error("FFmpeg produced empty thumbnail");
 				}
 
 				const output = new Uint8Array(totalBytes);
@@ -1739,11 +2188,15 @@ export async function generateThumbnail(
 
 				return output;
 			})(),
-			THUMBNAIL_TIMEOUT_MS,
-			() => terminateProcess(proc),
+			timeoutMs,
+			stop,
 		);
+	} catch (error) {
+		abortSignal?.throwIfAborted();
+		throw error;
 	} finally {
-		await terminateProcess(proc);
+		abortSignal?.removeEventListener("abort", abort);
+		await stop();
 	}
 }
 
@@ -2027,10 +2480,6 @@ async function readUploadReceipt(
 	return { objectIdentity: `"cap-drive-content-v1:${digest}"` };
 }
 
-async function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function uploadSignal(abortSignal?: AbortSignal) {
 	const timeout = AbortSignal.timeout(UPLOAD_TIMEOUT_MS);
 	return abortSignal ? AbortSignal.any([abortSignal, timeout]) : timeout;
@@ -2044,6 +2493,22 @@ async function uploadWithRetry(
 	ifNoneMatch?: "*",
 	abortSignal?: AbortSignal,
 ): Promise<StorageUploadReceipt> {
+	if (isGoogleDriveResumableUrl(presignedUrl) && contentLength > 0) {
+		const response = await uploadDriveResumable(
+			presignedUrl,
+			bodyFactory(),
+			contentType,
+			ifNoneMatch,
+			abortSignal,
+		);
+		const receipt = await readUploadReceipt(
+			response,
+			presignedUrl,
+			contentLength,
+		);
+		abortSignal?.throwIfAborted();
+		return receipt;
+	}
 	let lastError: Error | undefined;
 
 	for (let attempt = 0; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
@@ -2056,10 +2521,6 @@ async function uploadWithRetry(
 				"Content-Length": contentLength.toString(),
 			};
 			if (ifNoneMatch) headers["If-None-Match"] = ifNoneMatch;
-			if (isGoogleDriveResumableUrl(presignedUrl) && contentLength > 0) {
-				headers["Content-Range"] =
-					`bytes 0-${contentLength - 1}/${contentLength}`;
-			}
 
 			response = await fetch(presignedUrl, {
 				method: "PUT",
@@ -2076,7 +2537,9 @@ async function uploadWithRetry(
 			}
 
 			lastError = uploadError;
-			await sleep(UPLOAD_RETRY_BASE_MS * 2 ** attempt);
+			await sleep(UPLOAD_RETRY_BASE_MS * 2 ** attempt, undefined, {
+				signal: abortSignal,
+			});
 			continue;
 		}
 
@@ -2103,7 +2566,9 @@ async function uploadWithRetry(
 		}
 
 		lastError = responseError;
-		await sleep(UPLOAD_RETRY_BASE_MS * 2 ** attempt);
+		await sleep(UPLOAD_RETRY_BASE_MS * 2 ** attempt, undefined, {
+			signal: abortSignal,
+		});
 	}
 
 	throw lastError ?? new Error("Storage upload failed after retries");
@@ -2113,24 +2578,40 @@ export async function uploadToS3(
 	data: Uint8Array | Blob,
 	presignedUrl: string,
 	contentType: string,
+	abortSignal?: AbortSignal,
 ): Promise<void> {
+	abortSignal?.throwIfAborted();
 	const blob =
 		data instanceof Blob
 			? data
-			: new Blob([data.buffer as ArrayBuffer], { type: contentType });
+			: new Blob([new Uint8Array(data)], { type: contentType });
 
-	await uploadWithRetry(presignedUrl, contentType, blob.size, () => blob);
+	await uploadWithRetry(
+		presignedUrl,
+		contentType,
+		blob.size,
+		() => blob,
+		undefined,
+		abortSignal,
+	);
 }
 
 export async function uploadFileToS3(
 	filePath: string,
 	presignedUrl: string,
 	contentType: string,
+	abortSignal?: AbortSignal,
 ): Promise<StorageUploadReceipt> {
+	abortSignal?.throwIfAborted();
 	const fileHandle = file(filePath);
 
-	return uploadWithRetry(presignedUrl, contentType, fileHandle.size, () =>
-		file(filePath),
+	return uploadWithRetry(
+		presignedUrl,
+		contentType,
+		fileHandle.size,
+		() => file(filePath),
+		undefined,
+		abortSignal,
 	);
 }
 
@@ -2168,6 +2649,7 @@ async function getMultipartPartUrl(
 			videoId: target.videoId,
 			generation: target.generation,
 			attemptId: target.attemptId,
+			loomImportAttemptId: target.loomImportAttemptId,
 			key: target.key,
 			uploadId: target.uploadId,
 			partNumber,
@@ -2221,7 +2703,9 @@ async function uploadMultipartPart(
 			}
 
 			lastError = uploadError;
-			await sleep(UPLOAD_RETRY_BASE_MS * 2 ** attempt);
+			await sleep(UPLOAD_RETRY_BASE_MS * 2 ** attempt, undefined, {
+				signal: abortSignal,
+			});
 			continue;
 		}
 
@@ -2248,7 +2732,9 @@ async function uploadMultipartPart(
 		}
 
 		lastError = responseError;
-		await sleep(UPLOAD_RETRY_BASE_MS * 2 ** attempt);
+		await sleep(UPLOAD_RETRY_BASE_MS * 2 ** attempt, undefined, {
+			signal: abortSignal,
+		});
 	}
 
 	throw lastError ?? new Error(`Multipart upload part ${partNumber} failed`);
@@ -2265,6 +2751,7 @@ async function completeMultipartUpload(
 			videoId: target.videoId,
 			generation: target.generation,
 			attemptId: target.attemptId,
+			loomImportAttemptId: target.loomImportAttemptId,
 			key: target.key,
 			uploadId: target.uploadId,
 			parts,
@@ -2299,6 +2786,7 @@ async function abortMultipartUpload(
 			videoId: target.videoId,
 			generation: target.generation,
 			attemptId: target.attemptId,
+			loomImportAttemptId: target.loomImportAttemptId,
 			key: target.key,
 			uploadId: target.uploadId,
 		},
@@ -2312,34 +2800,47 @@ async function abortMultipartUpload(
 	await response.body?.cancel().catch(() => {});
 }
 
-async function uploadFileMultipart(
+export function multipartUploadConcurrencyFromEnv(
+	env: Record<string, string | undefined> = process.env,
+): number {
+	const value = Number.parseInt(env.MEDIA_SERVER_UPLOAD_CONCURRENCY ?? "", 10);
+	return Number.isFinite(value) && value > 0 ? Math.min(value, 16) : 1;
+}
+
+async function uploadMultipartParts(
 	filePath: string,
 	target: Extract<StorageUploadTarget, { type: "multipart" }>,
 	abortSignal?: AbortSignal,
-): Promise<StorageUploadReceipt> {
+): Promise<UploadedPart[]> {
 	const fileHandle = file(filePath);
 	const contentLength = fileHandle.size;
 	const partSize = Math.floor(target.partSize);
 	const parts: UploadedPart[] = [];
 
-	try {
-		abortSignal?.throwIfAborted();
-		if (contentLength <= 0) {
-			throw new Error("Multipart upload requires a non-empty file");
-		}
+	abortSignal?.throwIfAborted();
+	if (contentLength <= 0) {
+		throw new Error("Multipart upload requires a non-empty file");
+	}
 
-		if (partSize < MULTIPART_MIN_PART_SIZE_BYTES) {
-			throw new Error("Multipart upload part size is too small");
-		}
+	if (partSize < MULTIPART_MIN_PART_SIZE_BYTES) {
+		throw new Error("Multipart upload part size is too small");
+	}
 
-		const partCount = Math.ceil(contentLength / partSize);
-		if (partCount > MULTIPART_MAX_PARTS) {
-			throw new Error(
-				`Multipart upload would require too many parts: ${partCount}/${MULTIPART_MAX_PARTS}`,
-			);
-		}
+	const partCount = Math.ceil(contentLength / partSize);
+	if (partCount > MULTIPART_MAX_PARTS) {
+		throw new Error(
+			`Multipart upload would require too many parts: ${partCount}/${MULTIPART_MAX_PARTS}`,
+		);
+	}
 
-		for (let partNumber = 1; partNumber <= partCount; partNumber++) {
+	const failed = new AbortController();
+	const signal = abortSignal
+		? AbortSignal.any([abortSignal, failed.signal])
+		: failed.signal;
+	let nextPart = 1;
+	const worker = async () => {
+		while (nextPart <= partCount) {
+			const partNumber = nextPart++;
 			const start = (partNumber - 1) * partSize;
 			const end = Math.min(start + partSize, contentLength);
 			const partLength = end - start;
@@ -2347,28 +2848,98 @@ async function uploadFileMultipart(
 				target,
 				partNumber,
 				partLength,
-				abortSignal,
+				signal,
 			);
 			const etag = await uploadMultipartPart(
 				url,
 				fileHandle.slice(start, end),
 				partLength,
 				partNumber,
-				abortSignal,
+				signal,
 			);
 			parts.push({ partNumber, etag, size: partLength });
 		}
-
-		return await completeMultipartUpload(target, parts, abortSignal);
+	};
+	const workers = Array.from(
+		{ length: Math.min(multipartUploadConcurrencyFromEnv(), partCount) },
+		() => worker(),
+	);
+	try {
+		await Promise.all(workers);
 	} catch (error) {
-		await abortMultipartUpload(target).catch((abortError) => {
-			console.warn(
-				"Multipart upload abort failed:",
-				abortError instanceof Error ? abortError.message : abortError,
-			);
-		});
+		failed.abort();
+		await Promise.allSettled(workers);
 		throw error;
 	}
+	return parts.sort((a, b) => a.partNumber - b.partNumber);
+}
+
+async function abortMultipartUploadQuietly(
+	target: Extract<StorageUploadTarget, { type: "multipart" }>,
+) {
+	await abortMultipartUpload(target).catch((abortError) => {
+		console.warn(
+			"Multipart upload abort failed:",
+			abortError instanceof Error ? abortError.message : abortError,
+		);
+	});
+}
+
+async function uploadFileMultipart(
+	filePath: string,
+	target: Extract<StorageUploadTarget, { type: "multipart" }>,
+	abortSignal?: AbortSignal,
+): Promise<StorageUploadReceipt> {
+	try {
+		const parts = await uploadMultipartParts(filePath, target, abortSignal);
+		return await completeMultipartUpload(target, parts, abortSignal);
+	} catch (error) {
+		await abortMultipartUploadQuietly(target);
+		throw error;
+	}
+}
+
+export interface PendingStorageUpload {
+	// Publishes the upload; for multipart targets this is the only step that creates the object.
+	finish(): Promise<StorageUploadReceipt>;
+	// Stops early work and waits for it to settle, leaving the target to the caller's abort.
+	cancel(): Promise<void>;
+}
+
+// Multipart parts are invisible until the upload is completed, so they can be sent while the caller
+// is still checking the file; single PUT targets only upload once finish() is called.
+export function beginStorageUpload(
+	filePath: string,
+	target: StorageUploadTarget,
+	contentType: string,
+	abortSignal?: AbortSignal,
+): PendingStorageUpload {
+	if (target.type !== "multipart")
+		return {
+			finish: () =>
+				uploadFileToStorage(filePath, target, contentType, abortSignal),
+			cancel: async () => {},
+		};
+	const early = new AbortController();
+	const signal = abortSignal
+		? AbortSignal.any([abortSignal, early.signal])
+		: early.signal;
+	const parts = uploadMultipartParts(filePath, target, signal);
+	parts.catch(() => {});
+	return {
+		finish: async () => {
+			try {
+				return await completeMultipartUpload(target, await parts, abortSignal);
+			} catch (error) {
+				await abortMultipartUploadQuietly(target);
+				throw error;
+			}
+		},
+		cancel: async () => {
+			early.abort();
+			await parts.catch(() => {});
+		},
+	};
 }
 
 export async function abortStorageUploadTarget(
@@ -2415,16 +2986,29 @@ export async function muxMediaTracksToMp4(
 	outputPath: string,
 	abortSignal?: AbortSignal,
 ): Promise<void> {
-	if (abortSignal?.aborted) throw new Error("Recording mux was cancelled");
+	abortSignal?.throwIfAborted();
+	abortSignal = AbortSignal.any([
+		...(abortSignal ? [abortSignal] : []),
+		AbortSignal.timeout(PROCESS_TIMEOUT_MS),
+	]);
 	const startedAt = performance.now();
 	const timing = await readRecordingVideoTiming(videoInputPath, {
 		abortSignal,
 		timeoutMs: PROCESS_TIMEOUT_MS,
 	});
-	if (abortSignal?.aborted) throw new Error("Recording mux was cancelled");
+	abortSignal?.throwIfAborted();
 	const lastTimestamp = timing.lastTimestampTicks - timing.firstTimestampTicks;
 	// FFmpeg 7 can discard a fragmented MP4's stored final sample duration.
 	const videoTimingFilter = `setts=pts=PTS:dts=DTS:duration=if(eq(PTS-STARTPTS\\,${lastTimestamp})\\,${timing.lastDurationTicks}\\,DURATION)`;
+	const audioTiming = audioInputPath
+		? await readRecordingAudioTail(audioInputPath, abortSignal, true)
+		: undefined;
+	if (audioTiming && audioTiming.packetCount === undefined)
+		throw new Error("Recording audio packet count is missing");
+	// FFmpeg synthesizes nominal AAC durations, so bind the final duration to the stored source sample.
+	const audioTimingFilter = audioTiming?.packetCount
+		? `setts=duration=if(eq(N\\,${audioTiming.packetCount - 1})\\,${audioTiming.durationTicks}\\,DURATION)`
+		: undefined;
 	const args = audioInputPath
 		? [
 				"ffmpeg",
@@ -2443,6 +3027,7 @@ export async function muxMediaTracksToMp4(
 				"copy",
 				"-bsf:v",
 				videoTimingFilter,
+				...(audioTimingFilter ? ["-bsf:a", audioTimingFilter] : []),
 				"-avoid_negative_ts",
 				"disabled",
 				"-movie_timescale",

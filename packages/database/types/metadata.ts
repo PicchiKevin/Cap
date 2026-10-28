@@ -6,6 +6,58 @@
  * Video metadata structure
  */
 export interface VideoMetadata {
+	loomImportRun?: {
+		runId: string;
+		dispatch: "pending" | "accepted" | "rejected" | "uncertain";
+		importPriority?: "customer" | "bulk";
+		mediaDispatch?: {
+			attemptId: string;
+			videoId?: string;
+			state: "accepted" | "rejected" | "uncertain";
+			jobId?: string;
+			worker?: "importer" | "media" | null;
+		};
+	};
+	loomImportUpload?: {
+		attemptId: string;
+		ownerId: string;
+		organizationId: string | null;
+		source?: { key: string; uploadId: string };
+		output: { key: string; uploadId: string };
+	};
+	loomDeferredProcessing?: {
+		rawFileKey: string;
+		status: "pending" | "started" | "complete";
+		startedAt?: string;
+	};
+	transcribeOnView?: boolean;
+	loomPreviewGif?: {
+		status: "pending" | "started" | "complete";
+		startedAt?: string;
+	};
+	editProcessing?: {
+		token: string;
+		startedAt: string;
+		ownerId: string;
+		bucket: string | null;
+		storageIntegrationId: string | null;
+		sourceKey: string;
+		source: string;
+		dispatch: "pending" | "dispatching" | "accepted";
+		jobId?: string;
+		resultCommitted?: boolean;
+		renderedMetadata?: {
+			duration: number;
+			width: number;
+			height: number;
+			fps: number;
+		};
+	};
+	completedVideoEdit?: {
+		token: string;
+		startedAt: string;
+		transcriptRemapped: boolean;
+	};
 	desktopRecordingUpload?: {
 		version: 1;
 		artifact:
@@ -53,10 +105,12 @@ export interface VideoMetadata {
 	 * AI generated summary of the content
 	 */
 	summary?: string;
+	summaryManuallyEdited?: boolean;
 	/**
 	 * Chapter markers generated from the transcript
 	 */
 	chapters?: { title: string; start: number }[];
+	chaptersManuallyEdited?: boolean;
 	aiGenerationStatus?:
 		| "QUEUED"
 		| "PROCESSING"
@@ -78,6 +132,14 @@ export interface VideoMetadata {
 		state: "pending" | "accepted" | "rejected";
 		rawFileKey?: string;
 	};
+}
+
+export interface VideoCallToAction {
+	label: string;
+	url: string;
+	headline?: string;
+	color?: string;
+	showWhilePlaying?: boolean;
 }
 
 export type VideoEditRange = {

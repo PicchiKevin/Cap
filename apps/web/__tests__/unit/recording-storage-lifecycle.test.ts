@@ -134,13 +134,14 @@ type DatabaseMutation = {
 	values?: Record<string, unknown>;
 };
 
-function databaseFixture(video = recording()) {
+function databaseFixture(video = recording(), password?: string | null) {
 	const encoded = Schema.encodeSync(Video.Video)(video);
 	const original = {
 		...encoded,
 		bucket: encoded.bucketId,
 		createdAt: video.createdAt,
 		updatedAt: video.updatedAt,
+		password: password ?? null,
 	};
 	const rows = new Map<string, Record<string, unknown>>([[videoId, original]]);
 	const jobs = new Map<string, Record<string, unknown>>([
@@ -155,6 +156,16 @@ function databaseFixture(video = recording()) {
 		],
 	]);
 	const uploads = new Map<string, typeof Db.videoUploads.$inferSelect>();
+	const shares = new Map<unknown, Map<string, { videoId: string }>>(
+		[Db.sharedVideos, Db.spaceVideos].map((table) => [
+			table,
+			new Map([
+				["root-share", { videoId }],
+				["folder-share", { videoId }],
+				["other-share", { videoId: "other-video" }],
+			]),
+		]),
+	);
 	const mutations: DatabaseMutation[] = [];
 	const events: string[] = [];
 	const objectDeleteConditions: SQL[] = [];
@@ -247,6 +258,12 @@ function databaseFixture(video = recording()) {
 						: mutation.table === Db.videoProcessingJobs
 							? jobs
 							: null;
+				const shareRows = shares.get(mutation.table);
+				if (shareRows && mutation.operation === "delete") {
+					for (const [id, row] of shareRows) {
+						if (row.videoId === mutation.id) shareRows.delete(id);
+					}
+				}
 				if (!table) continue;
 				if (mutation.operation === "delete" && mutation.id)
 					table.delete(mutation.id);
@@ -303,6 +320,7 @@ function databaseFixture(video = recording()) {
 		rows,
 		jobs,
 		uploads,
+		shares,
 		mutations,
 		events,
 		objectDeleteConditions,
@@ -797,6 +815,29 @@ afterEach(() => {
 });
 
 describe("recording storage lifecycle", () => {
+	it.each(["desktopMP4", "webMP4"] as const)(
+		"uses the published %s thumbnail without discovering older objects",
+		async (type) => {
+			const editThumbnail = `${prefix}.recording/outputs/edit-11111111-1111-4111-8111-111111111111/thumbnail.jpg`;
+			databaseFixture(recording({ type, thumbnailKey: editThumbnail }));
+			const storage = await storageFixture([
+				[editThumbnail, "current-thumbnail"],
+				[`${prefix}screenshot/screen-capture.jpg`, "old-thumbnail"],
+			]);
+			const thumbnail = await Effect.runPromise(
+				Effect.flatMap(Videos, (videos) =>
+					videos.getThumbnailURL(videoId),
+				).pipe(
+					Effect.provide(Videos.Default),
+					Effect.provideService(CurrentUser, currentUser),
+				),
+			);
+			expect(Option.getOrNull(thumbnail)).toContain(editThumbnail);
+			expect(
+				storage.requests.filter(({ operation }) => operation === "list"),
+			).toEqual([]);
+		},
+	);
 	it.each([
 		"committing",
 		"queued",
@@ -879,6 +920,12 @@ describe("recording storage lifecycle", () => {
 		expect(database.rows.get("duplicate-video")?.metadata).not.toHaveProperty(
 			"desktopRecordingUpload",
 		);
+		expect(database.rows.get("duplicate-video")).not.toHaveProperty(
+			"createdAt",
+		);
+		expect(database.rows.get("duplicate-video")).not.toHaveProperty(
+			"updatedAt",
+		);
 		expect(database.rows.get("owned-video")?.metadata).toHaveProperty(
 			"desktopRecordingUpload",
 		);
@@ -897,6 +944,53 @@ describe("recording storage lifecycle", () => {
 				key: `${newPrefix}preview/animated-preview.gif`,
 			},
 		]);
+	});
+	it("duplicates enhanced browser playback without retaining foreign audio pointers", async () => {
+		const audioKey = `${prefix}.recording/outputs/audio-quality-v3/selected.mp4`;
+		const database = databaseFixture(
+			recording({
+				type: "webMP4",
+				audioLevelSourceKey: `${prefix}result.mp4`,
+				audioLevelOutputKey: audioKey,
+			}),
+		);
+		const storage = await storageFixture([
+			[audioKey, "enhanced"],
+			[`${prefix}result.mp4`, "original"],
+		]);
+		const result = await runVideoOperation("duplicate");
+		expect(Exit.isSuccess(result)).toBe(true);
+		expect(storage.objects.get(`${newPrefix}result.mp4`)).toBe("enhanced");
+		expect(database.rows.get("duplicate-video")?.source).toEqual({
+			type: "webMP4",
+		});
+		expect(storage.objects.get(`${prefix}result.mp4`)).toBe("original");
+	});
+
+	it("preserves password and strips customCreatedAt without copying original createdAt or updatedAt", async () => {
+		const videoWithCustomDate = Video.Video.make({
+			...recording(),
+			metadata: Option.some({
+				sourceName: "Dated recording",
+				customCreatedAt: "2020-01-01T00:00:00.000Z",
+			}),
+		});
+		const database = databaseFixture(videoWithCustomDate, "secret-pass-123");
+		await storageFixture([
+			[outputKey, "verified-video"],
+			[thumbnailKey, "verified-thumbnail"],
+			[previewKey, "verified-preview"],
+		]);
+		const result = await runVideoOperation("duplicate");
+		expect(Exit.isSuccess(result)).toBe(true);
+		const duplicated = database.rows.get("duplicate-video");
+		expect(duplicated).toBeDefined();
+		expect(duplicated).not.toHaveProperty("createdAt");
+		expect(duplicated).not.toHaveProperty("updatedAt");
+		expect(duplicated?.metadata).not.toHaveProperty("customCreatedAt");
+		expect(duplicated).toMatchObject({
+			password: "secret-pass-123",
+		});
 	});
 
 	it("does not duplicate source inventories, raw fragments, or comment attachments across pages", async () => {
@@ -1005,6 +1099,19 @@ describe("recording storage lifecycle", () => {
 		},
 	);
 
+	it("removes organization and space shares only for the deleted recording", async () => {
+		const database = databaseFixture();
+		await storageFixture([[outputKey, "verified-video"]]);
+
+		expect(Exit.isSuccess(await runVideoOperation("delete"))).toBe(true);
+		expect(database.rows.has(videoId)).toBe(false);
+		for (const table of [Db.sharedVideos, Db.spaceVideos]) {
+			expect(database.shares.get(table)).toEqual(
+				new Map([["other-share", { videoId: "other-video" }]]),
+			);
+		}
+	});
+
 	it("waits for job deletion before deleting any dependent database row", async () => {
 		const database = databaseFixture();
 		let release: (() => void) | undefined;
@@ -1060,6 +1167,13 @@ describe("recording storage lifecycle", () => {
 			state: "source-blocked",
 			errorCode: "video-deleting",
 		});
+		for (const shares of database.shares.values()) {
+			expect([...shares.values()].map((share) => share.videoId)).toEqual([
+				videoId,
+				videoId,
+				"other-video",
+			]);
+		}
 		storage.deniedDeletes.clear();
 		expect(Exit.isSuccess(await runVideoOperation("delete"))).toBe(true);
 		expect(database.rows.has(videoId)).toBe(false);

@@ -1,3 +1,5 @@
+import { timingSafeEqual } from "node:crypto";
+import { serverEnv } from "@cap/env";
 import {
 	provideOptionalAuth,
 	Storage,
@@ -24,6 +26,47 @@ const copyHeader = (
 ) => {
 	const value = source.get(sourceName);
 	if (value) target.set(targetName, value);
+};
+
+const INLINE_CONTENT_TYPES = new Set([
+	"video/mp4",
+	"video/webm",
+	"video/quicktime",
+	"video/x-matroska",
+	"video/x-msvideo",
+	"video/x-m4v",
+	"video/mp2t",
+	"video/mpeg",
+	"video/ogg",
+	"video/3gpp",
+	"audio/mp4",
+	"audio/mpeg",
+	"audio/aac",
+	"audio/webm",
+	"audio/ogg",
+	"image/jpeg",
+	"image/png",
+	"image/gif",
+	"image/webp",
+	"text/vtt",
+	"application/vnd.apple.mpegurl",
+	"application/x-mpegurl",
+	"application/json",
+]);
+
+const setObjectContentHeaders = (
+	headers: Headers,
+	contentType: string | null | undefined,
+) => {
+	headers.set("X-Content-Type-Options", "nosniff");
+	headers.set("Content-Security-Policy", "sandbox; default-src 'none'");
+	const essence = contentType?.split(";")[0]?.trim().toLowerCase();
+	if (contentType && essence && INLINE_CONTENT_TYPES.has(essence)) {
+		headers.set("Content-Type", contentType);
+		return;
+	}
+	headers.set("Content-Type", "application/octet-stream");
+	headers.set("Content-Disposition", "attachment");
 };
 
 const asRecord = (value: unknown): Record<string, unknown> | null =>
@@ -122,6 +165,21 @@ const getPolicyVideo = (videoId: Video.VideoId) =>
 	});
 
 export async function GET(request: NextRequest) {
+	const internalDownload =
+		request.headers.get("x-cap-internal-download") === "1";
+	if (internalDownload) {
+		const expected = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET;
+		const provided = request.headers.get("x-media-server-secret");
+		if (
+			!expected ||
+			!provided ||
+			Buffer.byteLength(expected) !== Buffer.byteLength(provided) ||
+			!timingSafeEqual(Buffer.from(expected), Buffer.from(provided))
+		) {
+			return new Response("Unauthorized", { status: 401 });
+		}
+	}
+
 	const videoIdParam = request.nextUrl.searchParams.get("videoId");
 	const key = request.nextUrl.searchParams.get("key");
 	const token = request.nextUrl.searchParams.get("token");
@@ -148,12 +206,14 @@ export async function GET(request: NextRequest) {
 			isInternalRecordingKey(key) &&
 			!(tokenPayload?.videoId === videoIdParam && tokenPayload.key === key) &&
 			!(
-				video.source.type === "desktopMP4" &&
-				[
-					key === video.source.outputKey,
-					key === video.source.thumbnailKey,
-					key === video.source.previewKey,
-				].some(Boolean)
+				key === Video.getAudioLevelOutputKey(video) ||
+				((video.source.type === "desktopMP4" ||
+					video.source.type === "webMP4") &&
+					[
+						key === video.source.outputKey,
+						key === video.source.thumbnailKey,
+						key === video.source.previewKey,
+					].some(Boolean))
 			)
 		) {
 			return yield* Effect.fail("not-found" as const);
@@ -165,15 +225,36 @@ export async function GET(request: NextRequest) {
 			return Response.redirect(url);
 		}
 
+		if (internalDownload) {
+			if (!("getInternalDownload" in storage))
+				return new Response("Unsupported storage", { status: 400 });
+			const target = yield* storage.getInternalDownload(key, {
+				objectIdentity:
+					request.headers.get("x-cap-recording-object-identity") ??
+					request.headers.get("if-match") ??
+					undefined,
+				signal: request.signal,
+			});
+			return Response.json(target, {
+				headers: {
+					"Cache-Control": "private, no-store",
+					"Vercel-CDN-Cache-Control": "no-store",
+					Vary: "x-cap-internal-download, x-media-server-secret",
+				},
+			});
+		}
+
 		const verificationRequested =
 			request.headers.get("x-cap-recording-verification") === "1";
 		const expectedIdentity = request.headers.get("if-match");
-		const head = verificationRequested
-			? yield* storage.headObject(key)
-			: undefined;
-		const identity = head
-			? getRecordingObjectIdentity(head, expectedIdentity ?? undefined)
-			: undefined;
+		const head =
+			verificationRequested || request.method === "HEAD"
+				? yield* storage.headObject(key)
+				: undefined;
+		const identity =
+			verificationRequested && head
+				? getRecordingObjectIdentity(head, expectedIdentity ?? undefined)
+				: undefined;
 		if (verificationRequested && !identity) {
 			return new Response("Object identity is unavailable", { status: 503 });
 		}
@@ -184,18 +265,13 @@ export async function GET(request: NextRequest) {
 		) {
 			return new Response("Object changed", { status: 412 });
 		}
-		if (
-			verificationRequested &&
-			request.method === "HEAD" &&
-			head &&
-			identity
-		) {
+		if (request.method === "HEAD" && head) {
 			const headers = new Headers(CACHE_CONTROL_HEADERS);
-			headers.set("ETag", identity);
+			if (identity) headers.set("ETag", identity);
 			headers.set("Accept-Ranges", "bytes");
 			if (head.ContentLength !== undefined)
 				headers.set("Content-Length", String(head.ContentLength));
-			if (head.ContentType) headers.set("Content-Type", head.ContentType);
+			setObjectContentHeaders(headers, head.ContentType);
 			return new Response(null, { status: 200, headers });
 		}
 		const upstream = identity
@@ -203,10 +279,12 @@ export async function GET(request: NextRequest) {
 					objectIdentity: identity,
 					signal: request.signal,
 				})
-			: yield* storage.getObjectResponse(key, request.headers.get("range"));
+			: yield* storage.getObjectResponse(key, request.headers.get("range"), {
+					signal: request.signal,
+				});
 		const headers = new Headers(CACHE_CONTROL_HEADERS);
 		if (identity) headers.set("ETag", identity);
-		copyHeader(upstream.headers, headers, "content-type", "Content-Type");
+		setObjectContentHeaders(headers, upstream.headers.get("content-type"));
 		copyHeader(upstream.headers, headers, "content-length", "Content-Length");
 		copyHeader(upstream.headers, headers, "content-range", "Content-Range");
 		copyHeader(upstream.headers, headers, "accept-ranges", "Accept-Ranges");

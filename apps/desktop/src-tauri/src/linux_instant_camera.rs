@@ -342,7 +342,9 @@ fn processing(
     LinuxCameraProcessing {
         mirrored: state.mirrored,
         blur: match state.background_blur {
-            cap_project::BackgroundBlurMode::Off => LinuxCameraBlur::Off,
+            cap_project::BackgroundBlurMode::Off | cap_project::BackgroundBlurMode::Remove => {
+                LinuxCameraBlur::Off
+            }
             cap_project::BackgroundBlurMode::Light => LinuxCameraBlur::Light,
             cap_project::BackgroundBlurMode::Heavy => LinuxCameraBlur::Heavy,
         },
@@ -460,7 +462,7 @@ mod producer {
         FFmpegVideoFrame,
         feeds::camera::{self, CameraFeed, CameraFeedLock},
         instant_recording::{
-            LINUX_CAMERA_MAX_MASK_AGE, LinuxCameraBlur, LinuxCameraMaskReceipt,
+            LINUX_CAMERA_MAX_MASK_AGE, LinuxCameraBlur, LinuxCameraMaskReceipt, LinuxCameraPixels,
             LinuxCameraProcessing, LinuxCameraPublisher, LinuxProcessedCameraFrame,
             LinuxProcessedCameraSource,
         },
@@ -763,7 +765,7 @@ mod producer {
             }
         }
         Ok(Some(LinuxProcessedCameraFrame {
-            bgra: Arc::from(bgra),
+            bgra: LinuxCameraPixels::new(bgra),
             dimensions: receipt.dimensions,
             stride: row,
             timestamp: receipt.timestamp,

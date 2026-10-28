@@ -1,9 +1,11 @@
 import { serverEnv } from "@cap/env";
 import type { AiGenerationLanguage } from "@cap/web-domain";
-import { AssemblyAI } from "assemblyai";
 import { FatalError } from "workflow";
 import { z } from "zod";
-import { getAssemblyAITranscriptionOptions } from "@/lib/assemblyai";
+import {
+	createAssemblyAIClient,
+	getAssemblyAITranscriptionOptions,
+} from "@/lib/assemblyai";
 import type { AssemblyAIEditResult } from "@/lib/edit-transcript";
 import { getTranscriptionProvider } from "@/lib/transcription-config";
 
@@ -123,7 +125,7 @@ export async function transcribeAudio(
 	if (provider !== "assemblyai" || !env.ASSEMBLY_API_KEY) {
 		throw new FatalError("Missing ASSEMBLY_API_KEY or DEEPGRAM_API_KEY");
 	}
-	const client = new AssemblyAI({ apiKey: env.ASSEMBLY_API_KEY });
+	const client = createAssemblyAIClient();
 	const transcript = await client.transcripts.transcribe({
 		audio,
 		...getAssemblyAITranscriptionOptions(language),

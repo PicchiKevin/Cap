@@ -1,4 +1,5 @@
 import { db } from "@cap/database";
+import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
 import {
 	organizationMembers,
@@ -45,11 +46,13 @@ async function isOrgAdmin(
 }
 
 export async function POST(
-	_request: Request,
+	request: Request,
 	props: RouteContext<"/api/videos/[videoId]/retry-transcription">,
 ) {
 	try {
-		const user = await getCurrentUser();
+		const user = isCrossSiteCookieWrite(request)
+			? null
+			: await getCurrentUser();
 		if (!user) {
 			return Response.json({ error: "Unauthorized" }, { status: 401 });
 		}

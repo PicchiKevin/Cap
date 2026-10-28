@@ -16,11 +16,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { retryVideoProcessing } from "@/actions/video/retry-processing";
+import type { ShareCallToAction } from "@/lib/share-call-to-action";
+import { CallToActionOverlay } from "./call-to-action/CallToActionOverlay";
 import { bindCaptionTrackCueText } from "./caption-tracks";
 import { scheduleReadyRefresh } from "./deferred-ready-refresh";
+import { EarlyUploadOverlay } from "./EarlyUploadOverlay";
+import { useEarlyPlayback } from "./early-playback";
+import { waitForSegmentPlayback } from "./segment-playback-probe";
 import {
 	canRetryFailedProcessing,
 	getUploadFailureMessage,
+	hasUnplayableRecordingSource,
 	shouldDeferPlaybackSource,
 	shouldReloadPlaybackAfterUploadCompletes,
 	type UploadProgress,
@@ -55,10 +61,6 @@ const UploadProgressTracker = dynamic(() => import("./UploadProgressTracker"), {
 
 const { circumference } = getProgressCircleConfig();
 
-const PROBE_MAX_RETRIES = 60;
-const PROBE_INITIAL_DELAY_MS = 1000;
-const PROBE_MAX_DELAY_MS = 8000;
-
 // Stable default: `= []` in the destructuring would mint a new array identity
 // every render and re-run everything that depends on the prop.
 const NO_CAPTIONS: CaptionOption[] = [];
@@ -82,7 +84,7 @@ function getLiveProbeSrc(playbackSrc: string) {
 	const url = new URL(playbackSrc, window.location.origin);
 	if (url.searchParams.get("videoType") !== "segments-master") return null;
 
-	url.searchParams.set("videoType", "segments-video");
+	url.searchParams.set("videoType", "segments-status");
 	return `${url.pathname}${url.search}`;
 }
 
@@ -101,10 +103,13 @@ interface Props {
 	videoRef: React.RefObject<HTMLVideoElement | null>;
 	mediaPlayerClassName?: string;
 	disableCaptions?: boolean;
+	captionsInitiallyOff?: boolean;
 	autoplay?: boolean;
 	hasActiveUpload?: boolean;
 	isLiveSegments?: boolean;
 	allowSegmentProbeDuringUpload?: boolean;
+	earlyPlayback?: boolean;
+	onSourceComplete?: () => void;
 	enhancedAudioUrl?: string | null;
 	enhancedAudioStatus?: EnhancedAudioStatus | null;
 	captionLanguage?: string;
@@ -124,6 +129,7 @@ interface Props {
 	 * timeline strip replaces the seek slider, everything else comes along.
 	 */
 	controlsPortalEl?: HTMLElement | null;
+	callToAction?: ShareCallToAction | null;
 }
 
 export function HLSVideoPlayer({
@@ -137,7 +143,10 @@ export function HLSVideoPlayer({
 	hasActiveUpload,
 	isLiveSegments = false,
 	allowSegmentProbeDuringUpload = false,
+	earlyPlayback = false,
+	onSourceComplete,
 	disableCaptions,
+	captionsInitiallyOff = false,
 	enhancedAudioUrl: _enhancedAudioUrl,
 	enhancedAudioStatus: _enhancedAudioStatus,
 	captionLanguage,
@@ -151,17 +160,24 @@ export function HLSVideoPlayer({
 	previewMode,
 	externalTimeline = false,
 	controlsPortalEl = null,
+	callToAction = null,
 }: Props) {
 	const hlsInstance = useRef<Hls | null>(null);
 	const [currentCue, setCurrentCue] = useState<string>("");
 	const [controlsVisible, setControlsVisible] = useState(false);
-	const [toggleCaptions, setToggleCaptions] = useState(true);
+	const [toggleCaptions, setToggleCaptions] = useState(!captionsInitiallyOff);
 	const [showPlayButton, setShowPlayButton] = useState(false);
 	const [videoLoaded, setVideoLoaded] = useState(false);
 	const [hlsInitFailed, setHlsInitFailed] = useState(false);
+	const [sourceFailure, setSourceFailure] = useState<
+		"incomplete" | "unavailable" | null
+	>(null);
 	const [hasPlayedOnce, setHasPlayedOnce] = useState(false);
+	const [earlyPlaylistEnded, setEarlyPlaylistEnded] = useState(false);
 	const hasPlayedOnceRef = useRef(false);
 	const videoLoadedRef = useRef(false);
+	const playbackStartedAtRef = useRef<number | null>(null);
+	const reportedReadyRef = useRef(false);
 	const [isRetryingProcessing, setIsRetryingProcessing] = useState(false);
 	const [sourceVersion, setSourceVersion] = useState(0);
 	const [isPlaybackSourceReady, setIsPlaybackSourceReady] = useState(
@@ -173,14 +189,29 @@ export function HLSVideoPlayer({
 	const segmentRetryCountRef = useRef(0);
 	const hasTriedRouterRefreshRef = useRef(false);
 	const isBackgroundPreview = previewMode === "background";
+	// Native HLS players end a growing playlist when playback catches up with
+	// its last segment, and on ManagedMediaSource alone (iPhone) the final
+	// segment was seen to go missing when it ended, so early playback needs
+	// hls.js on MediaSource. Everything else waits for the complete recording.
+	const isEarlyPlayback =
+		earlyPlayback &&
+		typeof window !== "undefined" &&
+		typeof window.MediaSource !== "undefined" &&
+		Hls.isSupported();
+	const sourceSrc =
+		earlyPlayback && !isEarlyPlayback
+			? videoSrc.replace("earlyPlayback=1", "requireComplete=1")
+			: videoSrc;
 	const playbackSrc =
 		sourceVersion === 0
-			? videoSrc
-			: videoSrc.includes("?")
-				? `${videoSrc}&_t=${sourceVersion}`
-				: `${videoSrc}?_t=${sourceVersion}`;
+			? sourceSrc
+			: sourceSrc.includes("?")
+				? `${sourceSrc}&_t=${sourceVersion}`
+				: `${sourceSrc}?_t=${sourceVersion}`;
 	const reloadPlayback = useCallback(() => {
 		setVideoLoaded(false);
+		setHlsInitFailed(false);
+		setSourceFailure(null);
 		setSourceVersion((current) => current + 1);
 	}, []);
 
@@ -210,6 +241,14 @@ export function HLSVideoPlayer({
 		!allowSegmentProbeDuringUpload &&
 		shouldDeferPlaybackSource(uploadProgressRaw);
 	const liveProbeSrc = isLiveSegments ? getLiveProbeSrc(playbackSrc) : null;
+	const early = useEarlyPlayback({
+		enabled: isEarlyPlayback && isPlaybackSourceReady,
+		statusUrl: isEarlyPlayback ? liveProbeSrc : null,
+		playerComplete: earlyPlaylistEnded,
+		videoRef,
+	});
+	const earlyLength =
+		isEarlyPlayback && !earlyPlaylistEnded ? early.recorded : null;
 
 	useEffect(() => {
 		if (!isLiveSegments) {
@@ -222,69 +261,59 @@ export function HLSVideoPlayer({
 			return;
 		}
 
-		let cancelled = false;
-		let retryTimer: ReturnType<typeof setTimeout> | null = null;
-		let attempt = 0;
-
+		const controller = new AbortController();
 		setIsPlaybackSourceReady(false);
+		setSourceFailure(null);
+		void waitForSegmentPlayback({
+			url: liveProbeSrc,
+			signal: controller.signal,
+			onComplete: () => {
+				if (!controller.signal.aborted) onSourceComplete?.();
+			},
+		}).then((result) => {
+			if (controller.signal.aborted) return;
+			if (result === "ready") setIsPlaybackSourceReady(true);
+			else setSourceFailure(result);
+		});
 
-		const probe = async () => {
-			try {
-				const response = await fetch(liveProbeSrc, {
-					cache: "no-store",
-					credentials: "same-origin",
-				});
-				if (!response.ok) {
-					throw new Error(`Playback source not ready: ${response.status}`);
-				}
-				if (!cancelled) {
-					setIsPlaybackSourceReady(true);
-				}
-			} catch {
-				if (cancelled) return;
-				attempt++;
-				if (attempt >= PROBE_MAX_RETRIES) {
-					setHlsInitFailed(true);
-					return;
-				}
-				const delay = Math.min(
-					PROBE_INITIAL_DELAY_MS * 2 ** Math.min(attempt - 1, 4),
-					PROBE_MAX_DELAY_MS,
-				);
-				retryTimer = setTimeout(() => {
-					void probe();
-				}, delay);
-			}
-		};
-
-		void probe();
-
-		return () => {
-			cancelled = true;
-			if (retryTimer) clearTimeout(retryTimer);
-		};
-	}, [isLiveSegments, liveProbeSrc, shouldDelayPlaybackSource]);
+		return () => controller.abort();
+	}, [
+		isLiveSegments,
+		liveProbeSrc,
+		shouldDelayPlaybackSource,
+		onSourceComplete,
+	]);
 
 	useEffect(() => {
 		const video = videoRef.current;
 		if (!video) return;
+		playbackStartedAtRef.current ??= performance.now();
 
 		const handleLoadedData = () => {
 			setVideoLoaded(true);
-			if (!hasPlayedOnceRef.current) {
-				setShowPlayButton(true);
+			if (isLiveSegments && !isBackgroundPreview && !reportedReadyRef.current) {
+				reportedReadyRef.current = true;
+				const elapsedMs = Math.round(
+					performance.now() -
+						(playbackStartedAtRef.current ?? performance.now()),
+				);
+				const fromRecordingStop =
+					new URLSearchParams(window.location.search).get(
+						"recordingStopped",
+					) === "1";
+				void import("@/app/utils/analytics")
+					.then(({ trackEvent }) =>
+						trackEvent("instant_playback_ready", {
+							elapsedMs,
+							fromRecordingStop,
+							// Time since the page navigation began; the desktop opens
+							// the share page right as the recording stops.
+							sinceNavigationMs: Math.round(performance.now()),
+							earlyPlayback: isEarlyPlayback,
+						}),
+					)
+					.catch(() => {});
 			}
-		};
-
-		const handleCanPlay = () => {
-			setVideoLoaded(true);
-			if (!hasPlayedOnceRef.current) {
-				setShowPlayButton(true);
-			}
-		};
-
-		const handleLoad = () => {
-			setVideoLoaded(true);
 			if (!hasPlayedOnceRef.current) {
 				setShowPlayButton(true);
 			}
@@ -304,6 +333,7 @@ export function HLSVideoPlayer({
 
 		const handleError = (e: Event) => {
 			const error = (e.target as HTMLVideoElement).error;
+			if (error) setHlsInitFailed(true);
 			console.error("HLSVideoPlayer: Video error detected:", {
 				error,
 				code: error?.code,
@@ -314,8 +344,7 @@ export function HLSVideoPlayer({
 
 		video.addEventListener("loadeddata", handleLoadedData);
 		video.addEventListener("loadedmetadata", handleLoadedMetadata);
-		video.addEventListener("canplay", handleCanPlay);
-		video.addEventListener("load", handleLoad);
+		video.addEventListener("canplay", handleLoadedData);
 		video.addEventListener("play", handlePlay);
 		video.addEventListener("error", handleError);
 
@@ -324,21 +353,23 @@ export function HLSVideoPlayer({
 		}
 
 		if (video.readyState >= 2) {
-			setVideoLoaded(true);
-			if (!hasPlayedOnceRef.current) {
-				setShowPlayButton(true);
-			}
+			handleLoadedData();
 		}
 
 		return () => {
 			video.removeEventListener("loadeddata", handleLoadedData);
 			video.removeEventListener("loadedmetadata", handleLoadedMetadata);
-			video.removeEventListener("canplay", handleCanPlay);
-			video.removeEventListener("load", handleLoad);
+			video.removeEventListener("canplay", handleLoadedData);
 			video.removeEventListener("play", handlePlay);
 			video.removeEventListener("error", handleError);
 		};
-	}, [playbackSrc, videoRef.current]);
+	}, [
+		playbackSrc,
+		videoRef.current,
+		isLiveSegments,
+		isBackgroundPreview,
+		isEarlyPlayback,
+	]);
 
 	useEffect(() => {
 		const video = videoRef.current;
@@ -355,7 +386,14 @@ export function HLSVideoPlayer({
 				...(isLiveSegments
 					? {
 							liveSyncDurationCount: 3,
-							liveMaxLatencyDurationCount: 6,
+							// Safari's ManagedMediaSource freezes after a seek in segment
+							// playlists, so they use MediaSource wherever that exists.
+							preferManagedMediaSource: false,
+							// Early playback watches from the start while the playlist
+							// grows, so it must never jump ahead to the live edge.
+							...(isEarlyPlayback
+								? { startPosition: 0 }
+								: { liveMaxLatencyDurationCount: 6 }),
 							manifestLoadingRetryDelay: 2000,
 							manifestLoadingMaxRetry: 30,
 							levelLoadingRetryDelay: 2000,
@@ -374,30 +412,20 @@ export function HLSVideoPlayer({
 				hls.startLoad(0);
 			}
 
-			hls.on(Hls.Events.MANIFEST_PARSED, () => {
-				console.log("HLSVideoPlayer: HLS manifest parsed successfully");
-				setVideoLoaded(true);
-				if (!hasPlayedOnceRef.current) {
-					setShowPlayButton(true);
-				}
-			});
-
-			hls.on(Hls.Events.FRAG_LOADED, () => {
-				if (isLiveSegments && !videoLoadedRef.current) {
-					setVideoLoaded(true);
-					if (!hasPlayedOnceRef.current) {
-						setShowPlayButton(true);
-					}
-				}
-			});
-
 			let networkRetryCount = 0;
+			let mediaRetryCount = 0;
 			const maxNetworkRetries = isLiveSegments ? 30 : 6;
 			let hasTriedPlaylistReload = false;
 			let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
 			hls.on(Hls.Events.ERROR, (event, data) => {
 				console.error("HLSVideoPlayer: HLS error:", event, data);
+				if (isLiveSegments && data.response?.code === 409) {
+					setSourceFailure("incomplete");
+					hls.stopLoad();
+					video.pause();
+					return;
+				}
 
 				const isExpiredUrl =
 					data.response?.code === 403 || data.response?.code === 410;
@@ -449,10 +477,11 @@ export function HLSVideoPlayer({
 							}
 							break;
 						case Hls.ErrorTypes.MEDIA_ERROR:
-							console.log(
-								"HLSVideoPlayer: Fatal media error encountered, trying to recover",
-							);
-							hls.recoverMediaError();
+							if (mediaRetryCount++ < 3) hls.recoverMediaError();
+							else {
+								setHlsInitFailed(true);
+								hls.destroy();
+							}
 							break;
 						default:
 							console.log("HLSVideoPlayer: Fatal error, cannot recover");
@@ -467,6 +496,13 @@ export function HLSVideoPlayer({
 				networkRetryCount = 0;
 				hasTriedPlaylistReload = false;
 			});
+
+			if (isEarlyPlayback) {
+				setEarlyPlaylistEnded(false);
+				hls.on(Hls.Events.LEVEL_UPDATED, (_event, data) => {
+					if (!data.details.live) setEarlyPlaylistEnded(true);
+				});
+			}
 
 			return () => {
 				if (retryTimer) clearTimeout(retryTimer);
@@ -486,6 +522,7 @@ export function HLSVideoPlayer({
 	}, [
 		playbackSrc,
 		isLiveSegments,
+		isEarlyPlayback,
 		isPlaybackSourceReady,
 		reloadPlayback,
 		router,
@@ -502,13 +539,18 @@ export function HLSVideoPlayer({
 		return bindCaptionTrackCueText(video, setCurrentCue);
 	}, [captionsSrc, videoRef.current]);
 
+	const sourceIsIncomplete =
+		sourceFailure === "incomplete" ||
+		(isLiveSegments && hasUnplayableRecordingSource(uploadProgressRaw));
 	const isErrorWhileHlsLoading =
 		!videoLoaded &&
 		!hlsInitFailed &&
+		!sourceIsIncomplete &&
 		(uploadProgressRaw?.status === "error" ||
 			uploadProgressRaw?.status === "failed");
 	const uploadProgress =
-		isBackgroundPreview || videoLoaded || isErrorWhileHlsLoading
+		(isBackgroundPreview || videoLoaded || isErrorWhileHlsLoading) &&
+		!sourceIsIncomplete
 			? null
 			: uploadProgressRaw;
 	const isUploading = uploadProgress?.status === "uploading";
@@ -517,17 +559,32 @@ export function HLSVideoPlayer({
 		uploadProgress?.status === "generating_thumbnail";
 	const isUploadFailed = uploadProgress?.status === "failed";
 	const isUploadError = uploadProgress?.status === "error";
-	const hasFailedOrError = isUploadFailed || isUploadError;
+	const hasFailedOrError =
+		isUploadFailed || isUploadError || sourceFailure !== null || hlsInitFailed;
+	const showEarlyUploadOverlay =
+		isEarlyPlayback &&
+		videoLoaded &&
+		!earlyPlaylistEnded &&
+		!hasFailedOrError &&
+		(early.held !== null || early.atEdge);
 	const hasActiveProgress =
 		isUploading || isProcessing || isGeneratingThumbnail;
-	const canRetryUploadProcessing = canRetryFailedProcessing(
-		uploadProgress,
-		canRetryProcessing,
-	);
-	const uploadFailureMessage = getUploadFailureMessage(
-		uploadProgress,
-		canRetryProcessing,
-	);
+	const canRetryUploadProcessing =
+		!sourceIsIncomplete &&
+		sourceFailure === null &&
+		canRetryFailedProcessing(uploadProgress, canRetryProcessing);
+	const uploadFailureMessage = sourceIsIncomplete
+		? canRetryProcessing
+			? "This recording is missing some video or audio. Reopen Cap on the recording computer to resume the upload."
+			: "This recording is missing some video or audio. Ask the owner to reopen Cap and finish the upload."
+		: sourceFailure === "unavailable" || hlsInitFailed
+			? "This video could not load. Check your connection and try again."
+			: getUploadFailureMessage(uploadProgress, canRetryProcessing);
+	useEffect(() => {
+		if (!sourceIsIncomplete) return;
+		videoRef.current?.pause();
+		hlsInstance.current?.stopLoad();
+	}, [sourceIsIncomplete, videoRef]);
 
 	const retryProcessing = async () => {
 		if (!canRetryUploadProcessing || isRetryingProcessing) {
@@ -557,6 +614,7 @@ export function HLSVideoPlayer({
 	const prevUploadProgress =
 		useRef<typeof uploadProgressRaw>(uploadProgressRaw);
 	const pendingReadyRefreshRef = useRef(false);
+	const cancelReadyRefreshRef = useRef<(() => void) | null>(null);
 	// The belt-and-braces second reload below must survive effect re-runs (its
 	// whole point is firing after progress events settle), so it is only ever
 	// cancelled on unmount.
@@ -565,6 +623,7 @@ export function HLSVideoPlayer({
 	);
 	useEffect(
 		() => () => {
+			cancelReadyRefreshRef.current?.();
 			if (delayedReloadTimerRef.current) {
 				clearTimeout(delayedReloadTimerRef.current);
 			}
@@ -581,7 +640,7 @@ export function HLSVideoPlayer({
 		) {
 			if (isLiveSegments && !pendingReadyRefreshRef.current) {
 				pendingReadyRefreshRef.current = true;
-				scheduleReadyRefresh({
+				cancelReadyRefreshRef.current = scheduleReadyRefresh({
 					video: videoRef.current,
 					videoId,
 					refresh: () => router.refresh(),
@@ -631,6 +690,16 @@ export function HLSVideoPlayer({
 					<p className="text-gray-11 text-sm leading-relaxed text-center text-balance w-full max-w-[340px] mx-auto">
 						{uploadFailureMessage}
 					</p>
+					{(sourceFailure === "unavailable" || hlsInitFailed) &&
+						!sourceIsIncomplete && (
+							<button
+								type="button"
+								onClick={reloadPlayback}
+								className="px-4 py-2 text-sm font-medium text-white bg-blue-500 rounded-full"
+							>
+								Try again
+							</button>
+						)}
 					{canRetryUploadProcessing && (
 						<button
 							type="button"
@@ -737,6 +806,13 @@ export function HLSVideoPlayer({
 			</AnimatePresence>
 			<VideoPreviewGif
 				videoId={videoId}
+				preload={
+					!hasActiveUpload &&
+					!hasPlayedOnce &&
+					!hasFailedOrError &&
+					!isLiveSegments &&
+					!isBackgroundPreview
+				}
 				visible={
 					videoLoaded &&
 					!hasPlayedOnce &&
@@ -764,13 +840,33 @@ export function HLSVideoPlayer({
 				{captionsSrc && (
 					<track
 						key={captionsSrc}
-						label="English"
+						label={
+							availableCaptions.find(
+								(caption) => caption.code === captionLanguage,
+							)?.name ?? "Original"
+						}
 						kind="captions"
-						srcLang="en"
+						srcLang={
+							captionLanguage &&
+							captionLanguage !== "original" &&
+							captionLanguage !== "off"
+								? captionLanguage
+								: "en"
+						}
 						src={captionsSrc}
 					/>
 				)}
 			</MediaPlayerVideo>
+			{showEarlyUploadOverlay && (
+				<EarlyUploadOverlay
+					videoRef={videoRef}
+					target={early.held}
+					ready={early.ready}
+					recorded={earlyLength}
+					uploadComplete={early.uploadComplete}
+					stalled={early.stalled}
+				/>
+			)}
 			{videoLoaded &&
 				!hasActiveProgress &&
 				!hasFailedOrError &&
@@ -795,9 +891,21 @@ export function HLSVideoPlayer({
 					{currentCue}
 				</div>
 			)}
-			<MediaPlayerLoading />
+			{!showEarlyUploadOverlay && <MediaPlayerLoading />}
 			<MediaPlayerError />
 			<MediaPlayerVolumeIndicator />
+			{callToAction &&
+				videoLoaded &&
+				!hasActiveProgress &&
+				!hasFailedOrError &&
+				!hlsInitFailed &&
+				!isBackgroundPreview && (
+					<CallToActionOverlay
+						cta={callToAction}
+						videoId={videoId}
+						controlsDocked={externalTimeline && controlsPortalEl !== null}
+					/>
+				)}
 			{(() => {
 				// Docked: the bar renders into the timeline deck's slot through a
 				// portal. Same tree, same store; only where it paints changes. The
@@ -822,7 +930,12 @@ export function HLSVideoPlayer({
 					>
 						{!docked && <MediaPlayerControlsOverlay />}
 						{!externalTimeline && (
-							<MediaPlayerSeek fallbackDuration={playerDuration} />
+							<MediaPlayerSeek
+								fallbackDuration={playerDuration}
+								expectedDuration={earlyLength}
+								pendingFrom={earlyLength !== null ? early.ready : null}
+								heldSeekTime={isEarlyPlayback ? early.held : null}
+							/>
 						)}
 						<div className="flex gap-2 items-center w-full">
 							<div className="flex flex-1 gap-2 items-center">
@@ -841,7 +954,10 @@ export function HLSVideoPlayer({
 									// setEnhancedAudioMuted={setEnhancedAudioMuted}
 								/>
 								{(!externalTimeline || docked) && (
-									<MediaPlayerTime fallbackDuration={playerDuration} />
+									<MediaPlayerTime
+										fallbackDuration={playerDuration}
+										expectedDuration={earlyLength}
+									/>
 								)}
 							</div>
 							<div className="flex gap-2 items-center">

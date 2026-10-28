@@ -1,4 +1,5 @@
 pub mod benchmark;
+pub mod camera_placement;
 mod capture_pipeline;
 pub mod cursor;
 pub mod defaults;
@@ -17,6 +18,7 @@ pub mod sources;
 pub mod studio_recording;
 pub mod sync_calibration;
 pub mod track_heal;
+pub mod upload_preparation;
 pub mod upload_resume;
 pub mod upload_verification;
 
@@ -77,9 +79,21 @@ pub struct RecordingOptions {
     pub mode: RecordingMode,
 }
 
+/// The window a capture should record by itself: only for a window target
+/// with window-only capture on.
+pub fn window_only_target(
+    target: &ScreenCaptureTarget,
+    window_only: bool,
+) -> Option<scap_targets::WindowId> {
+    target.window().filter(|_| window_only)
+}
+
 #[derive(Clone)]
 pub struct RecordingBaseInputs {
     pub capture_target: ScreenCaptureTarget,
+    /// For a window target on macOS and Windows: record only that window,
+    /// following it, instead of the region of the screen it starts in.
+    pub window_only: bool,
     pub capture_system_audio: bool,
     pub mic_feed: Option<Arc<MicrophoneFeedLock>>,
     pub camera_feed: Option<Arc<CameraFeedLock>>,
@@ -87,6 +101,9 @@ pub struct RecordingBaseInputs {
     pub shareable_content: Option<SendableShareableContent>,
     #[cfg(target_os = "macos")]
     pub excluded_windows: Vec<scap_targets::WindowId>,
+    /// Present when the pipeline is primed ahead of the start cue; capture is
+    /// held back until it is armed.
+    pub start_gate: Option<RecordingStartGate>,
 }
 
 #[cfg(target_os = "macos")]

@@ -3,6 +3,10 @@ name = "cap-export"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Encoder failure injection for the cap-verify suite. Never enabled by the app.
+test-hooks = []
+
 [dependencies]
 cap-utils = { path = "../utils" }
 cap-project = { path = "../project" }
@@ -16,7 +20,7 @@ cap-media-info = { path = "../media-info" }
 
 tokio.workspace = true
 tempfile = "3.12.0"
-image = "0.25.2"
+image = { version = "0.25.2", default-features = false, features = ["rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 base64 = "0.22.1"
 mp4 = "0.14.0"
 thiserror.workspace = true
@@ -39,6 +43,10 @@ inquire = "0.7.5"
 tokio.workspace = true
 serde_json.workspace = true
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+anyhow.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

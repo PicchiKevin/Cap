@@ -79,8 +79,14 @@ async function startJob(requestBody: Record<string, unknown> = body) {
 		body: JSON.stringify(requestBody),
 	});
 	expect(response.status).toBe(200);
-	const accepted = (await response.json()) as { jobId: string };
-	expect(Object.keys(accepted)).toEqual(["jobId"]);
+	const accepted = (await response.json()) as {
+		jobId: string;
+		recordingWorkerVersion?: number;
+	};
+	expect(Object.keys(accepted)).toEqual(
+		requestBody.generation ? ["jobId", "recordingWorkerVersion"] : ["jobId"],
+	);
+	if (requestBody.generation) expect(accepted.recordingWorkerVersion).toBe(1);
 	expect(typeof accepted.jobId).toBe("string");
 	jobs.push(accepted.jobId);
 	return accepted.jobId;
@@ -93,10 +99,24 @@ async function status(jobId: string): Promise<JobProgress> {
 }
 
 async function terminalWebhook(jobId: string): Promise<JobProgress> {
-	await waitFor(() => webhooks.some((payload) => payload.jobId === jobId));
-	const payload = webhooks.find((item) => item.jobId === jobId);
+	const terminal = (payload: JobProgress) =>
+		payload.jobId === jobId &&
+		["complete", "error", "cancelled"].includes(payload.phase);
+	await waitFor(() => webhooks.some(terminal));
+	const payload = webhooks.find(terminal);
 	if (!payload) throw new Error("Missing terminal webhook");
 	return payload;
+}
+
+function captureFailureLogs() {
+	const info = spyOn(console, "info");
+	const events = () =>
+		info.mock.calls.flatMap(([line]) => {
+			if (typeof line !== "string" || !line.startsWith("{")) return [];
+			const event = JSON.parse(line) as Record<string, unknown>;
+			return event.event === "recording_verification_failed" ? [event] : [];
+		});
+	return { events, restore: () => info.mockRestore() };
 }
 
 function waitForDecoderCancellation() {
@@ -130,7 +150,20 @@ beforeEach(() => {
 		requests.push({ url: request.url, method: request.method });
 		if (request.url === body.webhookUrl && request.method === "POST") {
 			expect(request.headers.get("x-media-server-secret")).toBe(secret);
-			webhooks.push((await request.json()) as JobProgress);
+			const payload = (await request.json()) as JobProgress;
+			webhooks.push(payload);
+			if (payload.recordingWorker)
+				return Response.json({
+					recordingWorker: {
+						version: 1,
+						status: "accepted",
+						generation: payload.generation,
+						attemptId: payload.attemptId,
+						jobId: payload.jobId,
+						sequence: payload.recordingWorker.sequence,
+						leaseDurationMs: 300_000,
+					},
+				});
 			return new Response(null, { status: 200 });
 		}
 		if (
@@ -149,7 +182,7 @@ beforeEach(() => {
 afterEach(async () => {
 	for (const jobId of jobs.splice(0)) {
 		jobManager.getJob(jobId)?.abortController?.abort();
-		await waitFor(() => webhooks.some((payload) => payload.jobId === jobId));
+		await terminalWebhook(jobId);
 		jobManager.deleteJob(jobId);
 	}
 	globalThis.fetch = originalFetch;
@@ -163,6 +196,115 @@ afterAll(() => {
 });
 
 describe("asynchronous recording verification", () => {
+	test("waits for one shared ownership acknowledgement before starting replayed work", async () => {
+		verify.mockResolvedValue({ ...evidence, remoteSha256: "a".repeat(64) });
+		const request = {
+			...body,
+			generation: "generation-delayed-claim",
+			attemptId: "attempt-delayed-claim",
+			inventorySha256: "d".repeat(64),
+			outputKey: "snapshot.mp4",
+			originalObjectIdentity: body.objectIdentity,
+			sourceObjectIdentity: body.objectIdentity,
+		};
+		const reply = globalThis.fetch;
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let claims = 0;
+		globalThis.fetch = (async (input, init) => {
+			const payload = JSON.parse(String(init?.body)) as JobProgress;
+			if (payload.recordingWorker?.action === "claim") {
+				claims++;
+				await gate;
+			}
+			return reply(input, init);
+		}) as typeof fetch;
+		const pending = [startJob(request), startJob(request), startJob(request)];
+		try {
+			await waitFor(() => claims === 1);
+			expect(probe).not.toHaveBeenCalled();
+			expect(verify).not.toHaveBeenCalled();
+		} finally {
+			release();
+		}
+		const accepted = await Promise.all(pending);
+		expect(new Set(accepted).size).toBe(1);
+		expect(claims).toBe(1);
+		expect((await terminalWebhook(accepted[0] ?? "")).phase).toBe("complete");
+		expect(probe).toHaveBeenCalledTimes(1);
+		expect(verify).toHaveBeenCalledTimes(1);
+	});
+
+	test("returns the durable owner without computing on a losing replica", async () => {
+		let localJobId = "";
+		globalThis.fetch = (async (_input, init) => {
+			const payload = JSON.parse(String(init?.body)) as JobProgress;
+			localJobId = payload.jobId;
+			return Response.json({
+				recordingWorker: {
+					version: 1,
+					status: "owned",
+					generation: payload.generation,
+					attemptId: payload.attemptId,
+					jobId: payload.jobId,
+					sequence: payload.recordingWorker?.sequence,
+					ownerJobId: "winning-replica-job",
+				},
+			});
+		}) as typeof fetch;
+		const response = await video.request("/verify-recording", {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				...body,
+				generation: "generation-owned",
+				attemptId: "attempt-owned",
+				inventorySha256: "d".repeat(64),
+				outputKey: "snapshot.mp4",
+				originalObjectIdentity: body.objectIdentity,
+				sourceObjectIdentity: body.objectIdentity,
+			}),
+		});
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			jobId: "winning-replica-job",
+			recordingWorkerVersion: 1,
+		});
+		expect(probe).not.toHaveBeenCalled();
+		expect(verify).not.toHaveBeenCalled();
+		expect(jobManager.getJob(localJobId)).toBeUndefined();
+	});
+
+	test("does no work when the web receiver cannot acknowledge ownership", async () => {
+		let localJobId = "";
+		globalThis.fetch = (async (_input, init) => {
+			localJobId = (JSON.parse(String(init?.body)) as JobProgress).jobId;
+			return Response.json({ success: true });
+		}) as typeof fetch;
+		const response = await video.request("/verify-recording", {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				...body,
+				generation: "generation-unsupported",
+				attemptId: "attempt-unsupported",
+				inventorySha256: "d".repeat(64),
+				outputKey: "snapshot.mp4",
+				originalObjectIdentity: body.objectIdentity,
+				sourceObjectIdentity: body.objectIdentity,
+			}),
+		});
+		expect(response.status).toBe(503);
+		expect((await response.json()).code).toBe(
+			"RECORDING_OWNERSHIP_UNAVAILABLE",
+		);
+		expect(probe).not.toHaveBeenCalled();
+		expect(verify).not.toHaveBeenCalled();
+		expect(jobManager.getJob(localJobId)).toBeUndefined();
+	});
+
 	test("binds a fenced MP4 attempt to the original artifact and verified snapshot", async () => {
 		const snapshotIdentity = '"snapshot-generation"';
 		verify.mockResolvedValue({
@@ -377,4 +519,94 @@ describe("asynchronous recording verification", () => {
 			expect(failed.metadata).toBeUndefined();
 		},
 	);
+
+	test("logs why permanent verification failed without leaking the presigned URL", async () => {
+		const logs = captureFailureLogs();
+		try {
+			verify.mockRejectedValue(
+				new Error(
+					"Recording full decode failed: https://bucket.s3.amazonaws.com/user-1/video-1/raw.mp4?X-Amz-Credential=AKIAEXAMPLE&X-Amz-Signature=deadbeef: Invalid data found when processing input",
+				),
+			);
+			const jobId = await startJob();
+			const failed = await terminalWebhook(jobId);
+			expect(failed.errorCode).toBe("source-invalid");
+			const [event, ...rest] = logs.events();
+			expect(rest).toEqual([]);
+			expect(event).toMatchObject({
+				jobId,
+				videoId: body.videoId,
+				phase: "error",
+				errorCode: "source-invalid",
+				retryable: false,
+				stage: "decode",
+				reason:
+					"Recording full decode failed: <url> Invalid data found when processing input",
+			});
+			const line = JSON.stringify(event);
+			expect(line).not.toContain("amazonaws");
+			expect(line).not.toContain("X-Amz");
+			expect(line).not.toContain("deadbeef");
+			expect(line).not.toContain(body.videoUrl);
+		} finally {
+			logs.restore();
+		}
+	});
+
+	test("logs which uploaded metadata check failed", async () => {
+		const logs = captureFailureLogs();
+		try {
+			probe.mockResolvedValue({ ...metadata, fileSize: 64, duration: 2 });
+			const jobId = await startJob();
+			const failed = await terminalWebhook(jobId);
+			expect(failed.errorCode).toBe("source-invalid");
+			expect(logs.events()).toEqual([
+				expect.objectContaining({
+					jobId,
+					errorCode: "source-invalid",
+					retryable: false,
+					stage: "metadata",
+					reason: "Uploaded recording does not match the completed local file",
+					mismatch: {
+						expectedFileSize: 128,
+						actualFileSize: 64,
+						expectedDuration: 5,
+						actualDuration: 2,
+						requiredAudio: false,
+						audioCodec: "aac",
+					},
+				}),
+			]);
+			expect(verify).not.toHaveBeenCalled();
+		} finally {
+			logs.restore();
+		}
+	});
+
+	test("logs the original probe error behind a retryable failure", async () => {
+		const logs = captureFailureLogs();
+		try {
+			probe.mockRejectedValue(
+				new Error(
+					"Media input is not accessible (503) for /tmp/cap-media-server/instance-1/user-1.mp4?X-Amz-Signature=deadbeef",
+				),
+			);
+			const jobId = await startJob();
+			const failed = await terminalWebhook(jobId);
+			expect(failed.error).toBe(
+				"Recording verification temporarily unavailable (503)",
+			);
+			expect(logs.events()).toEqual([
+				expect.objectContaining({
+					jobId,
+					errorCode: "processing-unavailable",
+					retryable: true,
+					stage: "probe",
+					reason: "Media input is not accessible (503) for <path>",
+				}),
+			]);
+		} finally {
+			logs.restore();
+		}
+	});
 });

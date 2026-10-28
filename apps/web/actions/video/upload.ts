@@ -4,7 +4,7 @@ import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
 import { nanoId } from "@cap/database/helpers";
 import { videos, videoUploads } from "@cap/database/schema";
-import { serverEnv } from "@cap/env";
+import { getNewVideoPublic } from "@cap/database/video-sharing-default";
 import { userIsPro } from "@cap/utils";
 import { Storage as StorageService } from "@cap/web-backend";
 import {
@@ -16,6 +16,7 @@ import {
 import { eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
 import { revalidatePath } from "next/cache";
+import { requirePersonalFolder } from "@/actions/folders/require-personal-folder";
 import { requireOrganizationAccess } from "@/actions/organization/authorization";
 import { runPromise } from "@/lib/server";
 
@@ -196,6 +197,7 @@ export async function createVideoAndGetUploadUrl({
 		}
 
 		const idToUse = Video.VideoId.make(videoId || nanoId());
+		if (folderId) await requirePersonalFolder(user.id, orgId, folderId);
 		const videoTitle = `Cap ${
 			isScreenshot ? "Screenshot" : isUpload ? "Upload" : "Recording"
 		} - ${formattedDate}`;
@@ -228,16 +230,18 @@ export async function createVideoAndGetUploadUrl({
 			isScreenshot,
 			bucket: Option.getOrNull(bucketId),
 			storageIntegrationId: Option.getOrNull(storageIntegrationId),
-			public: serverEnv().CAP_VIDEOS_DEFAULT_PUBLIC,
+			public: await getNewVideoPublic(orgId),
 			...(folderId ? { folderId } : {}),
 		};
 
-		await db().insert(videos).values(videoData);
+		await db().transaction(async (tx) => {
+			await tx.insert(videos).values(videoData);
 
-		if (supportsUploadProgress)
-			await db().insert(videoUploads).values({
-				videoId: idToUse,
-			});
+			if (supportsUploadProgress)
+				await tx.insert(videoUploads).values({
+					videoId: idToUse,
+				});
+		});
 
 		revalidatePath("/dashboard/caps");
 		revalidatePath("/dashboard/folder");

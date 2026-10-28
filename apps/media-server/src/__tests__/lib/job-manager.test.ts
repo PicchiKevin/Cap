@@ -1,17 +1,23 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	beginRecordingProcessing,
 	beginRecordingVerification,
+	claimRecordingWorker,
 	cleanupExpiredJobs,
 	createJob,
 	deleteJob,
+	extendJobLifetime,
 	getJob,
+	getJobTotals,
+	type JobProgress,
+	type RecordingWorkerAcknowledgement,
 	sendWebhook,
 	touchJob,
 	updateJob,
 } from "../../lib/job-manager";
 
 const createdJobs: string[] = [];
+const originalFetch = globalThis.fetch;
 
 function createTrackedJob(jobId: string) {
 	createdJobs.push(jobId);
@@ -19,9 +25,315 @@ function createTrackedJob(jobId: string) {
 }
 
 afterEach(() => {
+	globalThis.fetch = originalFetch;
 	for (const jobId of createdJobs.splice(0)) {
 		deleteJob(jobId);
 	}
+});
+
+function workerAcknowledgement(
+	payload: JobProgress,
+	status: RecordingWorkerAcknowledgement["status"] = "accepted",
+) {
+	return Response.json({
+		recordingWorker: {
+			version: 1,
+			status,
+			generation: payload.generation,
+			attemptId: payload.attemptId,
+			jobId: payload.jobId,
+			sequence: payload.recordingWorker?.sequence,
+			leaseDurationMs: 300_000,
+		},
+	});
+}
+
+function createRecordingWorker(jobId: string) {
+	const job = createTrackedJob(jobId);
+	job.webhookUrl = "https://webhook.example.test/progress";
+	updateJob(jobId, {
+		generation: "generation",
+		attemptId: "attempt",
+		abortController: new AbortController(),
+	});
+	return job;
+}
+
+describe("durable recording workers", () => {
+	test("retries a lost ownership acknowledgement with the same claim before work", async () => {
+		const job = createRecordingWorker("worker-lost-claim");
+		const payloads: JobProgress[] = [];
+		globalThis.fetch = (async (_input, init) => {
+			const payload = JSON.parse(String(init?.body)) as JobProgress;
+			payloads.push(payload);
+			if (payloads.length === 1) throw new Error("Acknowledgement lost");
+			return workerAcknowledgement(payload);
+		}) as typeof fetch;
+		const acknowledgement = await claimRecordingWorker(job);
+		expect(acknowledgement?.status).toBe("accepted");
+		expect(payloads).toHaveLength(2);
+		expect(payloads[0]).toEqual(payloads[1]);
+		expect(payloads[0]?.recordingWorker).toEqual({
+			version: 1,
+			action: "claim",
+			sequence: 0,
+		});
+		expect(job.recordingWorkerClaimed).toBe(true);
+		expect(job.abortController?.signal.aborted).toBe(false);
+		expect(await claimRecordingWorker(job)).toBe(acknowledgement);
+		expect(payloads).toHaveLength(2);
+	});
+
+	test("renews an unchanged long phase without extending the processing deadline", async () => {
+		const job = createRecordingWorker("worker-silent-stage");
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const payloads: JobProgress[] = [];
+		globalThis.fetch = (async (_input, init) => {
+			const payload = JSON.parse(String(init?.body)) as JobProgress;
+			payloads.push(payload);
+			return workerAcknowledgement(payload);
+		}) as typeof fetch;
+		try {
+			await claimRecordingWorker(job);
+			expect(beginRecordingProcessing(job.jobId, 20 * 60_000)).toBe(true);
+			updateJob(job.jobId, { phase: "processing", progress: 60 });
+			const deadline = job.recordingProcessingDeadlineAt;
+			for (let minute = 0; minute < 7; minute++) {
+				now += 61_000;
+				touchJob(job.jobId);
+				expect(cleanupExpiredJobs()).toBe(0);
+				await job.webhookPromise;
+				expect(job.recordingWorkerLeaseExpiresAt).toBeGreaterThan(now);
+			}
+			expect(payloads.slice(1)).toHaveLength(7);
+			expect(
+				payloads
+					.slice(1)
+					.every(
+						(payload) =>
+							payload.phase === "processing" &&
+							payload.progress === 60 &&
+							payload.recordingWorker?.sequence === 1,
+					),
+			).toBe(true);
+			expect(job.recordingProcessingDeadlineAt).toBe(deadline);
+			now = (deadline ?? now) + 1;
+			job.recordingWorkerLeaseExpiresAt = now + 300_000;
+			touchJob(job.jobId);
+			expect(cleanupExpiredJobs()).toBe(1);
+			await job.webhookPromise;
+			expect(job.phase).toBe("error");
+			expect(job.abortController?.signal.aborted).toBe(true);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("serializes an in-flight active callback and immediately drains terminal proof", async () => {
+		const job = createRecordingWorker("worker-terminal-drain");
+		const payloads: JobProgress[] = [];
+		let release: ((response: Response) => void) | undefined;
+		let inFlight = 0;
+		let maximumInFlight = 0;
+		globalThis.fetch = (async (_input, init) => {
+			const payload = JSON.parse(String(init?.body)) as JobProgress;
+			payloads.push(payload);
+			inFlight++;
+			maximumInFlight = Math.max(maximumInFlight, inFlight);
+			try {
+				if (payload.phase === "processing")
+					return await new Promise<Response>((resolve) => {
+						release = resolve;
+					});
+				return workerAcknowledgement(payload);
+			} finally {
+				inFlight--;
+			}
+		}) as typeof fetch;
+		await claimRecordingWorker(job);
+		updateJob(job.jobId, { phase: "processing", progress: 60 });
+		const sending = sendWebhook(job);
+		updateJob(job.jobId, { phase: "complete", progress: 100 });
+		expect(sendWebhook(job)).toBe(sending);
+		const started = performance.now();
+		release?.(new Response(null, { status: 503 }));
+		await sending;
+		expect(performance.now() - started).toBeLessThan(400);
+		expect(maximumInFlight).toBe(1);
+		expect(payloads.map((payload) => payload.phase)).toEqual([
+			"queued",
+			"processing",
+			"complete",
+		]);
+		expect(job.terminalWebhookAcknowledgedAt).toBeNumber();
+		expect(payloads.at(-1)?.recordingWorker?.sequence).toBe(2);
+	});
+
+	test("fails closed on unsupported ownership acknowledgements", async () => {
+		const job = createRecordingWorker("worker-unsupported-claim");
+		globalThis.fetch = (async (_input, _init) =>
+			Response.json({ success: true })) as typeof fetch;
+		expect(await claimRecordingWorker(job)).toBeUndefined();
+		expect(job.recordingWorkerClaimed).toBeUndefined();
+		expect(job.recordingWorkerLeaseExpiresAt).toBeUndefined();
+	});
+
+	test("revokes only positive supersession or expiry of the granted lease", async () => {
+		const job = createRecordingWorker("worker-lease-expiry");
+		let unavailable = false;
+		globalThis.fetch = (async (_input, init) =>
+			unavailable
+				? new Response(null, { status: 503 })
+				: workerAcknowledgement(
+						JSON.parse(String(init?.body)) as JobProgress,
+					)) as typeof fetch;
+		await claimRecordingWorker(job);
+		updateJob(job.jobId, { phase: "processing", progress: 60 });
+		const granted = job.recordingWorkerLeaseExpiresAt;
+		unavailable = true;
+		await sendWebhook(job);
+		expect(job.abortController?.signal.aborted).toBe(false);
+		expect(job.recordingWorkerLeaseExpiresAt).toBe(granted);
+		job.recordingWorkerLeaseExpiresAt = Date.now() - 1;
+		cleanupExpiredJobs();
+		expect(job.abortController?.signal.aborted).toBe(true);
+		expect(job.phase).toBe("cancelled");
+		expect(
+			updateJob(job.jobId, { phase: "complete", progress: 100 }),
+		).toBeUndefined();
+		expect(updateJob(job.jobId, { phase: "error" })).toBeUndefined();
+		expect(job.phase).toBe("cancelled");
+	});
+
+	test("aborts a superseded worker and never revives it from a late completion", async () => {
+		const job = createRecordingWorker("worker-superseded");
+		let superseded = false;
+		let requests = 0;
+		globalThis.fetch = (async (_input, init) => {
+			requests++;
+			return workerAcknowledgement(
+				JSON.parse(String(init?.body)) as JobProgress,
+				superseded ? "superseded" : "accepted",
+			);
+		}) as typeof fetch;
+		await claimRecordingWorker(job);
+		updateJob(job.jobId, { phase: "processing", progress: 60 });
+		superseded = true;
+		await sendWebhook(job);
+		expect(job.phase).toBe("cancelled");
+		expect(job.abortController?.signal.aborted).toBe(true);
+		updateJob(job.jobId, { phase: "complete", progress: 100 });
+		await sendWebhook(job);
+		expect(requests).toBe(2);
+		expect(job.phase).toBe("cancelled");
+	});
+
+	test("does not revoke or renew a live worker for a stale state acknowledgement", async () => {
+		const job = createRecordingWorker("worker-stale-ack");
+		let stale = false;
+		globalThis.fetch = (async (_input, init) =>
+			workerAcknowledgement(
+				JSON.parse(String(init?.body)) as JobProgress,
+				stale ? "stale" : "accepted",
+			)) as typeof fetch;
+		await claimRecordingWorker(job);
+		updateJob(job.jobId, { phase: "processing", progress: 60 });
+		const deadline = job.recordingWorkerLeaseExpiresAt;
+		stale = true;
+		expect((await sendWebhook(job))?.status).toBe("stale");
+		expect(job.recordingWorkerLeaseExpiresAt).toBe(deadline);
+		expect(job.abortController?.signal.aborted).toBe(false);
+	});
+
+	test("cannot revive an expired grant with an acknowledgement that arrives late", async () => {
+		const job = createRecordingWorker("worker-late-ack");
+		let release: (() => void) | undefined;
+		globalThis.fetch = (async (_input, init) => {
+			const payload = JSON.parse(String(init?.body)) as JobProgress;
+			if (payload.recordingWorker?.action === "progress")
+				await new Promise<void>((resolve) => {
+					release = resolve;
+				});
+			const acknowledgement = await workerAcknowledgement(payload).json();
+			acknowledgement.recordingWorker.leaseDurationMs = 20;
+			return Response.json(acknowledgement);
+		}) as typeof fetch;
+		await claimRecordingWorker(job);
+		updateJob(job.jobId, { phase: "processing", progress: 60 });
+		const deadline = job.recordingWorkerLeaseExpiresAt;
+		const sending = sendWebhook(job);
+		try {
+			await Bun.sleep(40);
+			expect(job.phase).toBe("cancelled");
+			expect(job.abortController?.signal.aborted).toBe(true);
+		} finally {
+			release?.();
+		}
+		await sending;
+		expect(job.recordingWorkerLeaseExpiresAt).toBe(deadline);
+		expect(job.recordingWorkerRevoked).toBe(true);
+	});
+
+	test("ignores an ownership rejection addressed to a different attempt", async () => {
+		const job = createRecordingWorker("worker-foreign-ack");
+		let foreign = false;
+		globalThis.fetch = (async (_input, init) => {
+			const payload = JSON.parse(String(init?.body)) as JobProgress;
+			if (foreign) payload.attemptId = "another-attempt";
+			return workerAcknowledgement(
+				payload,
+				foreign ? "superseded" : "accepted",
+			);
+		}) as typeof fetch;
+		await claimRecordingWorker(job);
+		updateJob(job.jobId, { phase: "processing", progress: 60 });
+		foreign = true;
+		const deadline = job.recordingWorkerLeaseExpiresAt;
+		expect(await sendWebhook(job)).toBeUndefined();
+		expect(job.recordingWorkerLeaseExpiresAt).toBe(deadline);
+		expect(job.abortController?.signal.aborted).toBe(false);
+	});
+
+	test("does not accept a malformed status as a lease renewal", async () => {
+		const job = createRecordingWorker("worker-malformed-ack");
+		let malformed = false;
+		globalThis.fetch = (async (_input, init) => {
+			const payload = JSON.parse(String(init?.body)) as JobProgress;
+			const acknowledgement = await workerAcknowledgement(payload).json();
+			if (malformed) acknowledgement.recordingWorker.status = ["accepted"];
+			return Response.json(acknowledgement);
+		}) as typeof fetch;
+		await claimRecordingWorker(job);
+		updateJob(job.jobId, { phase: "processing", progress: 60 });
+		const deadline = job.recordingWorkerLeaseExpiresAt;
+		malformed = true;
+		expect(await sendWebhook(job)).toBeUndefined();
+		expect(job.recordingWorkerLeaseExpiresAt).toBe(deadline);
+		expect(job.abortController?.signal.aborted).toBe(false);
+	});
+
+	test("retains the same fenced terminal revision across a lost acknowledgement", async () => {
+		const job = createRecordingWorker("worker-terminal-lost-ack");
+		const terminals: JobProgress[] = [];
+		globalThis.fetch = (async (_input, init) => {
+			const payload = JSON.parse(String(init?.body)) as JobProgress;
+			if (payload.phase === "complete") {
+				terminals.push(payload);
+				if (terminals.length === 1)
+					throw new Error("Terminal acknowledgement lost");
+			}
+			return workerAcknowledgement(payload);
+		}) as typeof fetch;
+		await claimRecordingWorker(job);
+		updateJob(job.jobId, { phase: "complete", progress: 100 });
+		await sendWebhook(job);
+		expect(terminals).toHaveLength(2);
+		expect(terminals[0]).toEqual(terminals[1]);
+		expect(job.terminalWebhookAcknowledgedAt).toBeNumber();
+		expect(updateJob(job.jobId, { phase: "error" })).toBeUndefined();
+		expect(job.phase).toBe("complete");
+	});
 });
 
 describe("job cleanup", () => {
@@ -210,5 +522,85 @@ describe("job cleanup", () => {
 		expect(cleaned).toBe(1);
 		expect(currentJob?.phase).toBe("error");
 		expect(currentJob?.error).toContain("maximum lifetime of 60 minutes");
+	});
+});
+
+describe("job lifetime", () => {
+	test("extends the lifetime cap for long work without shortening it", () => {
+		const job = createTrackedJob("job-extended-lifetime");
+		const now = Date.now();
+		job.phase = "processing";
+		job.createdAt = now - 10 * 60 * 1000;
+
+		expect(extendJobLifetime(job.jobId, 60_000)).toBe(
+			job.createdAt + 60 * 60 * 1000,
+		);
+		const deadline = extendJobLifetime(job.jobId, 2 * 60 * 60 * 1000);
+		expect(deadline).toBeGreaterThanOrEqual(now + 2 * 60 * 60 * 1000);
+		expect(extendJobLifetime(job.jobId, 60_000)).toBe(deadline);
+
+		job.createdAt = now - 90 * 60 * 1000;
+		job.updatedAt = Date.now();
+		expect(cleanupExpiredJobs()).toBe(0);
+		expect(getJob(job.jobId)?.phase).toBe("processing");
+	});
+
+	test("keeps a hard upper bound on extended lifetimes", () => {
+		const job = createTrackedJob("job-capped-lifetime");
+		job.phase = "uploading";
+		job.createdAt = Date.now() - 10 * 60 * 1000;
+
+		expect(extendJobLifetime(job.jobId, 24 * 60 * 60 * 1000)).toBe(
+			job.createdAt + 4 * 60 * 60 * 1000,
+		);
+		expect(extendJobLifetime(job.jobId, Number.NaN)).toBeUndefined();
+		expect(extendJobLifetime(job.jobId, -1)).toBeUndefined();
+	});
+
+	test("expires a job past its extended deadline", () => {
+		const job = createTrackedJob("job-past-extended-lifetime");
+		const abortController = new AbortController();
+		updateJob(job.jobId, { phase: "processing", abortController });
+		job.createdAt = Date.now() - 10 * 60 * 1000;
+		extendJobLifetime(job.jobId, 2 * 60 * 60 * 1000);
+		job.createdAt -= 3 * 60 * 60 * 1000;
+		job.lifetimeDeadlineAt = Date.now() - 1;
+		job.updatedAt = Date.now();
+
+		expect(cleanupExpiredJobs()).toBe(1);
+		expect(job.phase).toBe("error");
+		expect(job.error).toContain("maximum lifetime");
+		expect(abortController.signal.aborted).toBe(true);
+	});
+
+	test("does not extend terminal jobs", () => {
+		const job = createTrackedJob("job-terminal-lifetime");
+		updateJob(job.jobId, { phase: "complete" });
+		expect(extendJobLifetime(job.jobId, 2 * 60 * 60 * 1000)).toBeUndefined();
+		expect(job.lifetimeDeadlineAt).toBeUndefined();
+	});
+});
+
+describe("job totals", () => {
+	test("counts created, terminal, and expired jobs", () => {
+		const before = getJobTotals();
+		const completed = createTrackedJob("job-total-complete");
+		const errored = createTrackedJob("job-total-error");
+		const cancelled = createTrackedJob("job-total-cancelled");
+		const stale = createTrackedJob("job-total-stale");
+		updateJob(completed.jobId, { phase: "complete" });
+		updateJob(completed.jobId, { phase: "error" });
+		updateJob(errored.jobId, { phase: "error" });
+		updateJob(cancelled.jobId, { phase: "cancelled" });
+		updateJob(stale.jobId, { phase: "processing" });
+		stale.updatedAt = Date.now() - 16 * 60 * 1000;
+		cleanupExpiredJobs();
+
+		const after = getJobTotals();
+		expect(after.created - before.created).toBe(4);
+		expect(after.completed - before.completed).toBe(1);
+		expect(after.errored - before.errored).toBe(2);
+		expect(after.cancelled - before.cancelled).toBe(1);
+		expect(after.expired - before.expired).toBe(1);
 	});
 });

@@ -5,43 +5,54 @@ import type { comments as commentsSchema, videos } from "@cap/database/schema";
 import { NODE_ENV } from "@cap/env";
 import { Avatar, Logo } from "@cap/ui";
 import type { ViewerSettings } from "@cap/web-backend";
-import { AnimatePresence, motion } from "framer-motion";
 import { useTranscript } from "hooks/use-transcript";
+import { AnimatePresence, motion } from "motion/react";
+import dynamic from "next/dynamic";
+import Image from "next/image";
 import {
 	forwardRef,
+	useCallback,
 	useEffect,
 	useImperativeHandle,
 	useRef,
 	useState,
 } from "react";
-import { CapVideoPlayer } from "@/app/s/[videoId]/_components/CapVideoPlayer";
-import { HLSVideoPlayer } from "@/app/s/[videoId]/_components/HLSVideoPlayer";
-import { useUploadProgress } from "@/app/s/[videoId]/_components/ProgressCircle";
 import {
 	PreparingVideoOverlay,
 	RecordingInProgressOverlay,
 } from "@/app/s/[videoId]/_components/RecordingInProgress";
+import type { UploadProgress } from "@/app/s/[videoId]/_components/upload-progress";
 import {
 	formatChaptersAsVTT,
 	formatTranscriptAsVTT,
 	parseVTT,
 	type TranscriptEntry,
 } from "@/app/s/[videoId]/_components/utils/transcript-utils";
+import { formatPlayerTime } from "@/lib/player-time";
+import type { SharePageBranding } from "@/lib/share-branding";
+import type { ShareCallToAction } from "@/lib/share-call-to-action";
 import { usePlayerJsReceiver } from "./use-player-js-receiver";
+
+const CapVideoPlayer = dynamic(() =>
+	import("@/app/s/[videoId]/_components/CapVideoPlayer").then(
+		(m) => m.CapVideoPlayer,
+	),
+);
+const UploadProgressTracker = dynamic(
+	() => import("@/app/s/[videoId]/_components/UploadProgressTracker"),
+	{ ssr: false },
+);
+const HLSVideoPlayer = dynamic(() =>
+	import("@/app/s/[videoId]/_components/HLSVideoPlayer").then(
+		(m) => m.HLSVideoPlayer,
+	),
+);
 
 declare global {
 	interface Window {
 		MSStream: unknown;
 	}
 }
-
-const formatTime = (time: number) => {
-	const minutes = Math.floor(time / 60);
-	const seconds = Math.floor(time % 60);
-	return `${minutes.toString().padStart(2, "0")}:${seconds
-		.toString()
-		.padStart(2, "0")}`;
-};
 
 type CommentWithAuthor = typeof commentsSchema.$inferSelect & {
 	authorName: string | null;
@@ -53,30 +64,38 @@ export const EmbedVideo = forwardRef<
 		data: Omit<typeof videos.$inferSelect, "password"> & {
 			hasActiveUpload: boolean | undefined;
 		};
+		branding: SharePageBranding | null;
 		user: typeof userSelectProps | null;
 		comments: CommentWithAuthor[];
 		chapters?: { title: string; start: number }[];
 		ownerName?: string | null;
+		ownerImageUrl?: string | null;
 		autoplay?: boolean;
 		/** Seconds to open at, from the embed URL's `?t=`. */
 		startTime?: number | null;
 		minimal?: boolean;
+		defaultPlaybackSpeed?: number;
 		viewerSettings?: ViewerSettings | null;
 		showPlaybackStatusBadge?: boolean;
+		callToAction?: ShareCallToAction | null;
 	}
 >(
 	(
 		{
 			data,
+			branding,
 			user: _user,
 			comments: _comments,
 			chapters = [],
 			ownerName,
+			ownerImageUrl,
 			autoplay = false,
 			startTime = null,
 			minimal = false,
+			defaultPlaybackSpeed,
 			viewerSettings,
 			showPlaybackStatusBadge = false,
+			callToAction = null,
 		},
 		ref,
 	) => {
@@ -92,10 +111,17 @@ export const EmbedVideo = forwardRef<
 		);
 		const [isPlaying, setIsPlaying] = useState(false);
 		const [userConfirmedStopped, setUserConfirmedStopped] = useState(false);
-		const segmentUploadProgress = useUploadProgress(
-			data.id,
-			data.source.type === "desktopSegments" && (data.hasActiveUpload ?? false),
-		);
+		const trackUploadProgress =
+			data.source.type === "desktopSegments" && (data.hasActiveUpload ?? false);
+		const [segmentUploadProgress, setSegmentUploadProgress] =
+			useState<UploadProgress | null>(
+				trackUploadProgress ? { status: "fetching" } : null,
+			);
+		useEffect(() => {
+			setSegmentUploadProgress(
+				trackUploadProgress ? { status: "fetching" } : null,
+			);
+		}, [trackUploadProgress]);
 		const [subtitleUrl, setSubtitleUrl] = useState<string | null>(null);
 		const [chaptersUrl, setChaptersUrl] = useState<string | null>(null);
 		const captionsDisabled = viewerSettings?.disableCaptions ?? false;
@@ -209,10 +235,8 @@ export const EmbedVideo = forwardRef<
 			videoSrc = `/api/playlist?userId=${data.ownerId}&videoId=${data.id}&videoType=video`;
 		}
 
-		useEffect(() => {
-			if (!videoRef.current) return;
-			const player = videoRef.current;
-			const handleLoadedMetadata = () => {
+		const handleLoadedMetadata = useCallback(
+			(player: HTMLVideoElement) => {
 				setLongestDuration(player.duration);
 
 				// Once only. HLS level switches and source swaps fire this again, and
@@ -228,18 +252,25 @@ export const EmbedVideo = forwardRef<
 				} catch (error) {
 					console.warn("Failed to seek embed to start time", error);
 				}
-			};
+			},
+			[startTime],
+		);
 
-			if (player.readyState >= 1) {
-				handleLoadedMetadata();
-			} else {
-				player.addEventListener("loadedmetadata", handleLoadedMetadata);
-			}
-
-			return () => {
-				player.removeEventListener("loadedmetadata", handleLoadedMetadata);
+		useEffect(() => {
+			const container = playerContainerRef.current;
+			if (!container) return;
+			let currentPlayer: HTMLVideoElement | null = null;
+			const syncMetadata = () => {
+				const player = container.querySelector("video");
+				if (player === currentPlayer) return;
+				currentPlayer = player;
+				if (player && player.readyState >= 1) handleLoadedMetadata(player);
 			};
-		}, [startTime]);
+			const observer = new MutationObserver(syncMetadata);
+			observer.observe(container, { childList: true, subtree: true });
+			syncMetadata();
+			return () => observer.disconnect();
+		}, [handleLoadedMetadata]);
 
 		return (
 			<>
@@ -249,6 +280,11 @@ export const EmbedVideo = forwardRef<
 					onPlayCapture={() => setIsPlaying(true)}
 					onPauseCapture={() => setIsPlaying(false)}
 					onEndedCapture={() => setIsPlaying(false)}
+					onLoadedMetadataCapture={(event) => {
+						if (event.target instanceof HTMLVideoElement) {
+							handleLoadedMetadata(event.target);
+						}
+					}}
 				>
 					{isActivelyRecording ? (
 						<RecordingInProgressOverlay
@@ -270,8 +306,10 @@ export const EmbedVideo = forwardRef<
 							captionsSrc={captionsDisabled ? "" : subtitleUrl || ""}
 							videoRef={videoRef}
 							autoplay={autoplay}
+							defaultPlaybackSpeed={defaultPlaybackSpeed}
 							enableCrossOrigin={enableCrossOrigin}
 							hasActiveUpload={data.hasActiveUpload}
+							callToAction={callToAction}
 						/>
 					) : (
 						<HLSVideoPlayer
@@ -284,8 +322,10 @@ export const EmbedVideo = forwardRef<
 							captionsSrc={captionsDisabled ? "" : subtitleUrl || ""}
 							videoRef={videoRef}
 							autoplay={autoplay}
+							defaultPlaybackSpeed={defaultPlaybackSpeed}
 							hasActiveUpload={data.hasActiveUpload}
 							isLiveSegments={isSegmentsSource}
+							callToAction={callToAction}
 						/>
 					)}
 				</div>
@@ -305,6 +345,7 @@ export const EmbedVideo = forwardRef<
 										{ownerName && (
 											<Avatar
 												name={ownerName}
+												imageUrl={ownerImageUrl}
 												className="hidden flex-shrink-0 xs:flex xs:size-10"
 												letterClass="xs:text-base font-medium"
 											/>
@@ -331,7 +372,7 @@ export const EmbedVideo = forwardRef<
 													<>
 														<span className="text-xs text-gray-400">•</span>
 														<p className="text-xs text-gray-300 sm:text-sm">
-															{formatTime(longestDuration)}
+															{formatPlayerTime(longestDuration)}
 														</p>
 													</>
 												)}
@@ -339,26 +380,51 @@ export const EmbedVideo = forwardRef<
 										</div>
 									</div>
 								</motion.div>
-								<motion.button
-									initial={{ opacity: 0, y: 10 }}
-									animate={{ opacity: 1, y: 0 }}
-									exit={{ opacity: 0, y: 10 }}
-									transition={{ duration: 0.3, delay: 0.1 }}
-									onClick={(e) => {
-										e.stopPropagation();
-										window.open("https://cap.so", "_blank");
-									}}
-									className="hidden z-10 gap-2 items-center px-3 py-2 text-sm rounded-full border backdrop-blur-sm transition-colors duration-200 sm:flex border-white/10 w-fit text-white/80 hover:text-white bg-black/50"
-									aria-label="Powered by Cap"
-								>
-									<span className="text-xs md:text-sm text-white/80">
-										Powered by
-									</span>
-									<Logo className="w-auto h-4" white={true} />
-								</motion.button>
+								{branding?.type === "custom" ? (
+									<motion.div
+										initial={{ opacity: 0, y: 10 }}
+										animate={{ opacity: 1, y: 0 }}
+										exit={{ opacity: 0, y: 10 }}
+										transition={{ duration: 0.3, delay: 0.1 }}
+										className="w-fit rounded-lg border border-white/10 bg-black/50 px-3 py-2 backdrop-blur-sm"
+									>
+										<Image
+											src={branding.imageUrl}
+											alt={`${branding.name} logo`}
+											width={160}
+											height={32}
+											unoptimized
+											className="h-8 w-auto max-w-40 object-contain"
+										/>
+									</motion.div>
+								) : branding?.type === "cap" ? (
+									<motion.button
+										initial={{ opacity: 0, y: 10 }}
+										animate={{ opacity: 1, y: 0 }}
+										exit={{ opacity: 0, y: 10 }}
+										transition={{ duration: 0.3, delay: 0.1 }}
+										onClick={(e) => {
+											e.stopPropagation();
+											window.open("https://cap.so", "_blank");
+										}}
+										className="hidden z-10 gap-2 items-center px-3 py-2 text-sm rounded-full border backdrop-blur-sm transition-colors duration-200 sm:flex border-white/10 w-fit text-white/80 hover:text-white bg-black/50"
+										aria-label="Powered by Cap"
+									>
+										<span className="text-xs md:text-sm text-white/80">
+											Powered by
+										</span>
+										<Logo className="w-auto h-4" white={true} />
+									</motion.button>
+								) : null}
 							</div>
 						)}
 					</AnimatePresence>
+				)}
+				{trackUploadProgress && (
+					<UploadProgressTracker
+						videoId={data.id}
+						onChange={setSegmentUploadProgress}
+					/>
 				)}
 			</>
 		);

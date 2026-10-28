@@ -7,6 +7,7 @@ import {
 	faExclamationCircle,
 } from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { captureException } from "@sentry/nextjs";
 import { AnimatePresence, motion } from "framer-motion";
 import Cookies from "js-cookie";
 import { LucideArrowUpRight } from "lucide-react";
@@ -28,6 +29,10 @@ import { getOrganizationSSOData } from "@/actions/organization/get-organization-
 import { trackEvent } from "@/app/utils/analytics";
 import { usePublicEnv } from "@/utils/public-env";
 import { getEmailCodeCooldownSeconds, requestEmailCode } from "../auth-email";
+import {
+	clearOnboardingNextPath,
+	rememberOnboardingNextPath,
+} from "../onboarding-next";
 import { getSafeNextPath } from "../safe-next";
 import { SsoErrorNotice } from "../sso-error-notice";
 
@@ -68,6 +73,12 @@ export function SignupForm() {
 	);
 
 	useEffect(() => {
+		const nextPath = getNextPath();
+		if (nextPath) rememberOnboardingNextPath(nextPath);
+		else clearOnboardingNextPath();
+	}, [getNextPath]);
+
+	useEffect(() => {
 		signupFormMounted.current = true;
 		return () => {
 			signupFormMounted.current = false;
@@ -92,6 +103,8 @@ export function SignupForm() {
 				);
 			} else if (error === "SsoMissingProfileAttributes") {
 				setShowOrgInput(true);
+				return;
+			} else if (error === "SignupBlocked") {
 				return;
 			} else if (error === "SsoSessionExpired") {
 				setShowOrgInput(true);
@@ -157,6 +170,13 @@ export function SignupForm() {
 		});
 		signIn("google", {
 			...(nextPath ? { callbackUrl: nextPath } : {}),
+		}).catch((error) => {
+			captureException(error, {
+				tags: { auth_provider: "google", auth_surface: "signup" },
+			});
+			toast.error(
+				"Could not start sign-in. Check your connection and try again.",
+			);
 		});
 	};
 

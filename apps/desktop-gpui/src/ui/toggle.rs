@@ -6,9 +6,11 @@
 
 use gpui::{
     App, ClickEvent, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels,
-    RenderOnce, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 
+use super::keyboard_nav;
 use crate::theme::Theme;
 
 /// `cva` sizes. `lg` is `w-14 h-7 p-0.75` with a `size-6` thumb; no window
@@ -22,22 +24,28 @@ pub enum ToggleSize {
     Md,
     /// `w-14 h-7 p-0.75`, `size-6` thumb.
     Lg,
+    /// The system's mini switch, measured from macOS's own in a grouped
+    /// settings form (`scripts/glass-reference/gallery.swift`): a 36 x 16
+    /// track and a 22 x 14 capsule knob.
+    Mini,
 }
 
 impl ToggleSize {
     fn track(self) -> (Pixels, Pixels, Pixels) {
         match self {
-            ToggleSize::Sm => (px(36.), px(20.), px(2.)),
+            ToggleSize::Sm => (px(34.), px(20.), px(2.)),
             ToggleSize::Md => (px(44.), px(24.), px(2.)),
             ToggleSize::Lg => (px(56.), px(28.), px(3.)),
+            ToggleSize::Mini => (px(36.), px(16.), px(1.)),
         }
     }
 
-    fn thumb(self) -> Pixels {
+    fn thumb(self) -> (Pixels, Pixels) {
         match self {
-            ToggleSize::Sm => px(16.),
-            ToggleSize::Md => px(20.),
-            ToggleSize::Lg => px(24.),
+            ToggleSize::Sm => (px(16.), px(16.)),
+            ToggleSize::Md => (px(20.), px(20.)),
+            ToggleSize::Lg => (px(24.), px(24.)),
+            ToggleSize::Mini => (px(22.), px(14.)),
         }
     }
 }
@@ -54,20 +62,22 @@ pub struct Toggle {
     /// `bg-white` -- the thumb is white on every surface.
     thumb: Hsla,
     disabled: bool,
+    label: Option<SharedString>,
     on_click: Option<crate::ui::button::ClickHandler>,
 }
 
 impl Toggle {
-    /// The plain Radix track: `bg-gray-6`, checked `bg-blue-500`.
+    /// The editor track: `ed-ctl-active` off, `ed-accent` on, white knob.
     pub fn plain(theme: &Theme, id: impl Into<ElementId>, checked: bool) -> Self {
         Self {
             id: id.into(),
             checked,
-            size: ToggleSize::Md,
-            off_fill: Hsla::from(theme.gray_6),
-            on_fill: Hsla::from(theme.blue_500),
+            size: ToggleSize::Sm,
+            off_fill: Hsla::from(theme.editor.ctl_active),
+            on_fill: Hsla::from(theme.editor.accent),
             thumb: gpui::white(),
             disabled: false,
+            label: None,
             on_click: None,
         }
     }
@@ -78,11 +88,14 @@ impl Toggle {
     /// bevel the same rule adds has no gpui equivalent (README deviation).
     pub fn settings(theme: &Theme, id: impl Into<ElementId>, checked: bool) -> Self {
         Self {
-            size: ToggleSize::Sm,
-            off_fill: theme
-                .material
-                .map(|material| Hsla::from(material.control_fill))
-                .unwrap_or_else(|| Hsla::from(theme.gray_6)),
+            size: ToggleSize::Mini,
+            // The material's control fill is near-white in light mode, so an
+            // off toggle read as a blank pill on the white settings cards.
+            off_fill: if theme.is_dark() {
+                gpui::hsla(0., 0., 1., 0.16)
+            } else {
+                gpui::hsla(0., 0., 0., 0.13)
+            },
             on_fill: gpui::rgb(Theme::SETTINGS_ACCENT).into(),
             ..Self::plain(theme, id, checked)
         }
@@ -104,12 +117,16 @@ impl Toggle {
         self
     }
 
-    /// `data-disabled:bg-gray-3`.
     pub fn disabled(mut self, theme: &Theme, disabled: bool) -> Self {
         self.disabled = disabled;
         if disabled && !self.checked {
-            self.off_fill = Hsla::from(theme.gray_3);
+            self.off_fill = Hsla::from(theme.editor.ctl);
         }
+        self
+    }
+
+    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.label = Some(label.into());
         self
     }
 
@@ -123,7 +140,7 @@ impl Toggle {
 }
 
 impl RenderOnce for Toggle {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let Toggle {
             id,
             checked,
@@ -132,12 +149,24 @@ impl RenderOnce for Toggle {
             on_fill,
             thumb,
             disabled,
+            label,
             on_click,
         } = self;
         let (width, height, padding) = size.track();
 
         div()
             .id(id)
+            .when(
+                keyboard_nav::active(window, cx) && !disabled,
+                keyboard_nav::stop,
+            )
+            .role(gpui::Role::Switch)
+            .aria_toggled(if checked {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+            .when_some(label, |this, label| this.aria_label(label))
             .w(width)
             .h(height)
             .p(padding)
@@ -148,8 +177,23 @@ impl RenderOnce for Toggle {
             // `data-checked:translate-x-[calc(100%)]` on the thumb -- the same
             // end position a flex justification reaches, without a transform.
             .when(checked, |this| this.justify_end())
+            .when(!disabled, |this| this.cursor_pointer())
             .bg(if checked { on_fill } else { off_fill })
-            .child(div().size(size.thumb()).rounded_full().bg(thumb))
+            .child({
+                let (thumb_width, thumb_height) = size.thumb();
+                div()
+                    .w(thumb_width)
+                    .h(thumb_height)
+                    .rounded_full()
+                    .bg(thumb)
+                    .shadow(vec![gpui::BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.18),
+                        offset: gpui::point(px(0.), px(0.5)),
+                        blur_radius: px(1.5),
+                        spread_radius: px(0.),
+                        inset: false,
+                    }])
+            })
             .when_some(on_click.filter(|_| !disabled), |this, handler| {
                 this.on_click(move |event, window, cx| handler(event, window, cx))
             })

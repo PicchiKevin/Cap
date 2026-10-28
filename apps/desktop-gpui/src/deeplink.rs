@@ -187,7 +187,7 @@ impl TryFrom<&Url> for DeepLinkAction {
 #[derive(Debug, PartialEq)]
 enum QueuedAction {
     DeepLink(DeepLinkAction),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     Reopen,
 }
 
@@ -195,7 +195,7 @@ impl QueuedAction {
     fn execute(self, cx: &mut App) -> Result<(), String> {
         match self {
             Self::DeepLink(action) => action.execute(cx),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Self::Reopen => {
                 app_windows::handle_dock_reopen(cx);
                 Ok(())
@@ -221,7 +221,7 @@ pub(crate) fn submit_action(action: DeepLinkAction) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn submit_reopen() -> bool {
     channel().0.send(QueuedAction::Reopen).is_ok()
 }
@@ -400,13 +400,14 @@ impl DeepLinkAction {
                         let _ = main.update(cx, |view, _, _| view.finish_deep_link_start(&permit));
                         return;
                     }
-                    let (camera_feed, mic_feed, input_readiness, device_settings) = {
+                    let (camera_feed, mic_feed, mic_meter, input_readiness, device_settings) = {
                         let feeds = Feeds::global(cx);
                         feeds.update(cx, |feeds, cx| feeds.resume_camera_preview(cx));
                         let feeds = feeds.read(cx);
                         (
                             feeds.camera_actor(),
                             feeds.mic_actor(),
+                            feeds.mic_meter(),
                             feeds.input_readiness(),
                             feeds.requested_device_settings(),
                         )
@@ -425,8 +426,10 @@ impl DeepLinkAction {
                                     excluded_windows: Vec::new(),
                                     camera_feed,
                                     mic_feed,
+                                    mic_meter,
                                     #[cfg(target_os = "linux")]
                                     linux_instant_camera: None,
+                                    start_gate: None,
                                 },
                                 permit.clone(),
                                 cx,
@@ -512,6 +515,7 @@ impl DeepLinkAction {
                     cap_project::BackgroundBlurMode::Off => crate::store::BlurMode::Off,
                     cap_project::BackgroundBlurMode::Light => crate::store::BlurMode::Light,
                     cap_project::BackgroundBlurMode::Heavy => crate::store::BlurMode::Heavy,
+                    cap_project::BackgroundBlurMode::Remove => crate::store::BlurMode::Remove,
                 };
                 crate::store::update(|persisted| {
                     persisted.camera_window = Some(crate::store::CameraWindowState {
@@ -536,6 +540,11 @@ impl DeepLinkAction {
             DeepLinkAction::OpenEditor { project_path } => {
                 use cap_project::{RecordingMeta, RecordingMetaInner, StudioRecordingStatus};
 
+                if crate::library::is_screenshot_bundle(&project_path) {
+                    cx.defer(move |cx| app_windows::open_screenshot_editor(project_path, cx));
+                    return Ok(());
+                }
+
                 let meta =
                     RecordingMeta::load_for_project(&project_path).map_err(|v| v.to_string())?;
                 match &meta.inner {
@@ -554,7 +563,7 @@ impl DeepLinkAction {
                     RecordingMetaInner::Instant(_) => {
                         let mp4_path = project_path.join("content/output.mp4");
                         if mp4_path.exists() && mp4_path.is_file() {
-                            library::open_path(&mp4_path);
+                            library::open_with_system(&mp4_path, cx);
                             app_windows::hide_main_window(cx);
                         }
                     }
@@ -653,7 +662,7 @@ mod tests {
         for action in &expected {
             submit_action(action.clone());
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert!(submit_reopen());
         for action in expected {
             assert_eq!(
@@ -661,7 +670,7 @@ mod tests {
                 QueuedAction::DeepLink(action)
             );
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert_eq!(channel().1.try_recv().unwrap(), QueuedAction::Reopen);
         assert!(channel().1.is_empty());
     }

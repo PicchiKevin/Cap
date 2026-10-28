@@ -500,11 +500,101 @@ const sendDriveRequest = (
 		catch: (cause) => new Storage.StorageError({ cause }),
 	});
 
+const DRIVE_RATE_LIMIT_RETRIES = 4;
+const DRIVE_RATE_LIMIT_BASE_DELAY_MS = 1_000;
+const DRIVE_RATE_LIMIT_MAX_DELAY_MS = 16_000;
+// Callers such as the source commit give each storage call 60 s, so every retry must still fit inside it.
+const DRIVE_RATE_LIMIT_TOTAL_DELAY_MS = 30_000;
+const DRIVE_RATE_LIMIT_REASONS = new Set([
+	"userRateLimitExceeded",
+	"rateLimitExceeded",
+]);
+
+// Drive rejects these before doing any work, so every method can be retried; Google asks for exponential backoff.
+export const isGoogleDriveRateLimited = async (response: Response) => {
+	if (response.status === 429) return true;
+	if (response.status !== 403) return false;
+	const body: unknown = await response
+		.clone()
+		.json()
+		.catch(() => null);
+	const errors =
+		typeof body === "object" && body !== null && "error" in body
+			? (body.error as { errors?: { reason?: unknown }[] }).errors
+			: undefined;
+	return (
+		Array.isArray(errors) &&
+		errors.some(
+			(error) =>
+				typeof error?.reason === "string" &&
+				DRIVE_RATE_LIMIT_REASONS.has(error.reason),
+		)
+	);
+};
+
+const getRetryAfterMs = (retryAfter: string | null, now: number) => {
+	if (!retryAfter) return undefined;
+	if (/^\d+$/.test(retryAfter.trim())) return Number(retryAfter) * 1_000;
+	const date = Date.parse(retryAfter);
+	return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+};
+
+export const getGoogleDriveRateLimitDelayMs = (
+	attempt: number,
+	retryAfter: string | null,
+	random = Math.random,
+	now = Date.now(),
+) => {
+	const requested =
+		getRetryAfterMs(retryAfter, now) ??
+		DRIVE_RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt + random() * 1_000;
+	return Math.min(Math.round(requested), DRIVE_RATE_LIMIT_MAX_DELAY_MS);
+};
+
 const driveFetch = (
 	config: GoogleDriveIntegrationConfig,
 	url: string,
 	init?: RequestInit,
 	tokenStore?: GoogleDriveTokenStore,
+) =>
+	Effect.gen(function* () {
+		let response = yield* authorizedDriveFetch(config, url, init, tokenStore);
+		let waitedMs = 0;
+		for (let attempt = 0; attempt < DRIVE_RATE_LIMIT_RETRIES; attempt++) {
+			const limited = yield* Effect.promise(() =>
+				isGoogleDriveRateLimited(response),
+			);
+			if (!limited) break;
+			const delayMs = getGoogleDriveRateLimitDelayMs(
+				attempt,
+				response.headers.get("retry-after"),
+			);
+			if (waitedMs + delayMs > DRIVE_RATE_LIMIT_TOTAL_DELAY_MS) break;
+			waitedMs += delayMs;
+			console.warn(
+				JSON.stringify({
+					event: "google_drive_rate_limited",
+					status: response.status,
+					method: init?.method ?? "GET",
+					attempt: attempt + 1,
+					delayMs,
+				}),
+			);
+			yield* Effect.sleep(delayMs);
+			response = yield* authorizedDriveFetch(config, url, init, tokenStore);
+		}
+		yield* Effect.tryPromise({
+			try: () => assertDriveResponse(response),
+			catch: (cause) => new Storage.StorageError({ cause }),
+		});
+		return response;
+	});
+
+const authorizedDriveFetch = (
+	config: GoogleDriveIntegrationConfig,
+	url: string,
+	init: RequestInit | undefined,
+	tokenStore: GoogleDriveTokenStore | undefined,
 ) =>
 	Effect.gen(function* () {
 		const accessToken = yield* getCachedGoogleDriveAccessToken(
@@ -521,10 +611,6 @@ const driveFetch = (
 			);
 			response = yield* sendDriveRequest(refreshedAccessToken, url, init);
 		}
-		yield* Effect.tryPromise({
-			try: () => assertDriveResponse(response),
-			catch: (cause) => new Storage.StorageError({ cause }),
-		});
 		return response;
 	});
 
@@ -1373,6 +1459,7 @@ export const getGoogleDriveObjectResponse = (
 	fileId: string,
 	range?: string | null,
 	tokenStore?: GoogleDriveTokenStore,
+	signal?: AbortSignal,
 ) =>
 	Effect.gen(function* () {
 		const headers: Record<string, string> = {};
@@ -1382,7 +1469,7 @@ export const getGoogleDriveObjectResponse = (
 			appendSharedDriveCreateParams(
 				`${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?alt=media`,
 			),
-			{ headers },
+			{ headers, signal },
 			tokenStore,
 		);
 
@@ -1393,6 +1480,65 @@ export type GoogleDriveRecordingRead = {
 	objectIdentity: string;
 	signal?: AbortSignal;
 };
+
+export const getGoogleDriveRecordingDownload = (
+	config: GoogleDriveIntegrationConfig,
+	fileId: string,
+	verification: { objectIdentity?: string; signal?: AbortSignal },
+	tokenStore?: GoogleDriveTokenStore,
+) =>
+	Effect.gen(function* () {
+		const metadata = yield* getGoogleDriveFileMetadata(
+			config,
+			fileId,
+			tokenStore,
+			verification.signal,
+		);
+		const identity = getRecordingObjectIdentity(
+			{
+				ETag: metadata.version
+					? `"${metadata.id}:${metadata.version}"`
+					: undefined,
+				RecordingContentETag: getGoogleDriveRecordingIdentity(metadata),
+			},
+			verification.objectIdentity,
+		);
+		if (
+			metadata.id !== fileId ||
+			(verification.objectIdentity && identity !== verification.objectIdentity)
+		) {
+			return yield* Effect.fail(
+				new Storage.StorageError({
+					cause: new RecordingObjectReadError(412, "Recording object changed"),
+				}),
+			);
+		}
+		const size = getUsableGoogleDriveFileSize(metadata);
+		if (
+			!identity ||
+			!size ||
+			!metadata.headRevisionId ||
+			!metadata.sha256Checksum?.match(/^[a-fA-F0-9]{64}$/)
+		) {
+			return yield* Effect.fail(
+				new Storage.StorageError({
+					cause: new RecordingObjectReadError(
+						503,
+						"Recording revision identity is unavailable",
+					),
+				}),
+			);
+		}
+		const token = yield* loadGoogleDriveAccessToken(config, false, tokenStore);
+		return {
+			version: 1 as const,
+			url: `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}/revisions/${encodeURIComponent(metadata.headRevisionId)}?alt=media`,
+			authorization: `Bearer ${token.accessToken}`,
+			objectIdentity: identity,
+			size,
+			sha256: metadata.sha256Checksum.toLowerCase(),
+		};
+	});
 
 export const getGoogleDriveRecordingResponse = (
 	config: GoogleDriveIntegrationConfig,

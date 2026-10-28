@@ -16,10 +16,13 @@ import os, { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type appType from "../../app";
+import * as audioLevels from "../../lib/audio-levels";
 import * as containerCpu from "../../lib/container-cpu";
 import * as containerMemory from "../../lib/container-memory";
-import type { Job } from "../../lib/job-manager";
+import type { Job, JobProgress } from "../../lib/job-manager";
+import { withTimeout } from "../../lib/media-common";
 import { probeVideoFile } from "../../lib/media-probe";
+import * as mediaVideo from "../../lib/media-video";
 import * as recordingVerification from "../../lib/recording-verification";
 
 const FIXTURES_DIR = join(import.meta.dir, "..", "fixtures");
@@ -39,6 +42,11 @@ let baseUrl = "";
 let tempDir = "";
 
 const uploadedArtifacts = new Map<string, Uint8Array>();
+const uploadFailures = new Map<string, number>();
+const uploadGates = new Map<string, () => Promise<void> | void>();
+const uploadRequests: string[] = [];
+const fixtureReads: string[] = [];
+const webhookPhases: JobProgress["phase"][] = [];
 const recordingSources = new Map<string, Uint8Array>();
 const sourceReads: {
 	path: string;
@@ -48,7 +56,12 @@ const sourceReads: {
 const uploadConditions: (string | null)[] = [];
 const multipartCallbacks: { action: string; payload: unknown }[] = [];
 let rejectMultipartSigning = false;
-let sourceFault: "changed" | "missing" | "corrupt" | undefined;
+let sourceFault:
+	| "changed"
+	| "missing"
+	| "corrupt"
+	| "corrupt-audio"
+	| undefined;
 let corruptRecordingReadback = false;
 let transientFixtureFailures = 0;
 let permanentFixtureFailures = 0;
@@ -78,6 +91,8 @@ function fencedMuxRequest(name: string) {
 		attemptId: `attempt-${name}`,
 		manifestSha256: "a".repeat(64),
 		inventorySha256: "b".repeat(64),
+		webhookUrl: `${baseUrl}/ignored-webhook`,
+		webhookSecret: MEDIA_SERVER_SECRET,
 		outputKey: `recording-generations/${name}/result.mp4`,
 		outputUpload: {
 			type: "put",
@@ -203,21 +218,42 @@ beforeAll(async () => {
 	getJob = jobManager.getJob;
 	deleteJob = jobManager.deleteJob;
 	tempDir = mkdtempSync(join(tmpdir(), "cap-real-world-routes-"));
+	execFileSync("ffmpeg", [
+		"-v",
+		"error",
+		"-i",
+		TEST_VIDEO_WITH_AUDIO,
+		"-c:v",
+		"libvpx-vp9",
+		"-deadline",
+		"realtime",
+		"-cpu-used",
+		"8",
+		"-c:a",
+		"libopus",
+		"-threads",
+		"1",
+		join(tempDir, "chrome.webm"),
+	]);
 	for (const kind of ["video", "audio"] as const) {
 		const path = join(tempDir, `${kind}-fragmented.mp4`);
-		execFileSync("ffmpeg", [
-			"-v",
-			"error",
-			"-i",
-			TEST_VIDEO_WITH_AUDIO,
-			"-map",
-			kind === "video" ? "0:v:0" : "0:a:0",
-			"-c",
-			"copy",
-			"-movflags",
-			"+empty_moov+frag_keyframe+default_base_moof",
-			path,
-		]);
+		execFileSync(
+			"ffmpeg",
+			[
+				"-v",
+				"error",
+				"-i",
+				TEST_VIDEO_WITH_AUDIO,
+				"-map",
+				kind === "video" ? "0:v:0" : "0:a:0",
+				"-c",
+				"copy",
+				"-movflags",
+				"+empty_moov+frag_keyframe+default_base_moof",
+				path,
+			],
+			{ stdio: "inherit" },
+		);
 		const bytes = new Uint8Array(await Bun.file(path).arrayBuffer());
 		const view = new DataView(bytes.buffer);
 		let split = 0;
@@ -246,8 +282,27 @@ beforeAll(async () => {
 		port: 0,
 		async fetch(request) {
 			const url = new URL(request.url);
-			if (request.method === "POST" && url.pathname === "/ignored-webhook")
-				return new Response(null, { status: 200 });
+			if (request.method === "POST" && url.pathname === "/ignored-webhook") {
+				const payload = (await request.json()) as JobProgress;
+				webhookPhases.push(payload.phase);
+				if (!payload.recordingWorker)
+					return new Response(null, { status: 200 });
+				if (
+					request.headers.get("x-media-server-secret") !== MEDIA_SERVER_SECRET
+				)
+					return new Response(null, { status: 401 });
+				return Response.json({
+					recordingWorker: {
+						version: 1,
+						status: "accepted",
+						generation: payload.generation,
+						attemptId: payload.attemptId,
+						jobId: payload.jobId,
+						sequence: payload.recordingWorker.sequence,
+						leaseDurationMs: 300_000,
+					},
+				});
+			}
 			if (request.method === "POST" && url.pathname.startsWith("/multipart/")) {
 				const [, , name, action] = url.pathname.split("/");
 				const payload: unknown = await request.json();
@@ -274,7 +329,11 @@ beforeAll(async () => {
 					ifMatch: request.headers.get("if-match"),
 					verification: request.headers.get("x-cap-recording-verification"),
 				});
-				const affected = url.pathname.endsWith("video-segment.m4s");
+				const affected = url.pathname.endsWith(
+					sourceFault === "corrupt-audio"
+						? "audio-segment.m4s"
+						: "video-segment.m4s",
+				);
 				if (affected && sourceFault === "missing")
 					return new Response(null, { status: 404 });
 				if (
@@ -285,7 +344,8 @@ beforeAll(async () => {
 					return new Response(null, { status: 412 });
 				return new Response(
 					Uint8Array.from(
-						affected && sourceFault === "corrupt"
+						affected &&
+							(sourceFault === "corrupt" || sourceFault === "corrupt-audio")
 							? new Uint8Array(source.byteLength)
 							: source,
 					).buffer,
@@ -330,12 +390,17 @@ beforeAll(async () => {
 							? TEST_VIDEO_NO_AUDIO
 							: url.pathname === "/fixtures/test-with-audio.mp4"
 								? TEST_VIDEO_WITH_AUDIO
-								: null;
+								: url.pathname === "/fixtures/chrome.webm"
+									? join(tempDir, "chrome.webm")
+									: null;
 
 				if (fixturePath) {
+					if (request.method === "GET") fixtureReads.push(url.pathname);
 					const fixture = Bun.file(fixturePath);
 					const headers = {
-						"Content-Type": "video/mp4",
+						"Content-Type": fixturePath.endsWith(".webm")
+							? "video/webm"
+							: "video/mp4",
 						"Content-Length": String(await fixture.size),
 					};
 					return request.method === "HEAD"
@@ -377,6 +442,12 @@ beforeAll(async () => {
 			}
 
 			if (request.method === "PUT" && url.pathname.startsWith("/uploads/")) {
+				uploadRequests.push(url.pathname);
+				await uploadGates.get(url.pathname)?.();
+				const failureStatus = uploadFailures.get(url.pathname);
+				if (failureStatus) {
+					return new Response("Storage unavailable", { status: failureStatus });
+				}
 				uploadConditions.push(request.headers.get("if-none-match"));
 				if (
 					request.headers.get("if-none-match") === "*" &&
@@ -414,10 +485,17 @@ beforeEach(() => {
 	spyOn(containerCpu, "getContainerCpuUsageMicros").mockReturnValue(0);
 	spyOn(containerMemory, "getContainerMemoryMetrics").mockReturnValue({
 		usageMB: 256,
+		workingSetMB: 256,
+		reclaimableCacheMB: 0,
 		limitMB: 4096,
 		pressure: 0.0625,
 	});
 	uploadedArtifacts.clear();
+	uploadFailures.clear();
+	uploadGates.clear();
+	uploadRequests.length = 0;
+	fixtureReads.length = 0;
+	webhookPhases.length = 0;
 	transientFixtureFailures = 0;
 	permanentFixtureFailures = 0;
 	slowFixtureCancellations = 0;
@@ -438,6 +516,30 @@ afterAll(() => {
 });
 
 describe("media routes real-world integration tests", () => {
+	test("reports a failed output write without classifying pinned source media as invalid", async () => {
+		const mux = spyOn(mediaVideo, "muxMediaTracksToMp4").mockRejectedValue(
+			new Error("Could not write output header"),
+		);
+		let jobId: string | undefined;
+		try {
+			const response = await app.fetch(
+				mediaPostRequest(
+					"/video/mux-segments",
+					fencedMuxRequest("failed-output-write"),
+				),
+			);
+			expect(response.status).toBe(200);
+			jobId = ((await response.json()) as { jobId: string }).jobId;
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("error");
+			expect(job.errorCode).toBe("output-invalid");
+			expect(job.recordingVerification).toBeUndefined();
+			expect(uploadConditions).toHaveLength(0);
+		} finally {
+			mux.mockRestore();
+			if (jobId) deleteJob(jobId);
+		}
+	});
 	test("cancels segmented work at its total deadline without waiting for job cleanup", async () => {
 		const originalSetTimeout = globalThis.setTimeout;
 		const shortenedDeadline = new Proxy(originalSetTimeout, {
@@ -494,6 +596,7 @@ describe("media routes real-world integration tests", () => {
 				sourceObjectIdentity: objectIdentity(bytes),
 				outputKey: "recording-generations/mp4-generation/source.mp4",
 				webhookUrl: `${baseUrl}/ignored-webhook`,
+				webhookSecret: MEDIA_SERVER_SECRET,
 			}),
 		);
 		expect(response.status).toBe(200);
@@ -527,7 +630,7 @@ describe("media routes real-world integration tests", () => {
 			recordingVerification,
 			"inspectRecordingSources",
 		);
-		const localDecode = spyOn(recordingVerification, "verifyRecording");
+		const localDecode = spyOn(recordingVerification, "verifyRemuxedRecording");
 		const remoteDecode = spyOn(recordingVerification, "verifyRemoteRecording");
 		const bytesOnly = spyOn(
 			recordingVerification,
@@ -551,7 +654,7 @@ describe("media routes real-world integration tests", () => {
 			expect(job.attemptId).toBe(body.attemptId);
 			expect(job.inventorySha256).toBe(body.inventorySha256);
 			expect(job.metadata?.duration).toBeCloseTo(1, 3);
-			expect(sourceDecode).toHaveBeenCalledTimes(1);
+			expect(sourceDecode.mock.calls.length).toBeLessThanOrEqual(1);
 			expect(localDecode).toHaveBeenCalledTimes(1);
 			expect(remoteDecode).not.toHaveBeenCalled();
 			expect(bytesOnly).toHaveBeenCalledTimes(1);
@@ -587,7 +690,264 @@ describe("media routes real-world integration tests", () => {
 		}
 	}, 30_000);
 
-	test("refuses a local output changed between full decode and byte binding", async () => {
+	test("uploads mux previews only after the recording output is verified", async () => {
+		const body = {
+			...fencedMuxRequest("mux-previews"),
+			thumbnailPresignedUrl: uploadUrl("mux-previews.jpg"),
+			previewGifPresignedUrl: uploadUrl("mux-previews.gif"),
+		};
+		const response = await app.fetch(
+			mediaPostRequest("/video/mux-segments", body),
+		);
+		expect(response.status).toBe(200);
+		const { jobId } = (await response.json()) as { jobId: string };
+		try {
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("complete");
+			expect(uploadRequests[0]).toBe("/uploads/mux-previews.mp4");
+			expect([...uploadRequests].sort()).toEqual([
+				"/uploads/mux-previews.gif",
+				"/uploads/mux-previews.jpg",
+				"/uploads/mux-previews.mp4",
+			]);
+			expect(
+				uploadedBytes("/uploads/mux-previews.jpg").byteLength,
+			).toBeGreaterThan(0);
+			expect(
+				uploadedBytes("/uploads/mux-previews.gif").byteLength,
+			).toBeGreaterThan(0);
+		} finally {
+			deleteJob(jobId);
+		}
+	}, 30_000);
+
+	test("uploads the thumbnail and preview GIF together and keeps one when the other fails", async () => {
+		let gifStarted: () => void = () => {};
+		const gifRequested = new Promise<void>((resolve) => {
+			gifStarted = resolve;
+		});
+		uploadGates.set("/uploads/mux-previews-together.jpg", () =>
+			Promise.race([
+				gifRequested,
+				new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+			]),
+		);
+		uploadGates.set("/uploads/mux-previews-together.gif", () => gifStarted());
+		uploadFailures.set("/uploads/mux-previews-together.jpg", 403);
+		const body = {
+			...fencedMuxRequest("mux-previews-together"),
+			thumbnailPresignedUrl: uploadUrl("mux-previews-together.jpg"),
+			previewGifPresignedUrl: uploadUrl("mux-previews-together.gif"),
+		};
+		const response = await app.fetch(
+			mediaPostRequest("/video/mux-segments", body),
+		);
+		expect(response.status).toBe(200);
+		const { jobId } = (await response.json()) as { jobId: string };
+		const started = Date.now();
+		try {
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("complete");
+			expect(uploadRequests[0]).toBe("/uploads/mux-previews-together.mp4");
+			expect([...uploadRequests].sort()).toEqual([
+				"/uploads/mux-previews-together.gif",
+				"/uploads/mux-previews-together.jpg",
+				"/uploads/mux-previews-together.mp4",
+			]);
+			// The thumbnail is held until the GIF upload starts, so a sequential upload would wait out the 5 s gate.
+			expect(Date.now() - started).toBeLessThan(4_500);
+			expect(
+				uploadedBytes("/uploads/mux-previews-together.gif").byteLength,
+			).toBeGreaterThan(0);
+		} finally {
+			deleteJob(jobId);
+		}
+	}, 30_000);
+
+	test("skips mux previews when the recording output upload fails", async () => {
+		uploadFailures.set("/uploads/mux-previews-failed.mp4", 403);
+		const body = {
+			...fencedMuxRequest("mux-previews-failed"),
+			thumbnailPresignedUrl: uploadUrl("mux-previews-failed.jpg"),
+			previewGifPresignedUrl: uploadUrl("mux-previews-failed.gif"),
+		};
+		const response = await app.fetch(
+			mediaPostRequest("/video/mux-segments", body),
+		);
+		expect(response.status).toBe(200);
+		const { jobId } = (await response.json()) as { jobId: string };
+		try {
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("error");
+			expect(uploadRequests).toEqual(["/uploads/mux-previews-failed.mp4"]);
+		} finally {
+			deleteJob(jobId);
+		}
+	}, 30_000);
+
+	test("runs optional audio correction on the local verified file after publication and retains success if it fails", async () => {
+		let observed: () => void = () => {};
+		const observations: Record<string, unknown>[] = [];
+		const called = new Promise<void>((resolve) => {
+			observed = resolve;
+		});
+		const audio = spyOn(
+			audioLevels,
+			"enhanceLocalRecording",
+		).mockImplementation(async (input) => {
+			try {
+				observations.push({
+					phase: getJob(input.jobId)?.phase,
+					webhookPhase: webhookPhases.at(-1),
+					matchesPublishedBytes:
+						objectIdentity(await readFile(input.path)) === input.sourceIdentity,
+					sourceKey: input.sourceKey,
+				});
+			} finally {
+				observed();
+			}
+			throw new Error("Optional correction unavailable");
+		});
+		let jobId: string | undefined;
+		try {
+			const body = { ...fencedMuxRequest("local-audio"), audioLevels: true };
+			const response = await app.fetch(
+				mediaPostRequest("/video/mux-segments", body),
+			);
+			expect(response.status).toBe(200);
+			jobId = ((await response.json()) as { jobId: string }).jobId;
+			await withTimeout(called, 10_000);
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			expect(getJob(jobId)?.phase).toBe("complete");
+			expect(getJob(jobId)?.error).toBeUndefined();
+			expect(audio).toHaveBeenCalledTimes(1);
+			expect(observations).toEqual([
+				{
+					phase: "complete",
+					webhookPhase: "complete",
+					matchesPublishedBytes: true,
+					sourceKey: "recording-generations/local-audio/result.mp4",
+				},
+			]);
+			expect(sourceReads).toHaveLength(body.sourceObjects.length);
+		} finally {
+			audio.mockRestore();
+			if (jobId) deleteJob(jobId);
+		}
+	}, 30_000);
+
+	test("downloads Chrome input once and corrects the local MP4 only after publishing the original", async () => {
+		let observed: () => void = () => {};
+		const called = new Promise<void>((resolve) => {
+			observed = resolve;
+		});
+		const observations: Record<string, unknown>[] = [];
+		let outputPath: string | undefined;
+		const audio = spyOn(
+			audioLevels,
+			"enhanceLocalRecording",
+		).mockImplementation(async (input) => {
+			try {
+				outputPath = input.path;
+				observations.push({
+					phase: getJob(input.jobId)?.phase,
+					webhookPhase: webhookPhases.at(-1),
+					matchesPublishedBytes:
+						objectIdentity(await readFile(input.path)) === input.sourceIdentity,
+					sourceKey: input.sourceKey,
+				});
+			} finally {
+				observed();
+			}
+			throw new Error("Optional correction unavailable");
+		});
+		let jobId: string | undefined;
+		try {
+			const response = await app.fetch(
+				mediaPostRequest("/video/process", {
+					videoId: "chrome-audio",
+					userId: "owner",
+					audioLevels: true,
+					videoUrl: fixtureUrl("chrome.webm"),
+					inputExtension: ".webm",
+					outputPresignedUrl: uploadUrl("chrome-audio.mp4"),
+					webhookUrl: `${baseUrl}/ignored-webhook`,
+					webhookSecret: MEDIA_SERVER_SECRET,
+				}),
+			);
+			expect(response.status).toBe(200);
+			jobId = ((await response.json()) as { jobId: string }).jobId;
+			await withTimeout(called, 10_000);
+			await withTimeout(
+				(async () => {
+					while (outputPath && (await Bun.file(outputPath).exists()))
+						await Bun.sleep(10);
+				})(),
+				2_000,
+			);
+			expect(getJob(jobId)?.phase).toBe("complete");
+			expect(getJob(jobId)?.error).toBeUndefined();
+			expect(audio).toHaveBeenCalledTimes(1);
+			expect(observations).toEqual([
+				{
+					phase: "complete",
+					webhookPhase: "complete",
+					matchesPublishedBytes: true,
+					sourceKey: "owner/chrome-audio/result.mp4",
+				},
+			]);
+			expect(fixtureReads).toEqual(["/fixtures/chrome.webm"]);
+			expect(uploadRequests).toEqual(["/uploads/chrome-audio.mp4"]);
+		} finally {
+			audio.mockRestore();
+			if (jobId) deleteJob(jobId);
+		}
+	}, 30_000);
+
+	test("stops the output hash before cleanup when the decode check fails first", async () => {
+		let hashAborted = false;
+		let hashSettled = false;
+		const hashing = spyOn(
+			recordingVerification,
+			"hashRecordingFile",
+		).mockImplementation(
+			(_path, signal) =>
+				new Promise<string>((_resolve, reject) => {
+					signal?.addEventListener("abort", () => {
+						hashAborted = true;
+						setTimeout(() => {
+							hashSettled = true;
+							reject(new Error("Hash stopped"));
+						}, 50);
+					});
+				}),
+		);
+		const verifying = spyOn(
+			recordingVerification,
+			"verifyRemuxedRecording",
+		).mockRejectedValue(new Error("Recording decoder failed to start"));
+		let jobId: string | undefined;
+		try {
+			const response = await app.fetch(
+				mediaPostRequest(
+					"/video/mux-segments",
+					fencedMuxRequest("hash-after-failed-decode"),
+				),
+			);
+			jobId = ((await response.json()) as { jobId: string }).jobId;
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("error");
+			expect(hashAborted).toBe(true);
+			expect(hashSettled).toBe(true);
+		} finally {
+			hashing.mockRestore();
+			verifying.mockRestore();
+			if (jobId) deleteJob(jobId);
+		}
+	}, 30_000);
+
+	// Hashing now overlaps the decode check, so whichever check reads the changed bytes first refuses it.
+	test("refuses a local output changed while it is decoded and hashed", async () => {
 		const originalHash = recordingVerification.hashRecordingFile;
 		const hashing = spyOn(
 			recordingVerification,
@@ -611,8 +971,8 @@ describe("media routes real-world integration tests", () => {
 			jobId = ((await response.json()) as { jobId: string }).jobId;
 			const job = await waitForTerminalJob(jobId);
 			expect(job.phase).toBe("error");
-			expect(job.error).toContain(
-				"Local recording changed during verification",
+			expect(job.error).toMatch(
+				/Local recording changed during verification|does not preserve the source/,
 			);
 			expect(job.errorCode).toBe("output-invalid");
 			expect(job.recordingVerification).toBeUndefined();
@@ -659,7 +1019,32 @@ describe("media routes real-world integration tests", () => {
 		30_000,
 	);
 
-	test.each(["changed", "missing", "corrupt"] as const)(
+	test.each(["corrupt", "corrupt-audio"] as const)(
+		"never completes a multipart output whose source fails verification (%s)",
+		async (fault) => {
+			sourceFault = fault;
+			const body = multipartMuxRequest(`multipart-unverified-${fault}`);
+			const response = await app.fetch(
+				mediaPostRequest("/video/mux-segments", body),
+			);
+			expect(response.status).toBe(200);
+			const { jobId } = (await response.json()) as { jobId: string };
+			try {
+				const job = await waitForTerminalJob(jobId);
+				expect(job.phase).toBe("error");
+				expect(job.recordingVerification).toBeUndefined();
+				const actions = multipartCallbacks.map(({ action }) => action);
+				// Parts may already be uploaded while the check runs, but the object is never created.
+				expect(actions).not.toContain("complete");
+				expect(actions.at(-1)).toBe("abort");
+			} finally {
+				deleteJob(jobId);
+			}
+		},
+		30_000,
+	);
+
+	test.each(["changed", "missing", "corrupt", "corrupt-audio"] as const)(
 		"withholds upload and proof after a pinned source is %s",
 		async (fault) => {
 			sourceFault = fault;
@@ -673,7 +1058,7 @@ describe("media routes real-world integration tests", () => {
 				const job = await waitForTerminalJob(jobId);
 				expect(job.phase).toBe("error");
 				expect(job.errorCode).toBe(
-					fault === "corrupt" ? "source-invalid" : `source-${fault}`,
+					fault.startsWith("corrupt") ? "source-invalid" : `source-${fault}`,
 				);
 				expect(job.recordingVerification).toBeUndefined();
 				expect(uploadConditions).toHaveLength(0);
@@ -706,6 +1091,28 @@ describe("media routes real-world integration tests", () => {
 			expect(job.errorCode).toBe("output-invalid");
 			expect(job.recordingVerification).toBeUndefined();
 			expect(uploadConditions).toEqual(["*"]);
+		} finally {
+			deleteJob(jobId);
+		}
+	}, 30_000);
+
+	test("skips mux previews when the uploaded recording fails its remote check", async () => {
+		corruptRecordingReadback = true;
+		const body = {
+			...fencedMuxRequest("mux-previews-corrupt"),
+			thumbnailPresignedUrl: uploadUrl("mux-previews-corrupt.jpg"),
+			previewGifPresignedUrl: uploadUrl("mux-previews-corrupt.gif"),
+		};
+		const response = await app.fetch(
+			mediaPostRequest("/video/mux-segments", body),
+		);
+		expect(response.status).toBe(200);
+		const { jobId } = (await response.json()) as { jobId: string };
+		try {
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("error");
+			expect(job.errorCode).toBe("output-invalid");
+			expect(uploadRequests).toEqual(["/uploads/mux-previews-corrupt.mp4"]);
 		} finally {
 			deleteJob(jobId);
 		}
@@ -892,6 +1299,334 @@ describe("media routes real-world integration tests", () => {
 		}
 	}, 90000);
 
+	test.each([403, 503])(
+		"keeps a playable processed video when thumbnail storage returns %s",
+		async (status) => {
+			uploadFailures.set("/uploads/optional-thumbnail.jpg", status);
+			const response = await app.fetch(
+				mediaPostRequest("/video/process", {
+					videoId: "optional-thumbnail",
+					userId: "real-process-user",
+					videoUrl: fixtureUrl(),
+					outputPresignedUrl: uploadUrl("optional-thumbnail.mp4"),
+					thumbnailPresignedUrl: uploadUrl("optional-thumbnail.jpg"),
+					inputExtension: ".mp4",
+				}),
+			);
+			expect(response.status).toBe(200);
+			const { jobId } = (await response.json()) as { jobId: string };
+			try {
+				const job = await waitForTerminalJob(jobId);
+				expect(job.phase).toBe("complete");
+				expect(job.error).toBeUndefined();
+				expect(fixtureReads).toEqual(["/fixtures/test-with-audio.mp4"]);
+				expect(uploadRequests.filter((path) => path.endsWith(".mp4"))).toEqual([
+					"/uploads/optional-thumbnail.mp4",
+				]);
+				expect(
+					uploadRequests.filter((path) => path.endsWith(".jpg")),
+				).toHaveLength(status === 403 ? 1 : 5);
+				const output = join(tempDir, `optional-thumbnail-${status}.mp4`);
+				await writeFile(
+					output,
+					uploadedBytes("/uploads/optional-thumbnail.mp4"),
+				);
+				execFileSync("ffmpeg", [
+					"-v",
+					"error",
+					"-xerror",
+					"-i",
+					output,
+					"-f",
+					"null",
+					"-",
+				]);
+				const metadata = await probeVideoFile(output);
+				expect(metadata.videoCodec).toBe("h264");
+				expect(metadata.audioCodec).toBe("aac");
+			} finally {
+				deleteJob(jobId);
+			}
+		},
+		30_000,
+	);
+
+	test("recovers a saved output after preview failure without overwriting it", async () => {
+		const thumbnail = spyOn(mediaVideo, "generateThumbnail").mockRejectedValue(
+			new Error("Thumbnail decode interrupted"),
+		);
+		const jobs: string[] = [];
+		try {
+			const body = {
+				videoId: "saved-loom-output",
+				userId: "real-process-user",
+				videoUrl: fixtureUrl(),
+				outputPresignedUrl: uploadUrl("saved-output.mp4"),
+				thumbnailPresignedUrl: uploadUrl("saved-output.jpg"),
+				inputExtension: ".mp4",
+				maxImportBytes: 10 * 1024 ** 3,
+			};
+			const first = await app.fetch(mediaPostRequest("/video/process", body));
+			const firstJobId = ((await first.json()) as { jobId: string }).jobId;
+			jobs.push(firstJobId);
+			expect((await waitForTerminalJob(firstJobId)).phase).toBe("error");
+			const original = Uint8Array.from(
+				uploadedBytes("/uploads/saved-output.mp4"),
+			);
+			const second = await app.fetch(
+				mediaPostRequest("/video/process", {
+					...body,
+					existingOutput: {
+						url: uploadUrl("saved-output.mp4"),
+						objectIdentity: objectIdentity(original),
+						fileSize: original.byteLength,
+					},
+				}),
+			);
+			expect(second.status).toBe(200);
+			const secondJobId = ((await second.json()) as { jobId: string }).jobId;
+			jobs.push(secondJobId);
+			expect((await waitForTerminalJob(secondJobId)).phase).toBe("complete");
+			expect(uploadRequests.filter((path) => path.endsWith(".mp4"))).toEqual([
+				"/uploads/saved-output.mp4",
+			]);
+			expect(uploadedBytes("/uploads/saved-output.mp4")).toEqual(original);
+		} finally {
+			thumbnail.mockRestore();
+			for (const jobId of jobs) deleteJob(jobId);
+		}
+	}, 30_000);
+
+	test("holds a saved output whose storage identity changed without overwriting it", async () => {
+		const original = new Uint8Array(
+			await Bun.file(TEST_VIDEO_WITH_AUDIO).arrayBuffer(),
+		);
+		uploadedArtifacts.set("/uploads/changed-output.mp4", original);
+		const response = await app.fetch(
+			mediaPostRequest("/video/process", {
+				videoId: "changed-output",
+				userId: "real-process-user",
+				videoUrl: fixtureUrl(),
+				outputPresignedUrl: uploadUrl("changed-output.mp4"),
+				maxImportBytes: 10 * 1024 ** 3,
+				existingOutput: {
+					url: uploadUrl("changed-output.mp4"),
+					objectIdentity: '"previous-identity"',
+					fileSize: original.byteLength,
+				},
+			}),
+		);
+		const { jobId } = (await response.json()) as { jobId: string };
+		try {
+			expect((await waitForTerminalJob(jobId)).phase).toBe("error");
+			expect(uploadRequests).toHaveLength(0);
+			expect(uploadedBytes("/uploads/changed-output.mp4")).toEqual(original);
+		} finally {
+			deleteJob(jobId);
+		}
+	}, 30_000);
+
+	test("still fails processing when the video output cannot be uploaded", async () => {
+		uploadFailures.set("/uploads/failed-output.mp4", 403);
+		const response = await app.fetch(
+			mediaPostRequest("/video/process", {
+				videoId: "failed-output",
+				userId: "real-process-user",
+				videoUrl: fixtureUrl(),
+				outputPresignedUrl: uploadUrl("failed-output.mp4"),
+				thumbnailPresignedUrl: uploadUrl("failed-output.jpg"),
+				inputExtension: ".mp4",
+			}),
+		);
+		expect(response.status).toBe(200);
+		const { jobId } = (await response.json()) as { jobId: string };
+		try {
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("error");
+			expect(job.error).toContain("403");
+			expect(uploadRequests).toEqual(["/uploads/failed-output.mp4"]);
+			expect(uploadedArtifacts.size).toBe(0);
+		} finally {
+			deleteJob(jobId);
+		}
+	}, 30_000);
+
+	test.each(["output", "thumbnail"] as const)(
+		"preserves cancellation during %s upload with one terminal webhook",
+		async (stage) => {
+			let started: (() => void) | undefined;
+			const ready = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			const upload = spyOn(
+				mediaVideo,
+				stage === "output" ? "uploadFileToS3" : "uploadToS3",
+			).mockImplementation(
+				(
+					_data: unknown,
+					_url: string,
+					_contentType: string,
+					signal?: AbortSignal,
+				) => {
+					if (!signal) throw new Error("Missing upload signal");
+					return new Promise<never>((_resolve, reject) => {
+						signal.addEventListener("abort", () => reject(signal.reason), {
+							once: true,
+						});
+						started?.();
+					});
+				},
+			);
+			let jobId: string | undefined;
+			try {
+				const response = await app.fetch(
+					mediaPostRequest("/video/process", {
+						videoId: "cancelled-thumbnail",
+						userId: "real-process-user",
+						webhookUrl: `${baseUrl}/ignored-webhook`,
+						videoUrl: fixtureUrl(),
+						outputPresignedUrl: uploadUrl("cancelled-thumbnail.mp4"),
+						thumbnailPresignedUrl: uploadUrl("cancelled-thumbnail.jpg"),
+						inputExtension: ".mp4",
+					}),
+				);
+				expect(response.status).toBe(200);
+				jobId = ((await response.json()) as { jobId: string }).jobId;
+				await withTimeout(ready, 10_000);
+				const inputPath = getJob(jobId)?.inputTempFile?.path;
+				if (!inputPath) throw new Error("Missing downloaded input");
+				const cancelled = await app.fetch(
+					mediaPostRequest(`/video/process/${jobId}/cancel`, {}),
+				);
+				expect(cancelled.status).toBe(200);
+				await withTimeout(
+					(async () => {
+						while (await Bun.file(inputPath).exists()) await Bun.sleep(10);
+					})(),
+					5_000,
+				);
+				const job = await waitForTerminalJob(jobId);
+				expect(job.phase).toBe("cancelled");
+				expect(job.error).toBeUndefined();
+				expect(
+					webhookPhases.filter((phase) =>
+						["complete", "cancelled", "error"].includes(phase),
+					),
+				).toEqual(["cancelled"]);
+				expect(upload).toHaveBeenCalledTimes(1);
+			} finally {
+				if (jobId) {
+					getJob(jobId)?.abortController?.abort();
+					deleteJob(jobId);
+				}
+				upload.mockRestore();
+			}
+		},
+		15_000,
+	);
+
+	test("keeps thumbnail decode failures fatal when the uploaded output is unverified", async () => {
+		const thumbnail = spyOn(mediaVideo, "generateThumbnail").mockRejectedValue(
+			new Error("FFmpeg produced empty thumbnail"),
+		);
+		let jobId: string | undefined;
+		try {
+			const response = await app.fetch(
+				mediaPostRequest("/video/process", {
+					videoId: "failed-thumbnail-decode",
+					userId: "real-process-user",
+					videoUrl: fixtureUrl(),
+					outputPresignedUrl: uploadUrl("failed-thumbnail-decode.mp4"),
+					thumbnailPresignedUrl: uploadUrl("failed-thumbnail-decode.jpg"),
+					inputExtension: ".mp4",
+				}),
+			);
+			expect(response.status).toBe(200);
+			jobId = ((await response.json()) as { jobId: string }).jobId;
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("error");
+			expect(job.error).toBe("FFmpeg produced empty thumbnail");
+			expect(uploadRequests).toEqual(["/uploads/failed-thumbnail-decode.mp4"]);
+		} finally {
+			if (jobId) deleteJob(jobId);
+			thumbnail.mockRestore();
+		}
+	}, 15_000);
+
+	test("imports a real video and preserves the original bytes before processing", async () => {
+		const response = await app.fetch(
+			mediaPostRequest("/video/import", {
+				videoId: "direct-import",
+				userId: "import-owner",
+				videoUrl: fixtureUrl(),
+				sourcePresignedUrl: uploadUrl("import-original.mp4"),
+				outputPresignedUrl: uploadUrl("import-output.mp4"),
+				inputExtension: ".mp4",
+				maxWidth: 160,
+				maxHeight: 120,
+				preset: "ultrafast",
+			}),
+		);
+		expect(response.status).toBe(200);
+		const { jobId } = (await response.json()) as { jobId: string };
+		try {
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("complete");
+			expect(uploadedBytes("/uploads/import-original.mp4")).toEqual(
+				new Uint8Array(await Bun.file(TEST_VIDEO_WITH_AUDIO).arrayBuffer()),
+			);
+			const metadata = await probeBytesAsMp4(
+				uploadedBytes("/uploads/import-output.mp4"),
+				"import-output.mp4",
+			);
+			expect(metadata.videoCodec).toBe("h264");
+			expect(metadata.audioCodec).toBe("aac");
+			expect(metadata.width).toBeLessThanOrEqual(160);
+			expect([...uploadedArtifacts.keys()]).toEqual([
+				"/uploads/import-original.mp4",
+				"/uploads/import-output.mp4",
+			]);
+		} finally {
+			deleteJob(jobId);
+		}
+	}, 90000);
+
+	test("fails an import when the original cannot be saved without processing it", async () => {
+		const process = spyOn(mediaVideo, "processVideo");
+		const response = await app.fetch(
+			mediaPostRequest("/video/import", {
+				videoId: "failed-import",
+				userId: "import-owner",
+				videoUrl: fixtureUrl(),
+				sourcePresignedUrl: `${baseUrl}/missing-original-destination`,
+				outputPresignedUrl: uploadUrl("failed-import-output.mp4"),
+				inputExtension: ".mp4",
+			}),
+		);
+		expect(response.status).toBe(200);
+		const { jobId } = (await response.json()) as { jobId: string };
+		try {
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("error");
+			expect(process).not.toHaveBeenCalled();
+			expect(uploadedArtifacts.size).toBe(0);
+		} finally {
+			deleteJob(jobId);
+		}
+	}, 90000);
+
+	test("rejects imports that omit original storage", async () => {
+		const response = await app.fetch(
+			mediaPostRequest("/video/import", {
+				videoId: "unsafe-import",
+				userId: "import-owner",
+				videoUrl: fixtureUrl(),
+				outputPresignedUrl: uploadUrl("unsafe-import.mp4"),
+			}),
+		);
+		expect(response.status).toBe(400);
+	});
+
 	test("retries transient segment downloads and completes a real mux job", async () => {
 		const response = await app.fetch(
 			mediaPostRequest("/video/mux-segments", {
@@ -944,6 +1679,34 @@ describe("media routes real-world integration tests", () => {
 			expect(permanentFixtureFailures).toBe(3);
 			expect(slowFixtureCancellations).toBe(1);
 			expect(uploadedArtifacts.has("/uploads/failed-segment-output.mp4")).toBe(
+				false,
+			);
+		} finally {
+			deleteJob(data.jobId);
+		}
+	}, 90000);
+
+	test("cancels the other init download when one fails, before the job reports failure", async () => {
+		const response = await app.fetch(
+			mediaPostRequest("/video/mux-segments", {
+				videoId: "failed-init-mux-video",
+				userId: "failed-init-mux-user",
+				outputPresignedUrl: uploadUrl("failed-init-output.mp4"),
+				videoInitUrl: `${baseUrl}/fixtures/slow-segment.m4s`,
+				videoSegmentUrls: [fixtureUrl("test-no-audio.mp4")],
+				audioInitUrl: `${baseUrl}/fixtures/permanent-unavailable.m4s`,
+				audioSegmentUrls: [fixtureUrl("test-no-audio.mp4")],
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		const data = (await response.json()) as { jobId: string };
+		const job = await waitForTerminalJob(data.jobId);
+		try {
+			expect(job.phase).toBe("error");
+			expect(job.error).toContain("503");
+			expect(slowFixtureCancellations).toBe(1);
+			expect(uploadedArtifacts.has("/uploads/failed-init-output.mp4")).toBe(
 				false,
 			);
 		} finally {

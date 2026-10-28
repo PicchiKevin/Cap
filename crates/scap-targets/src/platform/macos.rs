@@ -267,7 +267,7 @@ impl DisplayImpl {
 
 fn get_cursor_position() -> Option<LogicalPosition> {
     let event_source = core_graphics::event_source::CGEventSource::new(
-        core_graphics::event_source::CGEventSourceStateID::Private,
+        core_graphics::event_source::CGEventSourceStateID::CombinedSessionState,
     )
     .ok()?;
 
@@ -347,6 +347,12 @@ impl WindowImpl {
         windows_with_level.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         windows_with_level.first().map(|(window, _)| *window)
+    }
+
+    /// The window `id`, without enumerating every window. Whether it still
+    /// exists shows in what its getters return.
+    pub fn from_id_direct(id: &WindowIdImpl) -> Option<Self> {
+        Some(Self(id.0))
     }
 
     pub fn id(&self) -> WindowIdImpl {

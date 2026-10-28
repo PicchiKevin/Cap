@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { closeSync, fstatSync, openSync } from "node:fs";
 import {
 	mkdtemp,
 	readdir,
@@ -10,18 +11,28 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { EncodedPacketSink, FilePathSource, Input, MP4 } from "mediabunny";
 import { muxMediaTracksToMp4 } from "../../lib/media-video";
 import {
+	describeTrackDifference,
+	proveRecordingPackets,
+	readRecordingAudioTail,
+} from "../../lib/recording-packet-proof";
+import {
 	RecordingTimingError,
 	readRecordingVideoTiming,
+	timingMetadataBudget,
 } from "../../lib/recording-timing";
 import {
+	decodePreverifiedRun,
 	inspectRecordingSources,
 	isRetryableRecordingVerificationError,
+	type PreverifiedVideoRun,
 	verifyRecording,
 	verifyRemoteRecording,
 	verifyRemoteRecordingBytes,
+	verifyRemuxedRecording,
 } from "../../lib/recording-verification";
 
 const FIXTURES = join(import.meta.dir, "..", "fixtures");
@@ -484,7 +495,567 @@ afterAll(async () => {
 	if (directory) await rm(directory, { recursive: true, force: true });
 });
 
+describe("encoded recording preservation", () => {
+	test.skipIf(process.platform === "win32")(
+		"kills and joins a stalled audio inspector on cancellation and timeout",
+		async () => {
+			for (const mode of ["cancel", "timeout"]) {
+				const path = join(directory, `stalled-audio-${mode}`);
+				await run(["mkfifo", path]);
+				const controller = new AbortController();
+				const pending = readRecordingAudioTail(path, controller.signal);
+				pending.catch(() => {});
+				let pids: number[] = [];
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					for (let attempt = 0; attempt < 100 && !pids.length; attempt++) {
+						pids = await decoderPids(path);
+						if (!pids.length) await Bun.sleep(10);
+					}
+					expect(pids).toHaveLength(1);
+					await Bun.sleep(100);
+					const started = performance.now();
+					if (mode === "timeout")
+						timer = setTimeout(
+							() =>
+								controller.abort(new DOMException("Timed out", "TimeoutError")),
+							50,
+						);
+					else controller.abort();
+					await expect(
+						Promise.race([
+							pending,
+							Bun.sleep(2000).then(() => {
+								throw new Error("Audio inspection ignored cancellation");
+							}),
+						]),
+					).rejects.toMatchObject({ retryable: true });
+					expect(performance.now() - started).toBeLessThan(2000);
+					expect(await decoderPids(path)).toEqual([]);
+				} finally {
+					if (timer) clearTimeout(timer);
+					controller.abort();
+					for (const pid of pids) {
+						try {
+							process.kill(pid, "SIGKILL");
+						} catch {}
+					}
+					await pending.catch(() => {});
+				}
+			}
+		},
+	);
+	test("retains the processing deadline reason when muxing is already cancelled", async () => {
+		const reason = new Error("Recording processing timed out");
+		await expect(
+			muxMediaTracksToMp4(
+				silent,
+				silent,
+				join(directory, "cancelled-mux.mp4"),
+				AbortSignal.abort(reason),
+			),
+		).rejects.toBe(reason);
+	});
+	test("distinguishes malformed audio from unavailable local timing reads", async () => {
+		await expect(
+			readRecordingAudioTail(
+				join(directory, "absent-audio.mp4"),
+				AbortSignal.timeout(5000),
+			),
+		).rejects.toMatchObject({ retryable: true });
+		await expect(
+			readRecordingAudioTail(silent, AbortSignal.abort()),
+		).rejects.toMatchObject({ retryable: true });
+		const malformed = join(directory, "malformed-audio.mp4");
+		await writeFile(malformed, Buffer.alloc(32));
+		await expect(
+			readRecordingAudioTail(malformed, AbortSignal.timeout(5000)),
+		).rejects.toMatchObject({ retryable: false });
+	});
+	test("uses decoded source evidence for tied terminal video samples", async () => {
+		const input = await tiedTimestampSource("packet-tied-terminal.mp4", 2);
+		const output = join(directory, "packet-tied-terminal-output.mp4");
+		await muxMediaTracksToMp4(input, silent, output);
+		const verified = await verifyRemuxedRecording(input, silent, output, {
+			requireAudio: true,
+		});
+		expect(verified.sourcePreserved).toBe(true);
+		expect(verified.integrity).toBeDefined();
+		expect(verified.video.frameCount).toBe(40);
+	});
+	test("preserves the stored looped AAC tail for one complete output decode", async () => {
+		const input = join(directory, "looped-audio.mp4");
+		const output = join(directory, "looped-audio-remux.mp4");
+		await run([
+			"ffmpeg",
+			"-v",
+			"error",
+			"-stream_loop",
+			"2",
+			"-i",
+			silent,
+			"-c",
+			"copy",
+			input,
+		]);
+		await muxMediaTracksToMp4(input, input, output);
+		const verified = await verifyRemuxedRecording(input, input, output, {
+			requireAudio: true,
+		});
+		expect(verified.fullDecode).toBe(true);
+		expect(verified.sourcePreserved).toBe(true);
+		expect(verified.integrity).toBeUndefined();
+		const source = await inspectRecordingSources(input, input);
+		expect(verified.audio).toEqual(source.audio);
+		expect(verified.video).toEqual(source.video);
+	});
+	test("preserves a recording whose source track carries a creation time", async () => {
+		const input = join(directory, "creation-time-source.mp4");
+		const output = join(directory, "creation-time-remux.mp4");
+		await run([
+			"ffmpeg",
+			"-v",
+			"error",
+			"-i",
+			silent,
+			"-map",
+			"0",
+			"-c",
+			"copy",
+			"-video_track_timescale",
+			"600",
+			"-movflags",
+			"frag_keyframe+empty_moov+default_base_moof",
+			"-metadata",
+			"creation_time=2026-09-17T10:29:10.000000Z",
+			input,
+		]);
+		await muxMediaTracksToMp4(input, input, output);
+		const verified = await verifyRemuxedRecording(input, input, output, {
+			requireAudio: true,
+		});
+		expect(verified.sourcePreserved).toBe(true);
+		expect(verified.integrity).toBeUndefined();
+	});
+	test("refuses identical corrupt packets rather than treating preservation as decodability", async () => {
+		await expect(
+			verifyRemuxedRecording(corruptTail, corruptTail, corruptTail, {
+				requireAudio: true,
+			}),
+		).rejects.toThrow();
+	});
+	test("binds backward presentation timestamps without changing the recording", async () => {
+		const samples = bFrameSamples.map((sample) => ({ ...sample }));
+		samples[13].pts -= 6000;
+		const input = join(directory, "packet-backward-pts.mp4");
+		await writeFile(
+			input,
+			Buffer.concat([
+				bFrameInit,
+				...samples.map((sample, index) => sampleFragment([sample], index + 1)),
+			]),
+		);
+		const output = join(directory, "packet-backward-output.mp4");
+		await muxMediaTracksToMp4(input, null, output);
+		const result = await verifyRemuxedRecording(input, null, output, {
+			requireAudio: false,
+		});
+		expect(result.sourcePreserved).toBe(true);
+		expect(result.video.frameCount).toBe(samples.length);
+		expect(result.integrity).toBeUndefined();
+	});
+	test("applies one deadline to packet inspection and decode", async () => {
+		await expect(
+			verifyRemuxedRecording(silent, silent, silent, {
+				requireAudio: true,
+				timeoutMs: 1,
+			}),
+		).rejects.toThrow();
+		expect(await decoderPids(silent)).toEqual([]);
+	});
+
+	test.each([true, false])(
+		"decodes preserved packets once with audio=%s",
+		async (audio) => {
+			const input = join(
+				FIXTURES,
+				audio ? "test-with-audio.mp4" : "test-no-audio.mp4",
+			);
+			const output = join(directory, `packet-proof-${audio}.mp4`);
+			await muxMediaTracksToMp4(input, audio ? input : null, output);
+			await proveRecordingPackets(
+				input,
+				audio ? input : null,
+				output,
+				AbortSignal.timeout(5000),
+			);
+			const verified = await verifyRemuxedRecording(
+				input,
+				audio ? input : null,
+				output,
+				{ requireAudio: audio },
+			);
+			expect(verified.fullDecode).toBe(true);
+			expect(verified.sourcePreserved).toBe(true);
+			expect(Boolean(verified.audio)).toBe(audio);
+			expect(verified.integrity).toBeUndefined();
+		},
+	);
+	test("rejects changed source bytes", async () => {
+		await expect(
+			proveRecordingPackets(
+				silent,
+				silent,
+				corruptTail,
+				AbortSignal.timeout(5000),
+			),
+		).rejects.toThrow();
+		await expect(
+			verifyRemuxedRecording(silent, silent, corruptTail, {
+				requireAudio: true,
+			}),
+		).rejects.toThrow();
+	});
+	test("preserves a shorter audio track independently of the video", async () => {
+		const output = join(directory, "proof-short-audio.mp4");
+		await muxMediaTracksToMp4(silent, shortAudio, output);
+		const verified = await verifyRemuxedRecording(silent, shortAudio, output, {
+			requireAudio: true,
+		});
+		expect(verified.sourcePreserved).toBe(true);
+	});
+	test("rejects shifted audio despite identical encoded content", async () => {
+		const output = join(directory, "proof-shifted-audio.mp4");
+		await run([
+			"ffmpeg",
+			"-v",
+			"error",
+			"-i",
+			silent,
+			"-itsoffset",
+			"0.5",
+			"-i",
+			silent,
+			"-map",
+			"0:v:0",
+			"-map",
+			"1:a:0",
+			"-c",
+			"copy",
+			output,
+		]);
+		await expect(
+			proveRecordingPackets(silent, silent, output, AbortSignal.timeout(5000)),
+		).rejects.toThrow();
+		await expect(
+			verifyRemuxedRecording(silent, silent, output, { requireAudio: true }),
+		).rejects.toThrow();
+	});
+	test("names what differs when the packet proof fails", async () => {
+		const shifted = join(directory, "proof-explained-shift.mp4");
+		await run([
+			"ffmpeg",
+			"-v",
+			"error",
+			"-i",
+			silent,
+			"-itsoffset",
+			"0.5",
+			"-i",
+			silent,
+			"-map",
+			"0:v:0",
+			"-map",
+			"1:a:0",
+			"-c",
+			"copy",
+			shifted,
+		]);
+		await expect(
+			proveRecordingPackets(silent, silent, shifted, AbortSignal.timeout(5000)),
+		).rejects.toThrow(
+			/audio does not preserve the source \(.*first difference at packet 0: pts -?[\d.]+ vs [\d.]+, dts/,
+		);
+
+		const retagged = join(directory, "proof-explained-tags.mp4");
+		await run([
+			"ffmpeg",
+			"-v",
+			"error",
+			"-i",
+			silent,
+			"-map",
+			"0",
+			"-c",
+			"copy",
+			"-metadata:s:v:0",
+			"handler_name=Retagged",
+			retagged,
+		]);
+		await expect(
+			proveRecordingPackets(
+				silent,
+				silent,
+				retagged,
+				AbortSignal.timeout(5000),
+			),
+		).rejects.toThrow(
+			/video does not preserve the source \(tags\.handler_name "[^"]*" vs "Retagged"/,
+		);
+
+		const changed = join(directory, "proof-explained-data.mp4");
+		const bytes = await readFile(silent);
+		const mdat = bytes.indexOf(Buffer.from("mdat"));
+		if (mdat < 0) throw new Error("Fixture has no media data");
+		bytes[mdat + 64] ^= 0xff;
+		await writeFile(changed, bytes);
+		await expect(
+			proveRecordingPackets(silent, silent, changed, AbortSignal.timeout(5000)),
+		).rejects.toThrow(
+			/does not preserve the source \(first difference at packet \d+: data differs\)/,
+		);
+	});
+	test("shows both time bases when packet timing differs", () => {
+		const summary = (packets: string) => ({
+			configuration: { codec_type: "video" as const, start: "0/1" },
+			count: 2,
+			packets,
+			startTime: 0,
+			tail: undefined,
+		});
+		expect(
+			describeTrackDifference(
+				{ summary: summary("a"), log: undefined, timeBase: "1/15000" },
+				{ summary: summary("b"), log: undefined, timeBase: "1/90000" },
+			),
+		).toBe("time base 1/15000 vs 1/90000");
+	});
+	test("keeps the time bases when many tags differ", () => {
+		const summary = (value: string) => ({
+			configuration: {
+				codec_type: "video" as const,
+				start: "0/1",
+				tags: Object.fromEntries(
+					Array.from({ length: 20 }, (_, index) => [
+						`tag_${index}`,
+						`${value}-${"x".repeat(30)}`,
+					]),
+				),
+			},
+			count: 2,
+			packets: value,
+			startTime: 0,
+			tail: undefined,
+		});
+		const explanation = describeTrackDifference(
+			{ summary: summary("a"), log: undefined, timeBase: "1/15000" },
+			{ summary: summary("b"), log: undefined, timeBase: "1/90000" },
+		);
+		expect(explanation.length).toBeLessThanOrEqual(400);
+		expect(explanation).toStartWith("time base 1/15000 vs 1/90000; tags.tag_0");
+	});
+	test("does not start cancelled packet verification", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			verifyRemuxedRecording(silent, silent, silent, {
+				requireAudio: true,
+				abortSignal: controller.signal,
+			}),
+		).rejects.toThrow();
+	});
+});
+
 describe("complete recording decode", () => {
+	test.each([
+		{ audio: true, hasAudio: true },
+		{ audio: false, hasAudio: false },
+	])(
+		"binds the audio-presence hint %j to decoded streams",
+		async ({ audio, hasAudio }) => {
+			const input = audio ? silent : join(FIXTURES, "test-no-audio.mp4");
+			const options = { expectedDuration: audio ? 5 : 1, requireAudio: false };
+			const stock = await verifyRecording(input, options);
+			const streamed = await verifyRecording(input, { ...options, hasAudio });
+			expect(streamed).toEqual(stock);
+			if (!audio) {
+				await expect(
+					verifyRecording(input, { ...options, hasAudio, requireAudio: true }),
+				).rejects.toThrow("missing required audio coverage");
+			}
+		},
+	);
+	test.skipIf(process.platform === "win32").each([
+		{ audio: true, hasAudio: false },
+		{ audio: false, hasAudio: true },
+	])(
+		"rejects a mismatched accelerated audio-presence hint %j",
+		async ({ audio, hasAudio }) => {
+			const input = audio ? silent : join(FIXTURES, "test-no-audio.mp4");
+			await expect(
+				verifyRecording(input, {
+					expectedDuration: audio ? 5 : 1,
+					requireAudio: false,
+					hasAudio,
+				}),
+			).rejects.toThrow();
+		},
+	);
+
+	test.each(["audio", "video-only"])(
+		"matches FFmpeg streamhash for every streamed %s byte",
+		async (kind) => {
+			const audio = kind === "audio" ? silent : null;
+			const evidence = await inspectRecordingSources(silent, audio);
+			const hashes = await run([
+				"ffmpeg",
+				"-v",
+				"error",
+				"-threads",
+				"1",
+				"-i",
+				silent,
+				"-map",
+				"0:v:0",
+				...(audio ? ["-map", "0:a:0"] : []),
+				"-c:v",
+				"rawvideo",
+				"-c:a",
+				"pcm_f64le",
+				"-threads",
+				"1",
+				"-f",
+				"streamhash",
+				"-hash",
+				"sha256",
+				"-",
+			]);
+			expect(hashes).toContain(
+				`0,v,SHA256=${evidence.integrity.video.contentSha256}`,
+			);
+			if (audio) {
+				expect(hashes).toContain(
+					`1,a,SHA256=${evidence.integrity.audio?.contentSha256}`,
+				);
+				const verified = await verifyRecording(silent, {
+					requireAudio: false,
+					sourceEvidence: evidence,
+				});
+				expect(verified.sourcePreserved).toBe(true);
+				expect(verified.integrity).toEqual(evidence.integrity);
+			} else {
+				expect(evidence.audio).toBeNull();
+				await expect(
+					verifyRecording(silent, {
+						requireAudio: false,
+						sourceEvidence: evidence,
+					}),
+				).rejects.toThrow();
+			}
+		},
+	);
+
+	test.skipIf(
+		process.platform === "win32" ||
+			process.env.MEDIA_SERVER_RECORDING_PERFORMANCE_TESTS !== "1",
+	)(
+		"streams a complete long recording within a bounded decode budget",
+		async () => {
+			const seed = join(directory, "long-recording-seed.mp4");
+			const input = join(directory, "long-recording.mp4");
+			await run([
+				"ffmpeg",
+				"-v",
+				"error",
+				"-f",
+				"lavfi",
+				"-i",
+				"testsrc2=size=1920x1080:rate=30:duration=2",
+				"-f",
+				"lavfi",
+				"-i",
+				"sine=frequency=700:sample_rate=48000:duration=2",
+				"-c:v",
+				"libx264",
+				"-preset",
+				"ultrafast",
+				"-threads",
+				"1",
+				"-c:a",
+				"aac",
+				seed,
+			]);
+			await run([
+				"ffmpeg",
+				"-v",
+				"error",
+				"-stream_loop",
+				"59",
+				"-i",
+				seed,
+				"-c",
+				"copy",
+				input,
+			]);
+			const baseline = process.memoryUsage().rss;
+			let peak = baseline;
+			const memory = setInterval(() => {
+				peak = Math.max(peak, process.memoryUsage().rss);
+			}, 25);
+			try {
+				const started = performance.now();
+				const source = await inspectRecordingSources(input, input, {
+					timeoutMs: 30_000,
+				});
+				const elapsed = performance.now() - started;
+				const sourcePeak = peak;
+				expect(elapsed).toBeLessThan(30_000);
+				expect(source.fullDecode).toBe(true);
+				expect(source.video.frameCount).toBe(3_600);
+				expect(source.audio?.sampleCount).toBeGreaterThanOrEqual(5_760_000);
+				expect(sourcePeak - baseline).toBeLessThan(256 * 1_024 * 1_024);
+				const stockStarted = performance.now();
+				const stock = await verifyRecording(input, {
+					expectedDuration: source.video.duration,
+					requireAudio: false,
+					timeoutMs: 110_000,
+				});
+				const stockElapsed = performance.now() - stockStarted;
+				expect(stock.integrity?.video.contentSha256).toBe(
+					source.integrity.video.contentSha256,
+				);
+				expect(source.integrity.audio?.contentSha256).toBe(
+					stock.integrity?.audio?.contentSha256,
+				);
+				expect(source.video).toEqual(stock.video);
+				expect(source.audio).toEqual(stock.audio);
+				const output = join(directory, "long-recording-remux.mp4");
+				await muxMediaTracksToMp4(input, input, output);
+				const efficientStarted = performance.now();
+				const efficient = await verifyRemuxedRecording(input, input, output, {
+					requireAudio: true,
+					timeoutMs: 30_000,
+				});
+				const efficientElapsed = performance.now() - efficientStarted;
+				expect(efficient.sourcePreserved).toBe(true);
+				expect(efficient.integrity).toBeUndefined();
+				expect(efficient.video).toEqual(source.video);
+				expect(efficient.audio).toEqual(source.audio);
+				expect(efficientElapsed).toBeLessThan(30_000);
+				console.info(
+					`Packet-bound full verification: ${efficientElapsed.toFixed(0)} ms`,
+				);
+
+				console.info(
+					`Recording decode: ${elapsed.toFixed(0)} ms, stock ${stockElapsed.toFixed(0)} ms, ${((sourcePeak - baseline) / 1_024 / 1_024).toFixed(1)} MiB peak RSS increase`,
+				);
+			} finally {
+				clearInterval(memory);
+			}
+		},
+		150_000,
+	);
+
 	test("counts real decoded frames and samples, including valid silent audio", async () => {
 		const evidence = await verifyRecording(silent, {
 			expectedDuration: 5,
@@ -522,6 +1093,26 @@ describe("complete recording decode", () => {
 		expect(hashes).toContain(
 			`1,a,SHA256=${evidence.integrity?.audio?.contentSha256}`,
 		);
+	});
+
+	test("skips decoded content hashes only when nothing compares them", async () => {
+		const options = { expectedDuration: 5, requireAudio: true };
+		const hashed = await verifyRecording(silent, options);
+		const unhashed = await verifyRecording(silent, {
+			...options,
+			hashDecodedContent: false,
+		});
+		expect(unhashed.integrity).toBeUndefined();
+		expect(unhashed.video).toEqual(hashed.video);
+		expect(unhashed.audio).toEqual(hashed.audio);
+		const evidence = await inspectRecordingSources(silent, silent);
+		const preserved = await verifyRecording(silent, {
+			requireAudio: false,
+			hashDecodedContent: false,
+			sourceEvidence: evidence,
+		});
+		expect(preserved.sourcePreserved).toBe(true);
+		expect(preserved.integrity).toEqual(evidence.integrity);
 	});
 
 	test("accepts legacy video without audio only when audio was not requested", async () => {
@@ -608,6 +1199,34 @@ describe("source-preserving recording mux", () => {
 				terminalTies,
 			);
 			const sourceEvidence = await inspectRecordingSources(input, silent);
+			const stockHash = await run([
+				"ffmpeg",
+				"-v",
+				"error",
+				"-copyts",
+				"-threads",
+				"1",
+				"-i",
+				input,
+				"-map",
+				"0:v:0",
+				"-fps_mode",
+				"passthrough",
+				"-enc_time_base:v",
+				"-1",
+				"-c:v",
+				"rawvideo",
+				"-threads",
+				"1",
+				"-f",
+				"streamhash",
+				"-hash",
+				"sha256",
+				"-",
+			]);
+			expect(stockHash).toContain(
+				`0,v,SHA256=${sourceEvidence.integrity.video.contentSha256}`,
+			);
 			const output = join(directory, `tied-${terminalTies}-output.mp4`);
 			await muxMediaTracksToMp4(input, silent, output);
 			const verified = await verifyRecording(output, {
@@ -638,7 +1257,7 @@ describe("source-preserving recording mux", () => {
 		const timing = await readRecordingVideoTiming(input, { timeoutMs: 5000 });
 		expect(timing.terminalPacketCount).toBe(3);
 		await expect(inspectRecordingSources(input, null)).rejects.toThrow(
-			"Recording container timing does not match decoded video",
+			"Recording container timing does not match decoded video (final tied packets 3 vs decoded 2)",
 		);
 	});
 
@@ -838,7 +1457,7 @@ describe("source-preserving recording mux", () => {
 		const timing = await readRecordingVideoTiming(input, { timeoutMs: 5000 });
 		expect(timing.videoPacketCount).toBe(31);
 		await expect(inspectRecordingSources(input, null)).rejects.toThrow(
-			"Recording container timing does not match decoded video",
+			"Recording container timing does not match decoded video (packets 31 vs decoded frames 30)",
 		);
 	});
 
@@ -874,8 +1493,8 @@ describe("source-preserving recording mux", () => {
 		},
 	);
 
-	test.each([-1, 1, -23_333])(
-		"preserves a true partial final frame with duration offset %d ticks when muxing",
+	test.each([-1, 1, -23_333, 670_000])(
+		"preserves the final frame with duration offset %d ticks when muxing",
 		async (offsetTicks) => {
 			const input = await fragmentedSource(0, { last: offsetTicks });
 			const sourceEvidence = await inspectRecordingSources(input, null);
@@ -897,12 +1516,21 @@ describe("source-preserving recording mux", () => {
 				throw new Error("Fixture has no final packet");
 			expect(sourceTail.duration).toBe(33_333 + offsetTicks);
 			expect(outputTail.duration).toBe(sourceTail.duration);
+			expect(sourceEvidence.video.duration).toBeCloseTo(
+				(sourceTail.pts + sourceTail.duration - (sourcePackets[0]?.pts ?? 0)) /
+					1_000_000,
+				9,
+			);
 			const verified = await verifyRecording(output, {
 				requireAudio: false,
 				sourceEvidence,
 			});
 			expect(verified.sourcePreserved).toBe(true);
 			expect(verified.video.frameCount).toBe(31);
+			expect(verified.video.duration).toBeCloseTo(
+				sourceEvidence.video.duration,
+				9,
+			);
 			expect(verified.integrity).toEqual(sourceEvidence.integrity);
 		},
 	);
@@ -1086,7 +1714,10 @@ describe("source-preserving recording mux", () => {
 		const output = await fragmentedSource(0, { first: 2_000_000, last: -1 });
 		const sourceEvidence = await inspectRecordingSources(input, null);
 		const outputEvidence = await inspectRecordingSources(output, null);
-		expect(outputEvidence.video).toEqual(sourceEvidence.video);
+		expect(outputEvidence.video.duration).toBeCloseTo(
+			sourceEvidence.video.duration - 0.000_001,
+			9,
+		);
 		expect(outputEvidence.integrity.video.contentSha256).toBe(
 			sourceEvidence.integrity.video.contentSha256,
 		);
@@ -1432,7 +2063,10 @@ async function decoderPids(input: string): Promise<number[]> {
 			processes.map(async (pid) => {
 				try {
 					const command = await readFile(`/proc/${pid}/cmdline`, "utf8");
-					return command.includes("ffmpeg") && command.includes(input)
+					return (command.includes("ffmpeg") ||
+						command.includes("ffprobe") ||
+						command.includes("recording-audio-timing.ts")) &&
+						command.includes(input)
 						? Number(pid)
 						: null;
 				} catch (error) {
@@ -1451,13 +2085,41 @@ async function decoderPids(input: string): Promise<number[]> {
 	const output = await run(["ps", "-axo", "pid=,command="]);
 	return output
 		.split("\n")
-		.filter((line) => line.includes("ffmpeg") && line.includes(input))
+		.filter(
+			(line) =>
+				(line.includes("ffmpeg") ||
+					line.includes("ffprobe") ||
+					line.includes("recording-audio-timing.ts")) &&
+				line.includes(input),
+		)
 		.map((line) => Number.parseInt(line.trim(), 10));
 }
 
 function expectExited(pid: number) {
 	expect(() => process.kill(pid, 0)).toThrow();
 }
+
+describe("recording timing metadata budget", () => {
+	const mb = 1024 * 1024;
+	test("keeps at least 64 MB for small recordings", () => {
+		expect(timingMetadataBudget(0)).toBe(64 * mb);
+		expect(timingMetadataBudget(2 * mb)).toBe(64 * mb);
+		expect(timingMetadataBudget(32 * mb)).toBe(64 * mb);
+	});
+
+	test("allows twice the file size, up to 1 GB", () => {
+		// Production failures: 64 MB read for a 156 MB and a 324 MB recording of tiny frames.
+		expect(timingMetadataBudget(156 * mb)).toBe(312 * mb);
+		expect(timingMetadataBudget(324 * mb)).toBe(648 * mb);
+		expect(timingMetadataBudget(4096 * mb)).toBe(1024 * mb);
+		expect(timingMetadataBudget(200 * 1024 * mb)).toBe(1024 * mb);
+	});
+
+	test("ignores an invalid size", () => {
+		expect(timingMetadataBudget(Number.NaN)).toBe(64 * mb);
+		expect(timingMetadataBudget(-1)).toBe(64 * mb);
+	});
+});
 
 describe("recording timing metadata lifetime", () => {
 	test.each(["cancel", "timeout"])(
@@ -1687,6 +2349,140 @@ describe("recording timing metadata lifetime", () => {
 });
 
 describe("recording verification lifetime", () => {
+	test.skipIf(process.platform === "win32")(
+		"reclaims repeated decoder pipes without closing reused descriptors",
+		async () => {
+			for (let attempt = 0; attempt < 12; attempt++) {
+				const source = await inspectRecordingSources(silent, silent);
+				expect(source.fullDecode).toBe(true);
+				const replacements = Array.from({ length: 32 }, () =>
+					openSync(silent, "r"),
+				);
+				try {
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					Bun.gc(true);
+					for (const descriptor of replacements) {
+						expect(fstatSync(descriptor).isFile()).toBe(true);
+					}
+				} finally {
+					for (const descriptor of replacements) closeSync(descriptor);
+				}
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32").each(["truncated", "read-error"])(
+		"rejects a %s decoded-content pipe and joins its decoder",
+		async (fault) => {
+			const original = Readable.prototype[Symbol.asyncIterator];
+			let modified = false;
+			const iterator = spyOn(
+				Readable.prototype,
+				Symbol.asyncIterator,
+			).mockImplementation(function (this: Readable) {
+				const source = original.call(this);
+				if (modified) return source;
+				modified = true;
+				return Readable.from(
+					(async function* () {
+						let first = true;
+						for await (const chunk of source) {
+							if (!Buffer.isBuffer(chunk))
+								throw new Error("Invalid fixture pipe bytes");
+							if (fault === "read-error")
+								throw new Error("Fixture pipe read failed");
+							yield first ? chunk.subarray(1) : chunk;
+							first = false;
+						}
+					})(),
+				)[Symbol.asyncIterator]();
+			});
+			try {
+				await expect(inspectRecordingSources(silent, silent)).rejects.toThrow(
+					fault === "truncated"
+						? "content is incomplete"
+						: "Fixture pipe read failed",
+				);
+				expect(modified).toBe(true);
+				expect(await decoderPids(silent)).toEqual([]);
+			} finally {
+				iterator.mockRestore();
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"cancels content pipes without closing a subsequently reused descriptor",
+		async () => {
+			const controller = new AbortController();
+			const original = Readable.prototype[Symbol.asyncIterator];
+			const streams: Readable[] = [];
+			const iterator = spyOn(
+				Readable.prototype,
+				Symbol.asyncIterator,
+			).mockImplementation(function (this: Readable) {
+				streams.push(this);
+				setImmediate(() => controller.abort());
+				return original.call(this);
+			});
+			try {
+				await expect(
+					inspectRecordingSources(silent, silent, {
+						abortSignal: controller.signal,
+					}),
+				).rejects.toThrow("cancelled");
+				expect(streams.length).toBe(2);
+				expect(streams.every((stream) => stream.destroyed)).toBe(true);
+				expect(await decoderPids(silent)).toEqual([]);
+				const replacement = openSync(silent, "r");
+				try {
+					Bun.gc(true);
+					expect(fstatSync(replacement).isFile()).toBe(true);
+				} finally {
+					closeSync(replacement);
+				}
+			} finally {
+				iterator.mockRestore();
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"joins a decoder and its backpressured content reader after timeout",
+		async () => {
+			const original = Readable.prototype[Symbol.asyncIterator];
+			let modified = false;
+			const iterator = spyOn(
+				Readable.prototype,
+				Symbol.asyncIterator,
+			).mockImplementation(function (this: Readable) {
+				const source = original.call(this);
+				if (modified) return source;
+				modified = true;
+				return Readable.from(
+					(async function* () {
+						let first = true;
+						for await (const chunk of source) {
+							if (first)
+								await new Promise((resolve) => setTimeout(resolve, 2_500));
+							first = false;
+							yield chunk;
+						}
+					})(),
+				)[Symbol.asyncIterator]();
+			});
+			try {
+				await expect(
+					inspectRecordingSources(silent, silent, { timeoutMs: 2_000 }),
+				).rejects.toThrow("timed out");
+				expect(modified).toBe(true);
+				expect(await decoderPids(silent)).toEqual([]);
+			} finally {
+				iterator.mockRestore();
+			}
+		},
+	);
+
 	test("does not start work for an already cancelled request", async () => {
 		const controller = new AbortController();
 		controller.abort();
@@ -1805,7 +2601,826 @@ function objectResponse(
 	return new Response(bytes, { headers });
 }
 
+describe("chunked packet-proven verification", () => {
+	async function segmentedRecording(
+		name: string,
+		gop: number,
+		frames = 120,
+		segmentSeconds = 0.5,
+	) {
+		const fragments = await mkdtemp(join(directory, `${name}-`));
+		await run([
+			"ffmpeg",
+			"-v",
+			"error",
+			"-f",
+			"lavfi",
+			"-i",
+			"testsrc2=size=320x180:rate=30",
+			"-frames:v",
+			String(frames),
+			"-c:v",
+			"libx264",
+			"-preset",
+			"ultrafast",
+			"-g",
+			String(gop),
+			"-keyint_min",
+			String(gop),
+			"-sc_threshold",
+			"0",
+			"-pix_fmt",
+			"yuv420p",
+			"-f",
+			"dash",
+			"-seg_duration",
+			String(segmentSeconds),
+			"-use_template",
+			"1",
+			"-use_timeline",
+			"1",
+			"-init_seg_name",
+			"init.mp4",
+			"-media_seg_name",
+			"fragment-$Number%05d$.m4s",
+			join(fragments, "manifest.mpd"),
+		]);
+		const init = join(fragments, "init.mp4");
+		const segments = (await readdir(fragments))
+			.filter((file) => /^fragment-\d+\.m4s$/.test(file))
+			.sort()
+			.map((file) => join(fragments, file));
+		const combined = join(directory, `${name}-combined.mp4`);
+		await writeFile(
+			combined,
+			Buffer.concat(
+				await Promise.all([init, ...segments].map((path) => readFile(path))),
+			),
+		);
+		const output = join(directory, `${name}-output.mp4`);
+		await muxMediaTracksToMp4(combined, silent, output);
+		return { init, segments, combined, output };
+	}
+
+	const previous = process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS;
+	afterAll(() => {
+		if (previous === undefined)
+			delete process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS;
+		else process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS = previous;
+	});
+
+	async function both(
+		recording: Awaited<ReturnType<typeof segmentedRecording>>,
+	) {
+		delete process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS;
+		const single = await verifyRemuxedRecording(
+			recording.combined,
+			silent,
+			recording.output,
+			{ requireAudio: false },
+		);
+		process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS = "3";
+		const warn = spyOn(console, "warn");
+		try {
+			const chunked = await verifyRemuxedRecording(
+				recording.combined,
+				silent,
+				recording.output,
+				{ requireAudio: false },
+				{ init: recording.init, segments: recording.segments },
+			);
+			const fallbacks = warn.mock.calls.filter((call) =>
+				String(call[0]).includes("recording_chunked_decode_fallback"),
+			);
+			return { single, chunked, fallbacks };
+		} finally {
+			warn.mockRestore();
+			delete process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS;
+		}
+	}
+
+	test("returns the same evidence as one full decode", async () => {
+		const recording = await segmentedRecording("chunk-parity", 15);
+		expect(recording.segments.length).toBeGreaterThanOrEqual(6);
+		const { single, chunked, fallbacks } = await both(recording);
+		expect(fallbacks).toHaveLength(0);
+		expect(chunked).toEqual(single);
+		expect(chunked.video.frameCount).toBe(120);
+		expect(chunked.audio).not.toBeNull();
+	});
+
+	async function misalignedRecording(name: string) {
+		const fragmented = join(directory, `${name}-fragmented.mp4`);
+		await run([
+			"ffmpeg",
+			"-v",
+			"error",
+			"-f",
+			"lavfi",
+			"-i",
+			"testsrc2=size=320x180:rate=30",
+			"-frames:v",
+			"120",
+			"-c:v",
+			"libx264",
+			"-preset",
+			"ultrafast",
+			"-g",
+			"45",
+			"-keyint_min",
+			"45",
+			"-sc_threshold",
+			"0",
+			"-pix_fmt",
+			"yuv420p",
+			"-movflags",
+			"empty_moov+default_base_moof+separate_moof",
+			"-frag_duration",
+			"400000",
+			fragmented,
+		]);
+		const bytes = await readFile(fragmented);
+		const boxes: { type: string; start: number; end: number }[] = [];
+		for (let offset = 0; offset < bytes.length; ) {
+			const size = bytes.readUInt32BE(offset);
+			boxes.push({
+				type: bytes.toString("ascii", offset + 4, offset + 8),
+				start: offset,
+				end: offset + size,
+			});
+			offset += size;
+		}
+		const firstFragment = boxes.findIndex((box) => box.type === "moof");
+		const init = join(directory, `${name}-init.mp4`);
+		await writeFile(init, bytes.subarray(0, boxes[firstFragment].start));
+		const segments: string[] = [];
+		for (let index = firstFragment; index < boxes.length; index += 2) {
+			const segment = join(
+				directory,
+				`${name}-fragment-${segments.length}.m4s`,
+			);
+			await writeFile(
+				segment,
+				bytes.subarray(
+					boxes[index].start,
+					boxes[index + 1]?.end ?? bytes.length,
+				),
+			);
+			segments.push(segment);
+		}
+		const output = join(directory, `${name}-output.mp4`);
+		await muxMediaTracksToMp4(fragmented, silent, output);
+		return { init, segments, combined: fragmented, output };
+	}
+
+	test("falls back to one full decode when fragments do not start on keyframes", async () => {
+		const recording = await misalignedRecording("chunk-misaligned");
+		expect(recording.segments.length).toBeGreaterThanOrEqual(6);
+		const { single, chunked, fallbacks } = await both(recording);
+		expect(fallbacks).toHaveLength(1);
+		expect(chunked).toEqual(single);
+		expect(chunked.video.frameCount).toBe(120);
+	});
+
+	async function resizedRecording(name: string) {
+		const halves: string[] = [];
+		for (const size of ["320x180", "352x180"]) {
+			const half = join(directory, `${name}-${size}.h264`);
+			await run([
+				"ffmpeg",
+				"-v",
+				"error",
+				"-f",
+				"lavfi",
+				"-i",
+				`testsrc2=size=${size}:rate=30`,
+				"-frames:v",
+				"90",
+				"-c:v",
+				"libx264",
+				"-preset",
+				"ultrafast",
+				"-g",
+				"15",
+				"-keyint_min",
+				"15",
+				"-sc_threshold",
+				"0",
+				"-pix_fmt",
+				"yuv420p",
+				"-bsf:v",
+				"h264_mp4toannexb",
+				"-f",
+				"h264",
+				half,
+			]);
+			halves.push(half);
+		}
+		const stream = join(directory, `${name}.h264`);
+		await writeFile(
+			stream,
+			Buffer.concat(await Promise.all(halves.map((path) => readFile(path)))),
+		);
+		const fragments = await mkdtemp(join(directory, `${name}-`));
+		await run([
+			"ffmpeg",
+			"-v",
+			"error",
+			"-framerate",
+			"30",
+			"-f",
+			"h264",
+			"-i",
+			stream,
+			"-c",
+			"copy",
+			"-f",
+			"dash",
+			"-seg_duration",
+			"0.5",
+			"-use_template",
+			"1",
+			"-use_timeline",
+			"1",
+			"-init_seg_name",
+			"init.mp4",
+			"-media_seg_name",
+			"fragment-$Number%05d$.m4s",
+			join(fragments, "manifest.mpd"),
+		]);
+		const init = join(fragments, "init.mp4");
+		const segments = (await readdir(fragments))
+			.filter((file) => /^fragment-\d+\.m4s$/.test(file))
+			.sort()
+			.map((file) => join(fragments, file));
+		expect(segments.length).toBeGreaterThanOrEqual(6);
+		const combined = join(directory, `${name}-combined.mp4`);
+		await writeFile(
+			combined,
+			Buffer.concat(
+				await Promise.all([init, ...segments].map((path) => readFile(path))),
+			),
+		);
+		const output = join(directory, `${name}-output.mp4`);
+		await muxMediaTracksToMp4(combined, silent, output);
+		return { init, segments, combined, output };
+	}
+
+	test("falls back when a later chunk starts at a different resolution", async () => {
+		const recording = await resizedRecording("chunk-resize");
+		const { single, chunked, fallbacks } = await both(recording);
+		expect(fallbacks).toHaveLength(1);
+		expect(String(fallbacks[0][0])).toContain(
+			"dimensions 0: 320x180 -> 352x180",
+		);
+		expect(chunked).toEqual(single);
+		expect(chunked.video.frameCount).toBe(180);
+	});
+
+	test("stops the other chunk decoders once headers differ", async () => {
+		const recording = await resizedRecording("chunk-resize-early");
+		const ffmpeg = Bun.which("ffmpeg");
+		if (!ffmpeg) throw new Error("ffmpeg is required");
+		// Every chunk after the first keeps running for 30 s after its output is complete,
+		// so verification only finishes quickly if those decoders are stopped early.
+		const bin = await mkdtemp(join(directory, "slow-ffmpeg-"));
+		await writeFile(
+			join(bin, "ffmpeg"),
+			[
+				"#!/bin/sh",
+				'case "$*" in',
+				`*verify-chunk-0.mp4*) exec "${ffmpeg}" "$@" ;;`,
+				`*verify-chunk-*) "${ffmpeg}" "$@"; status=$?; exec 1>&- 2>&-; sleep 30; exit $status ;;`,
+				`*) exec "${ffmpeg}" "$@" ;;`,
+				"esac",
+				"",
+			].join("\n"),
+			{ mode: 0o755 },
+		);
+		const path = process.env.PATH;
+		process.env.PATH = `${bin}:${path}`;
+		process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS = "3";
+		const warn = spyOn(console, "warn");
+		try {
+			const started = performance.now();
+			const result = await verifyRemuxedRecording(
+				recording.combined,
+				silent,
+				recording.output,
+				{ requireAudio: false },
+				{ init: recording.init, segments: recording.segments },
+			);
+			expect(performance.now() - started).toBeLessThan(15_000);
+			expect(result.video.frameCount).toBe(180);
+			expect(
+				warn.mock.calls.some((call) =>
+					String(call[0]).includes("chunk stream parameters differ"),
+				),
+			).toBe(true);
+		} finally {
+			warn.mockRestore();
+			process.env.PATH = path;
+			delete process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS;
+		}
+	}, 60_000);
+
+	test("copies many fragments into one run without piling up stream listeners", async () => {
+		const recording = await segmentedRecording("chunk-many", 6, 240, 0.2);
+		expect(recording.segments.length).toBeGreaterThanOrEqual(30);
+		const warnings: string[] = [];
+		const onWarning = (warning: Error) => warnings.push(warning.name);
+		const events = process as unknown as NodeJS.EventEmitter;
+		events.on("warning", onWarning);
+		try {
+			const { single, chunked, fallbacks } = await both(recording);
+			expect(fallbacks).toHaveLength(0);
+			expect(chunked).toEqual(single);
+		} finally {
+			events.off("warning", onWarning);
+		}
+		expect(warnings).not.toContain("MaxListenersExceededWarning");
+	});
+
+	test("still rejects a corrupt recording through the full decode", async () => {
+		const recording = await segmentedRecording("chunk-corrupt", 15);
+		const target = recording.segments[3];
+		const bytes = await readFile(target);
+		bytes.fill(
+			0,
+			Math.floor(bytes.length / 2),
+			Math.floor(bytes.length / 2) + 2048,
+		);
+		await writeFile(target, bytes);
+		const combined = Buffer.concat(
+			await Promise.all(
+				[recording.init, ...recording.segments].map((path) => readFile(path)),
+			),
+		);
+		await writeFile(recording.combined, combined);
+		await muxMediaTracksToMp4(recording.combined, silent, recording.output);
+		process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS = "3";
+		try {
+			await expect(
+				verifyRemuxedRecording(
+					recording.combined,
+					silent,
+					recording.output,
+					{ requireAudio: false },
+					{ init: recording.init, segments: recording.segments },
+				),
+			).rejects.toThrow();
+		} finally {
+			delete process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS;
+		}
+	});
+
+	async function preverify(
+		recording: { init: string; segments: string[] },
+		from: number,
+		to: number,
+	): Promise<PreverifiedVideoRun> {
+		const work = await mkdtemp(join(directory, "preverify-"));
+		const lines = await decodePreverifiedRun(
+			recording.init,
+			recording.segments.slice(from, to),
+			work,
+		);
+		if (!lines) throw new Error("Expected a decodable preverified run");
+		return { segments: to - from, lines };
+	}
+
+	async function withRuns(
+		recording: Awaited<ReturnType<typeof segmentedRecording>>,
+		runs: PreverifiedVideoRun[],
+		chunks?: string,
+	) {
+		if (chunks === undefined)
+			delete process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS;
+		else process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS = chunks;
+		const warn = spyOn(console, "warn");
+		try {
+			const result = await verifyRemuxedRecording(
+				recording.combined,
+				silent,
+				recording.output,
+				{ requireAudio: false },
+				{ init: recording.init, segments: recording.segments },
+				runs,
+			);
+			const fallbacks = warn.mock.calls.filter((call) =>
+				String(call[0]).includes("recording_chunked_decode_fallback"),
+			);
+			return { result, fallbacks };
+		} finally {
+			warn.mockRestore();
+			delete process.env.MEDIA_SERVER_VERIFY_DECODE_CHUNKS;
+		}
+	}
+
+	test.each([undefined, "3"])(
+		"returns the same evidence from preverified runs as one full decode (chunks %s)",
+		async (chunks) => {
+			const recording = await segmentedRecording("preverified-parity", 15);
+			expect(recording.segments.length).toBeGreaterThanOrEqual(6);
+			const { single } = await both(recording);
+			const runs = [
+				await preverify(recording, 0, 2),
+				await preverify(recording, 2, 4),
+			];
+			const { result, fallbacks } = await withRuns(recording, runs, chunks);
+			expect(fallbacks).toHaveLength(0);
+			expect(result).toEqual(single);
+			expect(result.video.frameCount).toBe(120);
+		},
+	);
+
+	test("accepts runs that cover every fragment", async () => {
+		const recording = await segmentedRecording("preverified-complete", 15);
+		const { single } = await both(recording);
+		const { result, fallbacks } = await withRuns(recording, [
+			await preverify(recording, 0, recording.segments.length),
+		]);
+		expect(fallbacks).toHaveLength(0);
+		expect(result).toEqual(single);
+	});
+
+	test.each([
+		"dropped frame",
+		"extra frame",
+		"shifted timestamps",
+		"changed header",
+	])(
+		"falls back to one full decode when a cached run has a %s",
+		async (defect) => {
+			const recording = await segmentedRecording(
+				`preverified-${defect.replaceAll(" ", "-")}`,
+				15,
+			);
+			const { single } = await both(recording);
+			const run = await preverify(recording, 0, 3);
+			const frames = run.lines.filter((line) => !line.startsWith("#"));
+			const header = run.lines.filter((line) => line.startsWith("#"));
+			const changed =
+				defect === "dropped frame"
+					? [...header, ...frames.slice(0, -1)]
+					: defect === "extra frame"
+						? [...header, ...frames, frames.at(-1) as string]
+						: defect === "shifted timestamps"
+							? [
+									...header,
+									...frames.map((line) =>
+										line.replace(
+											/^0,\s*(\d+),\s*(\d+)/,
+											(_, dts, pts) =>
+												`0, ${Number(dts) + 1}, ${Number(pts) + 1}`,
+										),
+									),
+								]
+							: [
+									...header.map((line) =>
+										line.replace(/^#dimensions 0: .*/, "#dimensions 0: 1x1"),
+									),
+									...frames,
+								];
+			const { result, fallbacks } = await withRuns(recording, [
+				{ segments: run.segments, lines: changed },
+			]);
+			expect(fallbacks).toHaveLength(1);
+			expect(result).toEqual(single);
+		},
+	);
+
+	test("drops a cached run whose next fragment cannot be decoded on its own", async () => {
+		const recording = await misalignedRecording("preverified-misaligned");
+		const { single } = await both(recording);
+		const work = await mkdtemp(join(directory, "preverify-misaligned-"));
+		const lines = await decodePreverifiedRun(
+			recording.init,
+			recording.segments.slice(0, 1),
+			work,
+		);
+		expect(lines).not.toBeNull();
+		const { result } = await withRuns(recording, [
+			{ segments: 1, lines: lines ?? [] },
+		]);
+		expect(result).toEqual(single);
+	});
+
+	test("does not preverify a run that does not start on a keyframe", async () => {
+		const recording = await misalignedRecording("preverified-unaligned-start");
+		const work = await mkdtemp(join(directory, "preverify-unaligned-"));
+		expect(
+			await decodePreverifiedRun(
+				recording.init,
+				recording.segments.slice(1, 3),
+				work,
+			),
+		).toBeNull();
+	});
+
+	test("does not preverify fragments that fail to decode", async () => {
+		const recording = await segmentedRecording("preverified-corrupt", 15);
+		const [first, second] = recording.segments;
+		if (!first || !second) throw new Error("Expected two fragments");
+		const packets = JSON.parse(
+			await run([
+				"ffprobe",
+				"-v",
+				"error",
+				"-protocol_whitelist",
+				"file,concat",
+				"-select_streams",
+				"v:0",
+				"-show_packets",
+				"-show_entries",
+				"packet=pos,size",
+				"-of",
+				"json",
+				`concat:${recording.init}|${second}`,
+			]),
+		) as { packets: { pos: string; size: string }[] };
+		const last = packets.packets.at(-1);
+		if (!last) throw new Error("Fragment has no video packet");
+		const offset = Number(last.pos) - (await readFile(recording.init)).length;
+		const bytes = Buffer.from(await readFile(second));
+		bytes.fill(0, offset, offset + Number(last.size));
+		const corrupt = join(directory, "preverified-corrupt-fragment.m4s");
+		await writeFile(corrupt, bytes);
+		const work = await mkdtemp(join(directory, "preverify-corrupt-"));
+		expect(
+			await decodePreverifiedRun(recording.init, [first, corrupt], work),
+		).toBeNull();
+	});
+});
+
+describe("ranged remote byte verification", () => {
+	const payload = new Uint8Array(3 * 1024 * 1024 + 12_345).map(
+		(_, index) => (index * 31 + 7) % 251,
+	);
+	const sha256 = createHash("sha256").update(payload).digest("hex");
+	const identity = '"ranged-object"';
+
+	function rangedServer(
+		respond?: (start: number, end: number, attempt: number) => Response | null,
+	) {
+		const ranges: string[] = [];
+		const attempts = new Map<string, number>();
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				if (request.headers.get("if-match") !== identity)
+					return new Response("Object changed", { status: 412 });
+				const range = request.headers.get("range");
+				const match = range?.match(/^bytes=(\d+)-(\d+)$/);
+				if (!match)
+					return new Response(payload, { headers: { ETag: identity } });
+				const start = Number(match[1]);
+				const end = Number(match[2]);
+				if (range !== "bytes=0-0") ranges.push(range ?? "");
+				const attempt = (attempts.get(range ?? "") ?? 0) + 1;
+				attempts.set(range ?? "", attempt);
+				const custom =
+					range === "bytes=0-0" ? null : respond?.(start, end, attempt);
+				if (custom) return custom;
+				return new Response(payload.slice(start, end + 1), {
+					status: 206,
+					headers: {
+						ETag: identity,
+						"Content-Range": `bytes ${start}-${end}/${payload.length}`,
+					},
+				});
+			},
+		});
+		return { server, ranges };
+	}
+
+	async function verify(port: number | undefined) {
+		return verifyRemoteRecordingBytes(
+			`http://127.0.0.1:${port}/recording.mp4`,
+			{
+				expectedObjectIdentity: identity,
+				expectedSha256: sha256,
+				expectedFileSize: payload.length,
+			},
+		);
+	}
+
+	const env = { ...process.env };
+	beforeAll(() => {
+		process.env.MEDIA_SERVER_VERIFY_DOWNLOAD_CONCURRENCY = "3";
+		process.env.MEDIA_SERVER_VERIFY_DOWNLOAD_PART_MB = "1";
+	});
+	afterAll(() => {
+		process.env.MEDIA_SERVER_VERIFY_DOWNLOAD_CONCURRENCY =
+			env.MEDIA_SERVER_VERIFY_DOWNLOAD_CONCURRENCY;
+		process.env.MEDIA_SERVER_VERIFY_DOWNLOAD_PART_MB =
+			env.MEDIA_SERVER_VERIFY_DOWNLOAD_PART_MB;
+		if (env.MEDIA_SERVER_VERIFY_DOWNLOAD_CONCURRENCY === undefined)
+			delete process.env.MEDIA_SERVER_VERIFY_DOWNLOAD_CONCURRENCY;
+		if (env.MEDIA_SERVER_VERIFY_DOWNLOAD_PART_MB === undefined)
+			delete process.env.MEDIA_SERVER_VERIFY_DOWNLOAD_PART_MB;
+	});
+
+	test("hashes every pinned range in order", async () => {
+		const { server, ranges } = rangedServer();
+		try {
+			const result = await verify(server.port);
+			expect(result).toEqual({
+				objectIdentity: identity,
+				fileSize: payload.length,
+				remoteSha256: sha256,
+			});
+			const mb = 1024 * 1024;
+			expect([...ranges].sort()).toEqual(
+				[0, 1, 2, 3]
+					.map(
+						(index) =>
+							`bytes=${index * mb}-${Math.min(payload.length, (index + 1) * mb) - 1}`,
+					)
+					.sort(),
+			);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	test("rejects a range served from a different object", async () => {
+		const { server } = rangedServer((start, end) =>
+			start === 2 * 1024 * 1024
+				? new Response(payload.slice(start, end + 1), {
+						status: 206,
+						headers: {
+							ETag: '"replaced-object"',
+							"Content-Range": `bytes ${start}-${end}/${payload.length}`,
+						},
+					})
+				: null,
+		);
+		try {
+			await expect(verify(server.port)).rejects.toThrow(
+				"Recording object changed during byte verification",
+			);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	test("rejects a range that does not match its requested bytes", async () => {
+		const { server } = rangedServer((start, end) =>
+			start === 1024 * 1024
+				? new Response(payload.slice(start, end + 1), {
+						status: 206,
+						headers: {
+							ETag: identity,
+							"Content-Range": `bytes ${start}-${end - 1}/${payload.length}`,
+						},
+					})
+				: null,
+		);
+		try {
+			await expect(verify(server.port)).rejects.toThrow(
+				"Recording byte resume range does not match the verified object",
+			);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	test("retries a range after a transient storage error", async () => {
+		const { server, ranges } = rangedServer((start, _end, attempt) =>
+			start === 0 && attempt === 1
+				? new Response("busy", { status: 503 })
+				: null,
+		);
+		try {
+			expect((await verify(server.port)).remoteSha256).toBe(sha256);
+			expect(
+				ranges.filter((range) => range.startsWith("bytes=0-")),
+			).toHaveLength(2);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	test("rejects an oversized range body without buffering it whole", async () => {
+		const { server } = rangedServer((start, end) =>
+			start === 1024 * 1024
+				? new Response(payload, {
+						status: 206,
+						headers: {
+							ETag: identity,
+							"Content-Range": `bytes ${start}-${end}/${payload.length}`,
+						},
+					})
+				: null,
+		);
+		try {
+			await expect(verify(server.port)).rejects.toThrow(
+				"Recording object size changed during byte verification",
+			);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	test("retries a range whose body ends early", async () => {
+		const { server, ranges } = rangedServer((start, end, attempt) =>
+			start === 2 * 1024 * 1024 && attempt === 1
+				? new Response(payload.slice(start, start + 1000), {
+						status: 206,
+						headers: {
+							ETag: identity,
+							"Content-Range": `bytes ${start}-${end}/${payload.length}`,
+						},
+					})
+				: null,
+		);
+		try {
+			expect((await verify(server.port)).remoteSha256).toBe(sha256);
+			expect(
+				ranges.filter((range) => range.startsWith(`bytes=${2 * 1024 * 1024}-`)),
+			).toHaveLength(2);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	test("falls back to one sequential read when storage ignores ranges", async () => {
+		const { server } = rangedServer(
+			() => new Response(payload, { headers: { ETag: identity } }),
+		);
+		try {
+			expect((await verify(server.port)).remoteSha256).toBe(sha256);
+		} finally {
+			await server.stop(true);
+		}
+	});
+});
+
 describe("remote recording object identity", () => {
+	test("resumes interrupted byte verification without rereading the verified prefix", async () => {
+		const identity = '"resume-object"';
+		let reads = 0;
+		let sent = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				if (request.method === "HEAD")
+					return new Response(null, {
+						headers: {
+							ETag: identity,
+							"Content-Length": String(silentBytes.length),
+						},
+					});
+				const range = request.headers.get("range");
+				if (range === "bytes=0-0")
+					return new Response(silentBytes.slice(0, 1), {
+						status: 206,
+						headers: {
+							ETag: identity,
+							"Content-Range": `bytes 0-0/${silentBytes.length}`,
+						},
+					});
+				expect(request.headers.get("if-match")).toBe(identity);
+				reads++;
+				if (reads === 1) {
+					sent += 128;
+					return new Response(silentBytes.slice(0, 128), {
+						headers: { ETag: identity },
+					});
+				}
+				expect(range).toBe(`bytes=128-${silentBytes.length - 1}`);
+				sent += silentBytes.length - 128;
+				return new Response(silentBytes.slice(128), {
+					status: 206,
+					headers: {
+						ETag: identity,
+						"Content-Range": `bytes 128-${silentBytes.length - 1}/${silentBytes.length}`,
+					},
+				});
+			},
+		});
+		try {
+			const result = await verifyRemoteRecordingBytes(
+				`http://127.0.0.1:${server.port}/recording.mp4`,
+				{
+					expectedObjectIdentity: identity,
+					expectedSha256: createHash("sha256")
+						.update(silentBytes)
+						.digest("hex"),
+					expectedFileSize: silentBytes.length,
+				},
+			);
+			expect(result.fileSize).toBe(silentBytes.length);
+			expect(reads).toBe(2);
+			expect(sent).toBe(silentBytes.length);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
 	test("binds remote bytes without manufacturing decoded evidence", async () => {
 		const identity = '"byte-bound-output"';
 		const sha256 = createHash("sha256").update(silentBytes).digest("hex");

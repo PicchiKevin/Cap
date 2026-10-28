@@ -8,7 +8,7 @@
 //! module is that canvas pass: scale the frame-space annotations up to the
 //! export frame, re-apply the mask filters at export resolution, draw the
 //! shapes with tiny-skia and the text with cosmic-text, and expand the output
-//! to the union of the image and every annotation's box.
+//! to the union of the image and every annotation's painted extents.
 //!
 //! It also carries the share fingerprint (`screenshotProjectFingerprint`,
 //! `:419-431`) and the per-destination encodings (`exportImage`,
@@ -20,6 +20,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use cap_gpui_kernels::{codec, screenshot as pixels};
 use cap_project::{Annotation, AnnotationType, ProjectConfiguration};
 
 use crate::screenshot_annotations::{self as annotations, Rect};
@@ -86,9 +87,8 @@ pub fn scale_annotations(list: &[Annotation], scale_x: f64, scale_y: f64) -> Vec
 // The composite (`renderScreenshotExportCanvas`)
 // ---------------------------------------------------------------------------
 
-/// The output canvas rect: the working canvas's own rect, unioned with every
-/// non-mask annotation's normalized box (`:307-325`). `Math.max(1,
-/// Math.round(..))` on each axis.
+/// Include stroke and glyph overhang, rounding outward to keep the frame on
+/// whole pixels when annotations extend past its edges.
 pub fn export_bounds(scaled: &[Annotation], canvas: (u32, u32)) -> ExportBounds {
     let mut min_x = 0f64;
     let mut min_y = 0f64;
@@ -99,51 +99,99 @@ pub fn export_bounds(scaled: &[Annotation], canvas: (u32, u32)) -> ExportBounds 
         if annotation.annotation_type == AnnotationType::Mask {
             continue;
         }
-        let left = annotation.x.min(annotation.x + annotation.width);
-        let right = annotation.x.max(annotation.x + annotation.width);
-        let top = annotation.y.min(annotation.y + annotation.height);
-        let bottom = annotation.y.max(annotation.y + annotation.height);
-        min_x = min_x.min(left);
-        max_x = max_x.max(right);
-        min_y = min_y.min(top);
-        max_y = max_y.max(bottom);
+        let mut include = |x: f64, y: f64, width: f64, height: f64| {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x + width);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y + height);
+        };
+        let rect = annotations::normalized_rect(annotation);
+        include(rect.x, rect.y, rect.width, rect.height);
+        let has_stroke = annotations::parse_css_rgba(&annotation.stroke_color, annotation.opacity)
+            .is_some_and(|(_, alpha)| alpha > 0.);
+        let stroke_width = if has_stroke {
+            annotation.stroke_width.max(0.)
+        } else {
+            0.
+        };
+        let radius = stroke_width / 2.;
+        match annotation.annotation_type {
+            AnnotationType::Rectangle | AnnotationType::Circle => include(
+                rect.x - radius,
+                rect.y - radius,
+                rect.width + stroke_width,
+                rect.height + stroke_width,
+            ),
+            AnnotationType::Arrow if has_stroke => {
+                let end = (
+                    annotation.x + annotation.width,
+                    annotation.y + annotation.height,
+                );
+                let angle = (end.1 - annotation.y).atan2(end.0 - annotation.x);
+                let head =
+                    annotations::arrow_head_points(end.0, end.1, angle, annotation.stroke_width);
+                for (x, y) in [(annotation.x, annotation.y), head.base] {
+                    include(
+                        f64::from(x as f32) - radius,
+                        f64::from(y as f32) - radius,
+                        stroke_width,
+                        stroke_width,
+                    );
+                }
+                for (x, y) in head.points {
+                    include(f64::from(x as f32), f64::from(y as f32), 0., 0.);
+                }
+            }
+            AnnotationType::Draw if stroke_width > 0. => {
+                for [x, y] in annotations::draw_points(annotation) {
+                    include(x - radius, y - radius, stroke_width, stroke_width);
+                }
+            }
+            AnnotationType::Text => rasterize_text(annotation, |at, size, color| {
+                if color[3] > 0 {
+                    include(
+                        at.0.round(),
+                        at.1.round(),
+                        f64::from(size.0),
+                        f64::from(size.1),
+                    );
+                }
+            }),
+            AnnotationType::Mask | AnnotationType::Arrow | AnnotationType::Draw => {}
+        }
     }
 
+    let min_x = min_x.floor();
+    let min_y = min_y.floor();
     ExportBounds {
         min_x,
         min_y,
-        width: ((max_x - min_x).round() as i64).max(1) as u32,
-        height: ((max_y - min_y).round() as i64).max(1) as u32,
+        width: (max_x.ceil() - min_x).max(1.) as u32,
+        height: (max_y.ceil() - min_y).max(1.) as u32,
     }
 }
 
-/// The whole canvas pass. Faithfully in the source's order: masks from an
-/// unmodified copy of the frame, then the shape/text draw, then the expanded
-/// output canvas -- white-filled unless the background is invisible -- with
-/// the working canvas blitted at `(-minX, -minY)`.
-///
-/// Two deliberate matches of the source's own quirks: annotations are drawn
-/// onto the *frame-sized* working canvas, so the parts dragged past the frame
-/// are clipped there and the union expansion only pads the margins (that is
-/// what `drawAnnotations(ctx, ..)` before the final `drawImage` does); and the
-/// blit offset is rounded to a whole pixel where the browser would resample at
-/// a fractional one.
 pub fn composite(raw: &RawFrame, config: &ProjectConfiguration) -> Composited {
     let width = raw.width.max(1);
     let height = raw.height.max(1);
-    if config.annotations.is_empty()
-        && raw.rgba.len() == width as usize * height as usize * 4
-        && is_opaque(&raw.rgba)
-    {
+    if config.annotations.is_empty() && raw.rgba.len() == width as usize * height as usize * 4 {
+        let rgba = if has_no_visible_background(&config.background.source)
+            || pixels::is_opaque(&raw.rgba)
+        {
+            raw.rgba.clone()
+        } else {
+            pixels::flatten_onto_white(&raw.rgba)
+        };
+
         return Composited {
-            rgba: raw.rgba.clone(),
+            rgba,
             width,
             height,
         };
     }
     let scale_x = f64::from(width) / f64::from(raw.base_width.max(1));
     let scale_y = f64::from(height) / f64::from(raw.base_height.max(1));
-    let scaled = scale_annotations(&config.annotations, scale_x, scale_y);
+    let mut scaled = scale_annotations(&config.annotations, scale_x, scale_y);
 
     let mut canvas = raw.rgba.clone();
 
@@ -163,13 +211,20 @@ pub fn composite(raw: &RawFrame, config: &ProjectConfiguration) -> Composited {
         if let Some((x0, y0, region)) =
             annotations::masked_region_image(&raw.rgba, (width, height), mask, full)
         {
-            blit_over(&mut canvas, (width, height), &region, (x0, y0));
+            pixels::blit_over(&mut canvas, (width, height), &region, (x0, y0));
         }
     }
 
-    draw_annotations_onto(&mut canvas, width, height, &scaled);
-
     let bounds = export_bounds(&scaled, (width, height));
+    // Nothing paints past the frame, so draw in the frame's own pixels first,
+    // keeping the output byte-identical to the frame-sized pass.
+    let fits_frame = bounds.min_x == 0.
+        && bounds.min_y == 0.
+        && bounds.width == width
+        && bounds.height == height;
+    if fits_frame {
+        draw_annotations_onto(&mut canvas, width, height, &scaled);
+    }
     let mut out = vec![0u8; bounds.width as usize * bounds.height as usize * 4];
     if !has_no_visible_background(&config.background.source) {
         out.fill(255);
@@ -178,13 +233,20 @@ pub fn composite(raw: &RawFrame, config: &ProjectConfiguration) -> Composited {
         (-bounds.min_x).round() as i64,
         (-bounds.min_y).round() as i64,
     );
-    blit_over_offset(
+    pixels::blit_over_offset(
         &mut out,
         (bounds.width, bounds.height),
         &canvas,
         (width, height),
         offset,
     );
+    if !fits_frame {
+        for annotation in &mut scaled {
+            annotation.x += offset.0 as f64;
+            annotation.y += offset.1 as f64;
+        }
+        draw_annotations_onto(&mut out, bounds.width, bounds.height, &scaled);
+    }
 
     Composited {
         rgba: out,
@@ -204,39 +266,13 @@ pub fn needs_transparency(out: &Composited, config: &ProjectConfiguration) -> bo
     if !has_no_visible_background(&config.background.source) {
         return false;
     }
-    out.rgba
-        .iter()
-        .skip(3)
-        .step_by(4)
-        .any(|&alpha| alpha != 255)
-}
-
-fn is_opaque(rgba: &[u8]) -> bool {
-    const ALPHA_MASK: u128 = 0xff000000ff000000ff000000ff000000;
-    let mut blocks = rgba.chunks_exact(16);
-    blocks
-        .by_ref()
-        .all(|block| u128::from_le_bytes(block.try_into().unwrap()) & ALPHA_MASK == ALPHA_MASK)
-        && blocks
-            .remainder()
-            .iter()
-            .skip(3)
-            .step_by(4)
-            .all(|&alpha| alpha == 255)
+    pixels::has_translucent_pixel(&out.rgba)
 }
 
 /// `withWhiteBackground` (`useScreenshotExport.ts:18-28`).
 pub fn flatten_onto_white(out: &Composited) -> Composited {
-    let mut rgba = out.rgba.clone();
-    for pixel in rgba.chunks_exact_mut(4) {
-        let alpha = u32::from(pixel[3]);
-        for channel in &mut pixel[..3] {
-            *channel = ((u32::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
-        }
-        pixel[3] = 255;
-    }
     Composited {
-        rgba,
+        rgba: pixels::flatten_onto_white(&out.rgba),
         width: out.width,
         height: out.height,
     }
@@ -246,12 +282,8 @@ pub fn flatten_onto_white(out: &Composited) -> Composited {
 /// frame straight to PNG" path, still callable through
 /// `screenshot_editor::render_export_png`.
 pub fn encode_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    use image::ImageEncoder as _;
-    let mut png = std::io::Cursor::new(Vec::new());
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
-        .map_err(|e| format!("Failed to encode screenshot export: {e}"))?;
-    Ok(png.into_inner())
+    codec::encode_png_rgba(rgba, width, height)
+        .map_err(|e| format!("Failed to encode screenshot export: {e}"))
 }
 
 fn encode_png(out: &Composited) -> Result<Vec<u8>, String> {
@@ -262,22 +294,9 @@ fn encode_png(out: &Composited) -> Result<Vec<u8>, String> {
 /// share flow only ever picks it when the output is fully opaque, and the
 /// flatten here is the same belt the browser's own encode wears.
 fn encode_jpeg(out: &Composited) -> Result<Vec<u8>, String> {
-    let flat = flatten_onto_white(out);
-    let rgb: Vec<u8> = flat
-        .rgba
-        .chunks_exact(4)
-        .flat_map(|px| [px[0], px[1], px[2]])
-        .collect();
-    let mut buffer = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, 90)
-        .encode(
-            &rgb,
-            flat.width,
-            flat.height,
-            image::ExtendedColorType::Rgb8,
-        )
-        .map_err(|e| format!("Failed to encode screenshot export: {e}"))?;
-    Ok(buffer)
+    let rgb = codec::flatten_rgba_to_rgb_over_white(&out.rgba);
+    codec::encode_jpeg_rgb(&rgb, out.width, out.height, 90)
+        .map_err(|e| format!("Failed to encode screenshot export: {e}"))
 }
 
 /// An encoded export, tagged with the content type the upload sends.
@@ -317,7 +336,7 @@ pub fn encode_for_share(
 /// Copy: always PNG, composited over white when transparency is not needed
 /// (`:183-198` -- `withWhiteBackground` only on the clipboard path).
 pub fn encode_for_copy(out: &Composited, config: &ProjectConfiguration) -> Result<Vec<u8>, String> {
-    if has_no_visible_background(&config.background.source) || is_opaque(&out.rgba) {
+    if has_no_visible_background(&config.background.source) || pixels::is_opaque(&out.rgba) {
         encode_png(out)
     } else {
         encode_png(&flatten_onto_white(out))
@@ -380,115 +399,6 @@ pub fn content_hash(config: &ProjectConfiguration) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Pixel plumbing
-// ---------------------------------------------------------------------------
-
-/// Straight-alpha source-over of one pixel -- what `drawImage` does.
-fn blend_pixel_over(dst: &mut [u8], src: [u8; 4]) {
-    if src[3] == 0 {
-        return;
-    }
-    if src[3] == 255 {
-        dst.copy_from_slice(&src);
-        return;
-    }
-    let sa = f32::from(src[3]) / 255.;
-    let da = f32::from(dst[3]) / 255.;
-    let oa = sa + da * (1. - sa);
-    if oa <= 0. {
-        dst.fill(0);
-        return;
-    }
-    for channel in 0..3 {
-        let s = f32::from(src[channel]);
-        let d = f32::from(dst[channel]);
-        dst[channel] = ((s * sa + d * da * (1. - sa)) / oa).round().clamp(0., 255.) as u8;
-    }
-    dst[3] = (oa * 255.).round() as u8;
-}
-
-/// Source-over blit of a filtered mask region into the working canvas.
-fn blit_over(canvas: &mut [u8], size: (u32, u32), region: &image::RgbaImage, at: (u32, u32)) {
-    let stride = size.0 as usize * 4;
-    for (row_index, row) in region.rows().enumerate() {
-        let y = at.1 as usize + row_index;
-        if y >= size.1 as usize {
-            break;
-        }
-        for (column_index, pixel) in row.enumerate() {
-            let x = at.0 as usize + column_index;
-            if x >= size.0 as usize {
-                break;
-            }
-            let start = y * stride + x * 4;
-            blend_pixel_over(&mut canvas[start..start + 4], pixel.0);
-        }
-    }
-}
-
-/// Source-over blit of one straight-alpha buffer into another at a (possibly
-/// negative) offset, clipping to the destination.
-fn blit_over_offset(
-    dst: &mut [u8],
-    dst_size: (u32, u32),
-    src: &[u8],
-    src_size: (u32, u32),
-    offset: (i64, i64),
-) {
-    let dst_stride = dst_size.0 as usize * 4;
-    let src_stride = src_size.0 as usize * 4;
-    for src_y in 0..src_size.1 as i64 {
-        let dst_y = src_y + offset.1;
-        if dst_y < 0 || dst_y >= i64::from(dst_size.1) {
-            continue;
-        }
-        for src_x in 0..src_size.0 as i64 {
-            let dst_x = src_x + offset.0;
-            if dst_x < 0 || dst_x >= i64::from(dst_size.0) {
-                continue;
-            }
-            let src_start = src_y as usize * src_stride + src_x as usize * 4;
-            let dst_start = dst_y as usize * dst_stride + dst_x as usize * 4;
-            let pixel = [
-                src[src_start],
-                src[src_start + 1],
-                src[src_start + 2],
-                src[src_start + 3],
-            ];
-            blend_pixel_over(&mut dst[dst_start..dst_start + 4], pixel);
-        }
-    }
-}
-
-/// `(c * a + 127) / 255` rounding both ways -- the standard integer
-/// premultiply pair. tiny-skia's pixmaps are premultiplied, our canvases are
-/// straight, so the draw pass converts in and back out.
-fn premultiply(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
-        let alpha = u16::from(pixel[3]);
-        if alpha == 255 {
-            continue;
-        }
-        for channel in &mut pixel[..3] {
-            *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
-        }
-    }
-}
-
-fn demultiply(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
-        let alpha = u32::from(pixel[3]);
-        if alpha == 255 || alpha == 0 {
-            continue;
-        }
-        for channel in &mut pixel[..3] {
-            let value = (u32::from(*channel) * 255 + alpha / 2) / alpha;
-            *channel = value.min(255) as u8;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The shape draw (`drawAnnotations`, `screenshotExport.ts:42-121`)
 // ---------------------------------------------------------------------------
 
@@ -531,7 +441,13 @@ fn skia_stroke(width: f64, round: bool) -> tiny_skia::Stroke {
 /// order -- rect, ellipse, arrow, freehand with tiny-skia, text with
 /// cosmic-text, each under its own `globalAlpha`.
 fn draw_annotations_onto(canvas: &mut [u8], width: u32, height: u32, scaled: &[Annotation]) {
-    premultiply(canvas);
+    if scaled
+        .iter()
+        .all(|annotation| annotation.annotation_type == AnnotationType::Mask)
+    {
+        return;
+    }
+    pixels::premultiply(canvas);
     if let Some(mut pixmap) = tiny_skia::PixmapMut::from_bytes(canvas, width, height) {
         for annotation in scaled {
             if annotation.annotation_type == AnnotationType::Mask {
@@ -540,7 +456,7 @@ fn draw_annotations_onto(canvas: &mut [u8], width: u32, height: u32, scaled: &[A
             draw_one(&mut pixmap, annotation);
         }
     }
-    demultiply(canvas);
+    pixels::demultiply(canvas);
 }
 
 fn draw_one(pixmap: &mut tiny_skia::PixmapMut<'_>, annotation: &Annotation) {
@@ -700,7 +616,12 @@ fn draw_one(pixmap: &mut tiny_skia::PixmapMut<'_>, annotation: &Annotation) {
                 );
             }
         }
-        AnnotationType::Text => draw_text(pixmap, annotation),
+        AnnotationType::Text => {
+            let canvas_size = (pixmap.width(), pixmap.height());
+            rasterize_text(annotation, |at, size, color| {
+                pixels::blend_rect_premultiplied(pixmap.data_mut(), canvas_size, at, size, color);
+            });
+        }
     }
 }
 
@@ -716,7 +637,7 @@ static TEXT_STACK: OnceLock<Mutex<(cosmic_text::FontSystem, cosmic_text::SwashCa
 /// `<text>` at `font-size = height`, baseline at `y + height`, filled with the
 /// stroke colour -- the same placement the preview's `paint_text` resolves,
 /// down to the Helvetica the renderer maps `sans-serif` to.
-fn draw_text(pixmap: &mut tiny_skia::PixmapMut<'_>, annotation: &Annotation) {
+fn rasterize_text(annotation: &Annotation, mut pixel: impl FnMut((f64, f64), (u32, u32), [u8; 4])) {
     let Some(text) = annotation.text.as_deref().filter(|text| !text.is_empty()) else {
         return;
     };
@@ -731,7 +652,7 @@ fn draw_text(pixmap: &mut tiny_skia::PixmapMut<'_>, annotation: &Annotation) {
 
     let stack = TEXT_STACK.get_or_init(|| {
         Mutex::new((
-            cosmic_text::FontSystem::new(),
+            cap_rendering::new_font_system(),
             cosmic_text::SwashCache::new(),
         ))
     });
@@ -759,60 +680,13 @@ fn draw_text(pixmap: &mut tiny_skia::PixmapMut<'_>, annotation: &Annotation) {
     let origin_y = annotation.y + annotation.height - f64::from(line_y);
 
     let color = cosmic_text::Color::rgba(rgb[0], rgb[1], rgb[2], (alpha * 255.).round() as u8);
-    let (canvas_width, canvas_height) = (pixmap.width(), pixmap.height());
-    let data = pixmap.data_mut();
-    buffer.draw(font_system, swash_cache, color, |x, y, w, h, pixel| {
-        blend_rect_premultiplied(
-            data,
-            (canvas_width, canvas_height),
+    buffer.draw(font_system, swash_cache, color, |x, y, w, h, color| {
+        pixel(
             (origin_x + f64::from(x), origin_y + f64::from(y)),
             (w, h),
-            pixel,
+            [color.r(), color.g(), color.b(), color.a()],
         );
     });
-}
-
-/// Premultiplied source-over of one glyph-coverage rect (cosmic-text hands
-/// back the coverage folded into the colour's alpha).
-fn blend_rect_premultiplied(
-    data: &mut [u8],
-    size: (u32, u32),
-    at: (f64, f64),
-    rect: (u32, u32),
-    color: cosmic_text::Color,
-) {
-    let alpha = f32::from(color.a()) / 255.;
-    if alpha <= 0. {
-        return;
-    }
-    let src = [
-        (f32::from(color.r()) * alpha).round() as u8,
-        (f32::from(color.g()) * alpha).round() as u8,
-        (f32::from(color.b()) * alpha).round() as u8,
-        color.a(),
-    ];
-    let inverse = 1. - alpha;
-    let stride = size.0 as usize * 4;
-    let x0 = at.0.round() as i64;
-    let y0 = at.1.round() as i64;
-    for row in 0..i64::from(rect.1) {
-        let y = y0 + row;
-        if y < 0 || y >= i64::from(size.1) {
-            continue;
-        }
-        for column in 0..i64::from(rect.0) {
-            let x = x0 + column;
-            if x < 0 || x >= i64::from(size.0) {
-                continue;
-            }
-            let start = y as usize * stride + x as usize * 4;
-            for channel in 0..4 {
-                let d = f32::from(data[start + channel]);
-                data[start + channel] =
-                    (f32::from(src[channel]) + d * inverse).round().min(255.) as u8;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -846,6 +720,79 @@ mod tests {
             value: [0, 0, 0],
             alpha: 0,
         };
+    }
+
+    #[test]
+    fn mask_only_draw_preserves_straight_alpha_pixels() {
+        let original: Vec<u8> = (0..=255u8).flat_map(|alpha| [17, 30, 77, alpha]).collect();
+        for scaled in [
+            Vec::new(),
+            vec![annotation(AnnotationType::Mask, 0., 0., 16., 16.)],
+        ] {
+            let mut canvas = original.clone();
+            draw_annotations_onto(&mut canvas, 16, 16, &scaled);
+            assert_eq!(canvas, original);
+        }
+    }
+
+    #[test]
+    fn off_canvas_mask_does_not_change_translucent_export_pixels() {
+        let raw = RawFrame {
+            rgba: vec![17, 30, 77, 1, 123, 45, 67, 127],
+            width: 2,
+            height: 1,
+            base_width: 2,
+            base_height: 1,
+        };
+        let mut config = ProjectConfiguration::default();
+        invisible_background(&mut config);
+        config
+            .annotations
+            .push(annotation(AnnotationType::Mask, 3., 0., 2., 1.));
+
+        let out = composite(&raw, &config);
+
+        assert_eq!((out.width, out.height), (2, 1));
+        assert_eq!(out.rgba, raw.rgba);
+    }
+
+    #[test]
+    fn pixelated_export_preserves_pixels_outside_the_mask_and_draws_shapes() {
+        let raw = RawFrame {
+            rgba: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 17, 30, 77, 1, 123, 45, 67, 127, 255, 255, 0, 255,
+                0, 0, 255, 255, 23, 41, 83, 3, 111, 55, 99, 129,
+            ],
+            width: 4,
+            height: 2,
+            base_width: 4,
+            base_height: 2,
+        };
+        let mut config = ProjectConfiguration::default();
+        invisible_background(&mut config);
+        let mut mask = annotation(AnnotationType::Mask, 0., 0., 2., 2.);
+        mask.mask_type = Some(cap_project::MaskType::Pixelate);
+        mask.mask_level = Some(2.);
+        config.annotations.push(mask);
+        let mut expected = raw.rgba.clone();
+        for index in [0, 1, 4, 5] {
+            expected[index * 4..index * 4 + 4].copy_from_slice(&[0, 0, 255, 255]);
+        }
+
+        let out = composite(&raw, &config);
+
+        assert_eq!((out.width, out.height), (4, 2));
+        assert_eq!(out.rgba, expected);
+
+        let mut rectangle = annotation(AnnotationType::Rectangle, 2., 0., 2., 2.);
+        rectangle.fill_color = "#ff0000".into();
+        rectangle.stroke_width = 0.;
+        config.annotations.push(rectangle);
+        for index in [2, 3, 6, 7] {
+            expected[index * 4..index * 4 + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+
+        assert_eq!(composite(&raw, &config).rgba, expected);
     }
 
     /// `stableValue`: keys sorted at every depth, arrays kept in order.
@@ -914,15 +861,15 @@ mod tests {
             }
         );
 
-        let overflowing = annotation(AnnotationType::Arrow, 90., -10., 30., 15.);
+        let overflowing = annotation(AnnotationType::Rectangle, 90., -10., 30., 15.);
         let bounds = export_bounds(&[overflowing], (100, 50));
-        assert_eq!((bounds.min_x, bounds.min_y), (0., -10.));
-        assert_eq!((bounds.width, bounds.height), (120, 60));
+        assert_eq!((bounds.min_x, bounds.min_y), (0., -12.));
+        assert_eq!((bounds.width, bounds.height), (122, 62));
 
         let negative = annotation(AnnotationType::Rectangle, -5., 0., -10., 10.);
         let bounds = export_bounds(&[negative], (100, 50));
-        assert_eq!(bounds.min_x, -15.);
-        assert_eq!(bounds.width, 115);
+        assert_eq!((bounds.min_x, bounds.min_y), (-17., -2.));
+        assert_eq!((bounds.width, bounds.height), (117, 52));
 
         let mask = annotation(AnnotationType::Mask, -50., -50., 300., 300.);
         assert_eq!(
@@ -995,7 +942,7 @@ mod tests {
 
     fn reference_flatten(out: &Composited) -> Composited {
         let mut rgba = vec![255; out.rgba.len()];
-        blit_over_offset(
+        pixels::blit_over_offset(
             &mut rgba,
             (out.width, out.height),
             &out.rgba,
@@ -1021,44 +968,11 @@ mod tests {
         if !has_no_visible_background(&config.background.source) {
             rgba.fill(255);
         }
-        blit_over_offset(&mut rgba, (width, height), &canvas, (width, height), (0, 0));
+        pixels::blit_over_offset(&mut rgba, (width, height), &canvas, (width, height), (0, 0));
         Composited {
             rgba,
             width,
             height,
-        }
-    }
-
-    #[test]
-    fn white_flatten_matches_source_over_for_every_channel_and_alpha() {
-        let rgba = (0..=255u8)
-            .flat_map(|alpha| {
-                (0..=255u8).flat_map(move |channel| {
-                    [channel, 255 - channel, channel.wrapping_mul(17), alpha]
-                })
-            })
-            .collect();
-        let out = Composited {
-            rgba,
-            width: 256,
-            height: 256,
-        };
-        assert_eq!(flatten_onto_white(&out).rgba, reference_flatten(&out).rgba);
-    }
-
-    #[test]
-    fn opacity_check_matches_individual_alpha_bytes_at_block_boundaries() {
-        for length in 0..130 {
-            let opaque = vec![255; length];
-            assert!(is_opaque(&opaque));
-            for changed_byte in 0..length {
-                let mut rgba = opaque.clone();
-                rgba[changed_byte] = 127;
-                assert_eq!(
-                    is_opaque(&rgba),
-                    rgba.iter().skip(3).step_by(4).all(|&alpha| alpha == 255),
-                );
-            }
         }
     }
 
@@ -1087,7 +1001,15 @@ mod tests {
                     invisible_background(&mut config);
                 }
                 let out = composite(&raw, &config);
-                let reference = reference_unannotated_composite(&raw, &config);
+                let reference = if invisible {
+                    Composited {
+                        rgba: raw.rgba.clone(),
+                        width: raw.width.max(1),
+                        height: raw.height.max(1),
+                    }
+                } else {
+                    reference_unannotated_composite(&raw, &config)
+                };
                 assert_eq!(out.rgba, reference.rgba);
                 let expected = if needs_transparency(&reference, &config) {
                     reference
@@ -1116,6 +1038,66 @@ mod tests {
             composite(&raw, &config).rgba,
             reference_unannotated_composite(&raw, &config).rgba,
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_mask_only_screenshot_composite() {
+        use std::{hint::black_box, time::Instant};
+        for (width, height) in [(1920, 1080), (3840, 2160)] {
+            for translucent_border in [false, true] {
+                let raw = RawFrame {
+                    rgba: (0..width * height)
+                        .flat_map(|i: u32| {
+                            let x = i % width;
+                            let y = i / width;
+                            let border = x < 32 || y < 32 || x >= width - 32 || y >= height - 32;
+                            let alpha = if translucent_border && border {
+                                (i % 254 + 1) as u8
+                            } else {
+                                255
+                            };
+                            [
+                                i as u8,
+                                i.wrapping_mul(17) as u8,
+                                i.wrapping_mul(31) as u8,
+                                alpha,
+                            ]
+                        })
+                        .collect(),
+                    width,
+                    height,
+                    base_width: width,
+                    base_height: height,
+                };
+                let mut config = ProjectConfiguration::default();
+                invisible_background(&mut config);
+                let mut mask = annotation(AnnotationType::Mask, 100., 100., 256., 256.);
+                mask.mask_type = Some(cap_project::MaskType::Pixelate);
+                mask.mask_level = Some(16.);
+                config.annotations.push(mask);
+                let mut samples_ns = Vec::new();
+                for iteration in 0..35 {
+                    let start = Instant::now();
+                    black_box(composite(black_box(&raw), black_box(&config)));
+                    let elapsed = start.elapsed().as_nanos();
+                    if iteration >= 5 {
+                        samples_ns.push(elapsed);
+                    }
+                }
+                samples_ns.sort_unstable();
+                let median_ms = (samples_ns[14] + samples_ns[15]) as f64 / 2_000_000.;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "width": width, "height": height,
+                        "translucent_border": translucent_border,
+                        "median_ms": median_ms, "samples_ns": samples_ns,
+                        "scope": "CPU mask-only composite; excludes GPU, PNG, disk and native UI"
+                    })
+                );
+            }
+        }
     }
 
     #[test]
@@ -1150,7 +1132,7 @@ mod tests {
                     let baseline_ms = start.elapsed().as_secs_f64() * 1000.0;
                     let start = Instant::now();
                     let result = composite(black_box(&raw), &config);
-                    let result = if is_opaque(&result.rgba) {
+                    let result = if pixels::is_opaque(&result.rgba) {
                         result
                     } else {
                         flatten_onto_white(&result)
@@ -1173,58 +1155,244 @@ mod tests {
         }
     }
 
-    /// `withWhiteBackground` leaves an opaque canvas untouched.
     #[test]
-    fn flattening_an_opaque_canvas_is_the_identity() {
-        let out = Composited {
-            rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
-            width: 2,
-            height: 1,
-        };
-        assert_eq!(flatten_onto_white(&out).rgba, out.rgba);
+    fn export_bounds_rounds_fractional_strokes_outward() {
+        let negative = annotation(AnnotationType::Rectangle, -30.25, -20.75, 20., 10.);
+        assert_eq!(
+            export_bounds(&[negative], (100, 50)),
+            ExportBounds {
+                min_x: -33.,
+                min_y: -23.,
+                width: 133,
+                height: 73
+            }
+        );
+        let positive = annotation(AnnotationType::Rectangle, 110.25, 60.75, 20., 10.);
+        assert_eq!(
+            export_bounds(&[positive], (100, 50)),
+            ExportBounds {
+                min_x: 0.,
+                min_y: 0.,
+                width: 133,
+                height: 73
+            }
+        );
     }
 
-    /// A composite with no annotations is the frame itself over the white
-    /// output canvas, and an annotation past the edge pads the output --
-    /// matching the source, the part outside the frame is clipped by the
-    /// working canvas, so the pad is background-coloured.
     #[test]
-    fn composite_passes_the_frame_through_and_pads_for_overflow() {
+    fn composite_exports_text_glyphs_outside_the_annotation_box() {
         let raw = RawFrame {
-            rgba: [0u8, 0, 255, 255].repeat(16), // 4x4 solid blue
+            rgba: vec![0; 100 * 100 * 4],
+            width: 100,
+            height: 100,
+            base_width: 100,
+            base_height: 100,
+        };
+        let mut text = annotation(AnnotationType::Text, 95., -5., 1., 32.);
+        text.text = Some("jÁW".into());
+        let mut config = ProjectConfiguration::default();
+        invisible_background(&mut config);
+        config.annotations.push(text.clone());
+
+        text.x += 128.;
+        text.y += 128.;
+        let mut reference = vec![0; 512 * 512 * 4];
+        draw_annotations_onto(&mut reference, 512, 512, &[text]);
+        let reference = image::RgbaImage::from_raw(512, 512, reference).unwrap();
+        let (mut left, mut top, mut right, mut bottom) = (0i64, -5i64, 100i64, 100i64);
+        for (x, y, pixel) in reference.enumerate_pixels() {
+            if pixel.0[3] > 0 {
+                let x = i64::from(x) - 128;
+                let y = i64::from(y) - 128;
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
+            }
+        }
+        assert!(right > 100);
+        let expected = image::imageops::crop_imm(
+            &reference,
+            (left + 128) as u32,
+            (top + 128) as u32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        )
+        .to_image();
+        let out = composite(&raw, &config);
+        assert_eq!((out.width, out.height), expected.dimensions());
+        assert_eq!(out.rgba, expected.into_raw());
+    }
+
+    #[test]
+    fn composite_keeps_frame_interior_rendering_unchanged() {
+        let raw = RawFrame {
+            rgba: [0u8, 0, 255, 255].repeat(100 * 100),
+            width: 100,
+            height: 100,
+            base_width: 100,
+            base_height: 100,
+        };
+        let mut config = ProjectConfiguration {
+            annotations: vec![
+                annotation(AnnotationType::Rectangle, 10., 10., 20., 20.),
+                annotation(AnnotationType::Circle, 40., 10., 20., 20.),
+                annotation(AnnotationType::Arrow, 10., 50., 40., 0.),
+                annotation(AnnotationType::Draw, 10., 70., 20., 20.),
+                annotation(AnnotationType::Text, 50., 70., 40., 10.),
+            ],
+            ..ProjectConfiguration::default()
+        };
+        config.annotations[3].points = Some(vec![[0., 0.], [1., 1.]]);
+        config.annotations[4].text = Some("cap".into());
+        for annotation in &mut config.annotations {
+            annotation.rotation = 45.;
+        }
+        let mut expected = raw.rgba.clone();
+        draw_annotations_onto(&mut expected, raw.width, raw.height, &config.annotations);
+        let out = composite(&raw, &config);
+        assert_eq!((out.width, out.height), (100, 100));
+        assert_eq!(out.rgba, expected);
+    }
+
+    #[test]
+    fn composite_keeps_translucent_in_frame_exports_byte_identical() {
+        let rgba = (0..64u32 * 64)
+            .flat_map(|i| {
+                [
+                    (i * 7) as u8,
+                    (i * 13) as u8,
+                    (i * 29) as u8,
+                    (i % 256) as u8,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let raw = RawFrame {
+            rgba,
+            width: 64,
+            height: 64,
+            base_width: 64,
+            base_height: 64,
+        };
+        for visible in [true, false] {
+            let mut config = ProjectConfiguration::default();
+            config.background.source = BackgroundSource::Color {
+                value: [10, 20, 30],
+                alpha: if visible { 255 } else { 0 },
+            };
+            let mut rectangle = annotation(AnnotationType::Rectangle, 10., 10., 30., 20.);
+            rectangle.stroke_width = 3.;
+            rectangle.stroke_color = "#ff0000".into();
+            rectangle.fill_color = "#00ff00".into();
+            rectangle.opacity = 0.5;
+            config.annotations.push(rectangle);
+
+            let mut canvas = raw.rgba.clone();
+            draw_annotations_onto(&mut canvas, 64, 64, &config.annotations);
+            let mut expected = vec![if visible { 255 } else { 0 }; 64 * 64 * 4];
+            pixels::blit_over_offset(&mut expected, (64, 64), &canvas, (64, 64), (0, 0));
+
+            let out = composite(&raw, &config);
+            assert_eq!((out.width, out.height), (64, 64));
+            assert_eq!(out.rgba, expected);
+        }
+    }
+
+    #[test]
+    fn composite_exports_outermost_strokes_and_arrow_heads() {
+        let raw = RawFrame {
+            rgba: [0u8, 0, 255, 255].repeat(100 * 100),
+            width: 100,
+            height: 100,
+            base_width: 50,
+            base_height: 50,
+        };
+        for invisible in [false, true] {
+            for (x, y, pixel, size) in [
+                (55., 10., (131, 30), (132, 100)),
+                (-15., 10., (0, 30), (132, 100)),
+                (10., 55., (30, 131), (100, 132)),
+                (10., -15., (30, 0), (100, 132)),
+            ] {
+                let mut config = ProjectConfiguration::default();
+                if invisible {
+                    invisible_background(&mut config);
+                }
+                let mut rectangle = annotation(AnnotationType::Rectangle, x, y, 10., 10.);
+                rectangle.stroke_width = 2.;
+                rectangle.stroke_color = "#00ff00".into();
+                config.annotations.push(rectangle);
+
+                let out = composite(&raw, &config);
+                let decoded = image::load_from_memory(&encode_for_save(&out).unwrap())
+                    .unwrap()
+                    .to_rgba8();
+                assert_eq!(decoded.dimensions(), size);
+                assert_eq!(decoded.get_pixel(pixel.0, pixel.1).0, [0, 255, 0, 255]);
+            }
+
+            for (x, y, width, height, pixel, size) in [
+                (10., 2., 20., 0., (36, 0), (100, 106)),
+                (10., 48., 20., 0., (36, 105), (100, 106)),
+                (2., 10., 0., 20., (0, 36), (106, 100)),
+                (48., 10., 0., 20., (105, 36), (106, 100)),
+            ] {
+                let mut config = ProjectConfiguration::default();
+                if invisible {
+                    invisible_background(&mut config);
+                }
+                let mut arrow = annotation(AnnotationType::Arrow, x, y, width, height);
+                arrow.stroke_width = 2.;
+                arrow.stroke_color = "#00ff00".into();
+                config.annotations.push(arrow);
+                let out = composite(&raw, &config);
+                assert_eq!((out.width, out.height), size);
+                let start = (pixel.1 * out.width as usize + pixel.0) * 4;
+                assert!(out.rgba[start] < 255);
+                assert_eq!(out.rgba[start + 1], 255);
+                assert!(out.rgba[start + 3] > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn composite_exports_annotations_past_each_frame_edge() {
+        let raw = RawFrame {
+            rgba: [0u8, 0, 255, 255].repeat(16),
             width: 4,
             height: 4,
-            base_width: 4,
-            base_height: 4,
+            base_width: 2,
+            base_height: 2,
         };
-        let config = ProjectConfiguration::default();
-        let out = composite(&raw, &config);
-        assert_eq!((out.width, out.height), (4, 4));
-        assert_eq!(&out.rgba[..4], &[0, 0, 255, 255]);
+        for invisible in [false, true] {
+            for (x, y, pixel, size) in [
+                (3., 0., (7, 1), (10, 4)),
+                (-3., 0., (1, 1), (10, 4)),
+                (0., 3., (1, 7), (4, 10)),
+                (0., -3., (1, 1), (4, 10)),
+            ] {
+                let mut config = ProjectConfiguration::default();
+                if invisible {
+                    invisible_background(&mut config);
+                }
+                let mut rectangle = annotation(AnnotationType::Rectangle, x, y, 2., 2.);
+                rectangle.stroke_width = 0.;
+                rectangle.fill_color = "#00ff00".into();
+                config.annotations.push(rectangle);
 
-        // A rectangle hanging entirely past the right edge: its stroke band
-        // (x 4..12 at width 4) misses the 4px working canvas, so -- like the
-        // source -- the expansion pads white with nothing drawn in it.
-        let mut with_overflow = ProjectConfiguration::default();
-        with_overflow
-            .annotations
-            .push(annotation(AnnotationType::Rectangle, 6., 0., 4., 4.));
-        let out = composite(&raw, &with_overflow);
-        assert_eq!((out.width, out.height), (10, 4));
-        // Column 0 is still the frame's blue...
-        assert_eq!(&out.rgba[..4], &[0, 0, 255, 255]);
-        // ...and the padded margin past the frame is the white fill.
-        let margin = 9 * 4;
-        assert_eq!(&out.rgba[margin..margin + 4], &[255, 255, 255, 255]);
-    }
-
-    /// Premultiply/demultiply round-trips opaque pixels exactly; a fully
-    /// transparent pixel's colour is unrecoverable by definition and zeroes.
-    #[test]
-    fn premultiply_roundtrip_is_exact_for_opaque_pixels() {
-        let mut rgba = vec![13, 200, 91, 255, 1, 2, 3, 0];
-        premultiply(&mut rgba);
-        demultiply(&mut rgba);
-        assert_eq!(rgba, vec![13, 200, 91, 255, 0, 0, 0, 0]);
+                let out = composite(&raw, &config);
+                let png = encode_for_save(&out).unwrap();
+                let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+                assert_eq!(decoded.dimensions(), size);
+                assert_eq!(decoded.get_pixel(pixel.0, pixel.1).0, [0, 255, 0, 255]);
+                let origin = ((-x * 2.).max(0.) as u32, (-y * 2.).max(0.) as u32);
+                assert_eq!(decoded.get_pixel(origin.0, origin.1).0, [0, 0, 255, 255]);
+                let gap = if x == 0. { (1, 5) } else { (5, 1) };
+                assert_eq!(
+                    decoded.get_pixel(gap.0, gap.1).0,
+                    if invisible { [0; 4] } else { [255; 4] }
+                );
+            }
+        }
     }
 }

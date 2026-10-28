@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { type Subprocess, spawn } from "bun";
+import { z } from "zod";
 import { withTimeout } from "./media-common";
 import {
 	canAcceptNewAudioOperation,
@@ -31,6 +32,9 @@ const MAX_AUDIO_SIZE_BYTES = 100 * 1024 * 1024;
 const MAX_STDERR_BYTES = 64 * 1024;
 const AUDIO_PROBE_MAX_ATTEMPTS = 3;
 const AUDIO_PROBE_RETRY_BASE_MS = 250;
+const AUDIO_PROBE_SCHEMA = z.object({
+	streams: z.array(z.object({ codec_type: z.string().optional() })),
+});
 
 const DEFAULT_OPTIONS: Required<AudioExtractionOptions> = {
 	format: "mp3",
@@ -144,7 +148,7 @@ function getAudioProbeArgs(inputPath: string): string[] {
 			"0",
 		);
 	}
-	args.push("-show_entries", "stream=codec_type", "-of", "csv=p=0", inputPath);
+	args.push("-show_entries", "stream=codec_type", "-of", "json", inputPath);
 	return args;
 }
 
@@ -224,10 +228,8 @@ async function probeAudioTracks(
 			const safeStderrText = redactProcessOutput(stderrText, sourceUrl);
 
 			if (exitCode === 0) {
-				const trackTypes = stdoutText
-					.split(/\r?\n/)
-					.map((value) => value.trim())
-					.filter(Boolean);
+				const { streams } = AUDIO_PROBE_SCHEMA.parse(JSON.parse(stdoutText));
+				const trackTypes = streams.map((stream) => stream.codec_type);
 				if (!trackTypes.includes("video")) {
 					throw new Error("No video stream found");
 				}
@@ -397,10 +399,12 @@ export function extractAudioStream(
 	let timeoutId: ReturnType<typeof setTimeout> | undefined;
 	let cleaned = false;
 	let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+	let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
 
-	const cleanup = () => {
+	const finish = (error?: Error) => {
 		if (cleaned) return;
 		cleaned = true;
+		if (error) streamController?.error(error);
 		if (timeoutId) clearTimeout(timeoutId);
 		if (reader) {
 			try {
@@ -412,22 +416,31 @@ export function extractAudioStream(
 		unregisterMediaOperation(operation);
 		void terminateProcess(proc);
 	};
+	const cleanup = () => finish(new Error("Audio extraction cancelled"));
 
 	timeoutId = setTimeout(() => {
-		cleanup();
+		finish(new Error(`Operation timed out after ${opts.timeoutMs}ms`));
 	}, opts.timeoutMs);
 
 	void drainStream(proc.stderr as ReadableStream<Uint8Array>);
 
-	proc.exited.then(() => {
-		cleanup();
+	proc.exited.then((exitCode) => {
+		if (cleaned) return;
+		if (exitCode !== 0) {
+			finish(new Error(`FFmpeg exited with code ${exitCode}`));
+			return;
+		}
+		if (timeoutId) clearTimeout(timeoutId);
+		unregisterMediaOperation(operation);
+		void terminateProcess(proc);
 	});
 
 	const originalStream = proc.stdout as ReadableStream<Uint8Array>;
 
 	const stream = new ReadableStream<Uint8Array>(
 		{
-			start() {
+			start(controller) {
+				streamController = controller;
 				reader = originalStream.getReader();
 			},
 			async pull(controller) {
@@ -438,15 +451,18 @@ export function extractAudioStream(
 
 				try {
 					const { done, value } = await reader.read();
+					if (cleaned) return;
 					if (done) {
+						await proc.exited;
+						if (cleaned) return;
 						controller.close();
-						cleanup();
+						finish();
 					} else {
 						controller.enqueue(value);
 					}
 				} catch (err) {
 					controller.error(err);
-					cleanup();
+					finish();
 				}
 			},
 			cancel() {
